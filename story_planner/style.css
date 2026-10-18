@@ -1,0 +1,759 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   Story Planner — .sp-* (arc cards, sections, injection mode)
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ─── Injection mode selector ──────────────────────────────────────────────── */
+
+.sp-mode-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--mwt-text);
+    cursor: pointer;
+}
+
+.sp-mode-label input {
+    cursor: pointer;
+    margin: 0;
+    /* Matches how knowledge/style.css tints its checkboxes. */
+    accent-color: var(--mwt-accent);
+}
+
+/* Every checkbox list in the Generate dialog. A bare <label> is display:inline,
+   so without this the subject and context-source rows run together as one
+   wrapped paragraph of text instead of a scannable column. */
+.sp-generate-target,
+.sp-check-row {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    padding: 4px 0;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.sp-check-row input {
+    accent-color: var(--mwt-accent);
+    cursor: pointer;
+    flex: none;
+    margin: 2px 0 0;
+}
+
+.sp-check-row input:disabled,
+.sp-check-row input:disabled + span { cursor: default; opacity: 0.55; }
+
+/* Bounded so a large cast scrolls inside the dialog rather than pushing the
+   Generate button off the bottom. */
+.sp-check-list {
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    display: flex;
+    flex-direction: column;
+    max-height: 190px;
+    overflow-y: auto;
+    padding: 4px 8px;
+}
+
+.sp-generate-author { margin: 12px 0 0; }
+.sp-generate-author summary { cursor: pointer; font-weight: 600; }
+.sp-generate-author > p { margin: 6px 0; }
+.sp-author-list {
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    max-height: 190px;
+    overflow-y: auto;
+    padding: 4px 8px;
+}
+.sp-author-npc-row + .sp-author-npc-row { border-top: 1px solid var(--mwt-border); }
+.sp-author-npc-row > .sp-check-row { font-weight: 600; }
+.sp-author-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 0 8px;
+    padding-left: 18px;
+}
+.sp-author-review {
+    border-top: 1px solid var(--mwt-border);
+    display: grid;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+}
+.sp-author-review label { color: var(--mwt-text); font-size: 12px; }
+.sp-author-review .mwt-input { box-sizing: border-box; width: 100%; }
+
+.sp-ownership {
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    display: grid;
+    gap: 4px 8px;
+    grid-template-columns: max-content 1fr;
+    align-items: center;
+    padding: 6px 8px;
+}
+
+.sp-ownership legend { grid-column: 1 / -1; padding: 0 4px; }
+.sp-ownership label { font-size: 12px; }
+.sp-ownership p { grid-column: 1 / -1; margin: 2px 0 0; }
+
+.sp-context-coverage {
+    list-style: none;
+    margin: 6px 0 0;
+    max-height: 190px;
+    overflow-y: auto;
+    padding: 0;
+}
+
+.sp-context-coverage li {
+    border-top: 1px solid var(--mwt-border);
+    font-size: 12px;
+    padding: 4px 0;
+}
+
+.sp-context-coverage li:first-child { border-top: 0; }
+.sp-context-coverage li[data-coverage-status="unavailable"] strong,
+.sp-context-coverage li[data-coverage-status="missing-dossier"] strong { color: var(--mwt-warning); }
+
+.sp-context-coverage-review summary,
+.sp-proposal-item summary { cursor: pointer; }
+
+.sp-proposal-ownership {
+    display: grid;
+    gap: 2px 8px;
+    grid-template-columns: max-content 1fr;
+    font-size: 12px;
+    margin: 4px 0;
+}
+
+.sp-proposal-ownership dt { color: var(--mwt-text-dim); }
+.sp-proposal-ownership dd { margin: 0; }
+
+.sp-proposal-diagnostics {
+    color: var(--mwt-warning);
+    font-size: 12px;
+}
+
+.sp-proposal-requirement {
+    background: rgba(255, 152, 0, 0.12);
+    border: 1px solid var(--mwt-warning);
+    border-radius: var(--mwt-radius);
+    color: var(--mwt-text);
+    font-size: 12px;
+    padding: 8px 10px;
+}
+
+.sp-proposal-selection {
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    margin: 10px 0;
+    padding: 8px 10px;
+}
+
+.sp-proposal-choice {
+    align-items: flex-start;
+    display: flex;
+    gap: 8px;
+    padding: 5px 0;
+}
+
+.sp-proposal-choice input { margin-top: 3px; }
+.sp-proposal-choice span { display: flex; flex-direction: column; }
+.sp-proposal-choice small { color: var(--mwt-text-dim); }
+
+.sp-enforcement {
+    background-color: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+    font-size: 12px;
+    padding: 2px 5px;
+    cursor: pointer;
+}
+
+.sp-enforcement option {
+    background-color: var(--mwt-bg-light);
+    color: var(--mwt-text);
+}
+
+.sp-enforcement:hover,
+.sp-enforcement:focus {
+    outline: none;
+    border-color: var(--mwt-accent);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.sp-enforcement:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 2px;
+}
+
+/* ─── Sections ─────────────────────────────────────────────────────────────── */
+
+.sp-section {
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    margin-bottom: 8px;
+    /* Section is the base surface; cards sit ON it and are one step lighter
+       (see .sp-arc). Keep these two in sync or the elevation reads inverted. */
+    background: var(--mwt-bg);
+}
+
+.sp-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+}
+
+.sp-section-head::-webkit-details-marker { display: none; }
+
+.sp-section-head::before {
+    content: '▸';
+    color: var(--mwt-text-dim);
+    transition: transform var(--mwt-transition);
+    margin-right: 4px;
+}
+
+.sp-section[open] > .sp-section-head::before { transform: rotate(90deg); }
+
+.sp-section-title {
+    flex: 1;
+    font-weight: 600;
+    color: var(--mwt-accent);
+    font-size: 13px;
+}
+
+.sp-section-count {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    white-space: nowrap;
+}
+
+.sp-section-blurb {
+    margin: 0 10px 8px;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+}
+
+.sp-section-arcs {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 10px;
+}
+
+.sp-section > .sp-add {
+    margin: 8px 10px 10px;
+    font-size: 11px;
+    padding: 3px 8px;
+}
+
+/* ─── Arc cards ────────────────────────────────────────────────────────────── */
+
+.sp-arc {
+    border: 1px solid var(--mwt-border);
+    border-left: 3px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    background: var(--mwt-bg-light);
+    color: var(--mwt-text);
+    padding: 6px 8px;
+    transition: border-color var(--mwt-transition), opacity var(--mwt-transition);
+}
+
+.sp-arc:hover { border-color: var(--mwt-accent); }
+
+.sp-arc--pinned { border-left-color: var(--mwt-warning); }
+
+/* Resolved/dropped arcs stay visible but visually recede — they are excluded
+   from the prompt, so they should not read as part of the live plan. */
+.sp-arc--muted { opacity: 0.55; }
+.sp-arc--muted:hover { opacity: 0.85; }
+.sp-arc--parked { border-left-color: var(--mwt-text-dim); }
+
+.sp-arc-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.sp-lifecycle {
+    flex: 0 0 auto;
+    font-size: 11px;
+    padding: 3px 7px;
+}
+
+.sp-activate-when {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 6px;
+    margin: 5px 5px 0;
+    color: var(--mwt-text-dim);
+    font-size: 11px;
+}
+
+.sp-activate-when .mwt-input { font-size: 11px; padding: 3px 5px; }
+
+/* NOTE: background AND color are set explicitly on every field below, even
+   where "transparent"/inherited would look right in isolation. SillyTavern
+   themes style bare input/textarea/select elements globally, so anything left
+   unset bleeds through (this is why chronicle/knowledge always set the full
+   bg + color + border triplet). */
+
+.sp-arc-title {
+    flex: 1;
+    min-width: 0;
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 3px 5px;
+}
+
+.sp-arc-title::placeholder,
+.sp-arc-body::placeholder {
+    color: var(--mwt-text-dim);
+    opacity: 0.7;
+}
+
+.sp-arc-title:hover {
+    border-color: var(--mwt-border);
+    background-color: var(--mwt-bg);
+}
+
+.sp-arc-title:focus {
+    outline: none;
+    border-color: var(--mwt-accent);
+    background-color: var(--mwt-bg);
+    color: var(--mwt-text);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.sp-arc-title:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 2px;
+}
+
+.sp-arc-body {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 4px;
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--mwt-text-dim);
+    font-family: var(--mwt-font);
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 3px 5px;
+    resize: vertical;
+}
+
+.sp-arc-body:hover {
+    border-color: var(--mwt-border);
+    background-color: var(--mwt-bg);
+}
+
+.sp-arc-body:focus {
+    outline: none;
+    border-color: var(--mwt-accent);
+    background-color: var(--mwt-bg);
+    color: var(--mwt-text);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.sp-arc-body:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 2px;
+}
+
+/* ─── Beat strip (current setup step + advance controls) ───────────────────── */
+
+.sp-beats {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 6px;
+    padding: 5px 7px;
+    border-radius: 4px;
+    background-color: var(--mwt-bg);
+    border-left: 2px solid var(--mwt-accent);
+}
+
+.sp-beats--ready { border-left-color: var(--mwt-success); }
+
+.sp-beat-line {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.sp-beat-badge {
+    flex-shrink: 0;
+    background-color: var(--mwt-bg-lighter);
+    color: var(--mwt-text-dim);
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 5px;
+    line-height: 1.4;
+    white-space: nowrap;
+}
+
+.sp-beat-badge--overdue {
+    background-color: var(--mwt-warning);
+    color: #1a1a2e;
+}
+
+.sp-beat-badge--ready {
+    background-color: var(--mwt-success);
+    color: #fff;
+}
+
+.sp-beat-text {
+    color: var(--mwt-text);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.sp-beat-actions {
+    flex-shrink: 0;
+    display: flex;
+    gap: 4px;
+}
+
+.sp-beat-done,
+.sp-beat-back {
+    font-size: 11px;
+    padding: 2px 7px;
+    white-space: nowrap;
+}
+
+/* ─── Full beat editor ─────────────────────────────────────────────────────── */
+
+.sp-beat-editor {
+    margin-top: 6px;
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+    background: var(--mwt-bg);
+}
+
+.sp-beat-editor > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 8px;
+    color: var(--mwt-text);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.sp-beat-editor > summary:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 2px;
+}
+
+.sp-beat-editor-count {
+    min-width: 1.5em;
+    border-radius: 999px;
+    background: var(--mwt-bg-lighter);
+    color: var(--mwt-text-dim);
+    font-size: 10px;
+    line-height: 1.5;
+    text-align: center;
+}
+
+.sp-beat-editor-help,
+.sp-beat-empty {
+    margin: 0;
+    padding: 0 8px 7px;
+    color: var(--mwt-text-dim);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.sp-beat-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+    padding: 0 8px;
+    list-style: none;
+}
+
+.sp-beat-row {
+    display: grid;
+    grid-template-columns: minmax(58px, auto) minmax(160px, 1fr) auto;
+    align-items: start;
+    gap: 6px;
+    padding: 6px;
+    border: 1px solid var(--mwt-border);
+    border-left: 3px solid var(--mwt-border);
+    border-radius: 4px;
+    background: var(--mwt-bg-light);
+}
+
+.sp-beat-row--planted { border-left-color: var(--mwt-success); }
+.sp-beat-row--skipped { border-left-color: var(--mwt-text-dim); }
+.sp-beat-row--current { border-left-color: var(--mwt-accent); }
+
+.sp-beat-state {
+    padding-top: 5px;
+    color: var(--mwt-text-dim);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.sp-beat-row--current .sp-beat-state { color: var(--mwt-accent); }
+.sp-beat-row--planted .sp-beat-state { color: var(--mwt-success); }
+
+.sp-beat-edit-fields {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.sp-beat-input,
+.sp-beat-reason {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+    background: var(--mwt-bg);
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+    font-size: 11px;
+    padding: 4px 5px;
+}
+
+.sp-beat-input { resize: vertical; }
+.sp-beat-reason::placeholder { color: var(--mwt-text-dim); }
+
+.sp-beat-input:focus,
+.sp-beat-reason:focus {
+    border-color: var(--mwt-accent);
+}
+
+.sp-beat-input:focus-visible,
+.sp-beat-reason:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 2px;
+}
+
+.sp-beat-row-actions,
+.sp-beat-editor-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.sp-beat-row-actions .mwt-btn,
+.sp-beat-editor-actions .mwt-btn {
+    min-height: 30px;
+    font-size: 11px;
+    padding: 3px 7px;
+}
+
+.sp-beat-icon { min-width: 30px; }
+
+.sp-beat-editor-actions {
+    padding: 7px 8px 8px;
+}
+
+/* ─── Targeted development / proposal review ─────────────────────────────── */
+
+.sp-target-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.sp-target-actions .mwt-btn {
+    font-size: 11px;
+    padding: 3px 7px;
+}
+
+.sp-proposal-diff {
+    margin: 4px 0 10px;
+    padding-left: 20px;
+}
+
+.sp-proposal-diff > li { margin-bottom: 8px; }
+
+.sp-proposal-change {
+    display: grid;
+    gap: 3px;
+    margin-top: 3px;
+}
+
+.sp-proposal-change del,
+.sp-proposal-change ins {
+    border-radius: 3px;
+    padding: 4px 6px;
+    text-decoration: none;
+    white-space: pre-wrap;
+}
+
+.sp-proposal-change del { background: rgba(239, 83, 80, 0.14); }
+.sp-proposal-change ins { background: rgba(76, 175, 80, 0.14); }
+
+/* A moved beat only changes position, not content — neutral styling so it
+   doesn't read as an add/remove. */
+.sp-proposal-move {
+    color: var(--mwt-text-dim);
+    padding: 4px 6px;
+}
+
+.sp-proposal-stale {
+    border: 1px solid var(--mwt-warning);
+    border-radius: var(--mwt-radius);
+    color: var(--mwt-warning);
+    padding: 8px;
+}
+
+.sp-progress-suggestion {
+    border-bottom: 1px solid var(--mwt-border);
+    padding: 8px 0 12px;
+}
+
+.sp-progress-suggestion blockquote {
+    border-left: 3px solid var(--mwt-accent);
+    color: var(--mwt-text);
+    margin: 8px 0;
+    padding: 6px 10px;
+}
+
+/* A ready arc is the payoff of the whole mechanism — make it findable. */
+.sp-arc--ready { border-left-color: var(--mwt-success); }
+
+.sp-arc-foot {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+    flex-wrap: wrap;
+}
+
+.sp-arc-section,
+.sp-arc-status {
+    background-color: var(--mwt-bg);
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+    font-size: 11px;
+    padding: 2px 4px;
+    cursor: pointer;
+}
+
+/* The native dropdown popup does NOT reliably inherit the select's colors —
+   on Windows it falls back to system colors and can render unreadable
+   (dark-on-dark). Style the options explicitly. */
+.sp-arc-section option,
+.sp-arc-status option {
+    background-color: var(--mwt-bg-light);
+    color: var(--mwt-text);
+}
+
+.sp-arc-section:hover,
+.sp-arc-status:hover { border-color: var(--mwt-accent); }
+
+.sp-arc-section:focus,
+.sp-arc-status:focus {
+    outline: none;
+    border-color: var(--mwt-accent);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.sp-arc-section:focus-visible,
+.sp-arc-status:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 2px;
+}
+
+.sp-pin,
+.sp-focus,
+.sp-arc-del {
+    background: none;
+    border: none;
+    color: var(--mwt-text-dim);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 3px 5px;
+    border-radius: 4px;
+    opacity: 0.65;
+    transition: all var(--mwt-transition);
+}
+
+.sp-pin:hover {
+    opacity: 1;
+    background: rgba(255, 152, 0, 0.15);
+}
+
+.sp-focus:hover {
+    opacity: 1;
+    background: rgba(33, 150, 243, 0.15);
+}
+
+.sp-arc-del:hover {
+    opacity: 1;
+    background: rgba(239, 83, 80, 0.15);
+}
+
+/* ─── Empty state ──────────────────────────────────────────────────────────── */
+
+.sp-empty {
+    text-align: center;
+    padding: 28px 16px;
+    border: 1px dashed var(--mwt-border);
+    border-radius: var(--mwt-radius);
+}
+
+.sp-empty p { margin: 0 0 8px; }
+
+/* ─── Mobile ───────────────────────────────────────────────────────────────── */
+
+@media (max-width: 600px) {
+    .sp-arc-foot { flex-direction: column; align-items: stretch; }
+    .sp-arc-section,
+    .sp-arc-status { width: 100%; }
+    /* Stack the beat text above its buttons rather than squeezing both. */
+    .sp-beats { flex-direction: column; gap: 6px; }
+    .sp-beat-actions { align-self: flex-end; }
+    .sp-beat-row { grid-template-columns: 1fr; }
+    .sp-beat-state { padding-top: 0; }
+    .sp-beat-row-actions { justify-content: flex-start; }
+    .sp-beat-row-actions .mwt-btn { min-height: 36px; }
+    .sp-target-actions { flex-direction: column; }
+    .sp-target-actions .mwt-btn,
+    .sp-proposal-actions .mwt-btn { min-height: 40px; width: 100%; }
+}
+
+.sp-proposal-item {
+    border-top: 1px solid var(--mwt-border);
+    margin-top: 6px;
+    padding-top: 6px;
+}
+
+.sp-proposal-item:first-of-type {
+    border-top: 0;
+    margin-top: 0;
+    padding-top: 0;
+}
