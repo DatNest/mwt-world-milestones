@@ -1,0 +1,177 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   budget/style.css — .mwt-budget-* (the 📊 Budget tab, TODO §2)
+   Reuses the diagnostics panel's shared classes (mwt-diag-badge,
+   mwt-diag-dim, mwt-diag-health-stats/-table, mwt-diag-note, mwt-diag-panic,
+   mwt-diag-placeholder) from core/style.css; only the budget-specific
+   shapes live here.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.mwt-budget-mode {
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: 8px 0;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.mwt-budget-mode--observe {
+    background: rgba(59, 130, 246, 0.12);
+    border: 1px solid rgba(59, 130, 246, 0.35);
+}
+
+.mwt-budget-mode--enforce {
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.45);
+}
+
+.mwt-budget-summary {
+    font-size: 12px;
+    line-height: 1.6;
+    padding: 6px 12px;
+    margin: 8px 0;
+    border-left: 3px solid rgba(59, 130, 246, 0.5);
+    background: rgba(59, 130, 246, 0.06);
+    border-radius: 0 4px 4px 0;
+}
+
+.mwt-budget-bar-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 10px 0 14px;
+}
+
+.mwt-budget-bar {
+    flex: 1;
+    height: 10px;
+    border-radius: 5px;
+    background: var(--mwt-bg, rgba(255, 255, 255, 0.08));
+    border: 1px solid var(--mwt-border, rgba(255, 255, 255, 0.15));
+    overflow: hidden;
+}
+
+.mwt-budget-bar-fill {
+    height: 100%;
+    background: #3b82f6;
+    transition: width 0.2s ease;
+}
+
+.mwt-budget-bar-fill--over {
+    background: #ef4444;
+}
+
+.mwt-budget-bar-label {
+    font-size: 12px;
+    white-space: nowrap;
+    color: var(--mwt-text-dim, #999);
+}
+
+.mwt-budget-table input[type="number"] {
+    width: 72px;
+    padding: 2px 4px;
+    font-size: 12px;
+    text-align: right;
+    background: var(--mwt-bg, rgba(0, 0, 0, 0.2));
+    color: var(--mwt-text, inherit);
+    border: 1px solid var(--mwt-border, rgba(255, 255, 255, 0.15));
+    border-radius: 4px;
+}
+
+/* Slice 4 (a11y plan §4.4): the module cell is the row header (th
+   scope="row"). The shared health-table th rule above styles column headers
+   (10px, uppercase, dim) — a row header is data, so it keeps the body-cell
+   look. vertical-align is part of that: the .mwt-diag-health-table td rule
+   this cell used to match sets `middle`, and neither th rule does, so without
+   it the name falls back to inherit (→ baseline) and rides high against the
+   input cells — visibly so now the plan cell is two lines tall. */
+.mwt-budget-table th[scope="row"] {
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--mwt-text, inherit);
+    padding: 6px 8px;
+    vertical-align: middle;
+    white-space: normal;
+    font-weight: 600;
+}
+
+.mwt-budget-row--idle td,
+.mwt-budget-row--idle th {
+    opacity: 0.6;
+}
+
+/* The former tooltip-only column explanations (priority, tokens, action,
+   soft/hard cap), now visible under the table (a11y plan §5 Slice 4 item 3).
+   The ids are the aria-describedby targets for the column headers and the
+   per-module inputs. */
+.mwt-budget-help {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 6px 0 0;
+}
+
+.mwt-budget-help p {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--mwt-text-dim, #999);
+}
+
+/* The modeled action's reason/displacement note, visible under the badge
+   (it was a td title before). */
+.mwt-budget-plan-reason {
+    font-size: 11px;
+    color: var(--mwt-text-dim, #999);
+    white-space: normal;
+    max-width: 260px;
+    margin-top: 2px;
+    line-height: 1.4;
+}
+
+/* The context-limit note, visible under the usage bar (the unknown-limit
+   branch always showed it; the known-limit branch hid it in a tooltip). */
+.mwt-budget-bar-note {
+    font-size: 11px;
+    margin: 0 0 12px;
+}
+
+.mwt-budget-caps {
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.mwt-budget-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 14px 0;
+}
+
+.mwt-budget-enforce-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.5;
+    cursor: pointer;
+}
+
+.mwt-budget-global-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 12px;
+}
+
+.mwt-budget-global-controls input[type="number"] {
+    width: 100px;
+    padding: 3px 6px;
+    font-size: 12px;
+    text-align: right;
+    background: var(--mwt-bg, rgba(0, 0, 0, 0.2));
+    color: var(--mwt-text, inherit);
+    border: 1px solid var(--mwt-border, rgba(255, 255, 255, 0.15));
+    border-radius: 4px;
+}

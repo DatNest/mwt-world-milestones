@@ -1,0 +1,346 @@
+/**
+ * core/context.js — Shared SillyTavern context helpers
+ *
+ * Provides safe access to the SillyTavern context object, chat metadata,
+ * message retrieval, and player name resolution.  Used by every module
+ * in the merged extension.
+ */
+
+import { stripNonNarrative } from './strip.js';
+
+/** Global settings key, kept here to avoid a context ↔ settings import cycle. */
+const GLOBAL_SETTINGS_KEY = 'merged_world_tracker';
+
+/**
+ * Returns the SillyTavern context object, or null if unavailable.
+ * Tries both the modern namespace and the legacy global.
+ */
+export function getContextSafe() {
+    try {
+        if (typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function') {
+            return SillyTavern.getContext();
+        }
+    } catch { /* ignore */ }
+    try {
+        if (typeof getContext === 'function') return getContext();
+    } catch { /* ignore */ }
+    return null;
+}
+
+/**
+ * Returns the chat array from the current context, or an empty array.
+ *
+ * ⚠️ This returns the **live reference** to SillyTavern's internal chat array,
+ * not a copy.  Callers must treat it as read-only — mutating the returned
+ * array (push/splice/sort/etc.) will modify SillyTavern's state directly.
+ * If a mutable copy is needed, use `getChat().slice()` or spread `[...getChat()]`.
+ */
+export function getChat() {
+    return getContextSafe()?.chat || [];
+}
+
+/**
+ * Number of trailing chat messages to exclude from tracker "recent message"
+ * scans. The final user + assistant pair is usually still in flight when a
+ * refresh fires (it can be swiped, edited, or discarded), so feeding it into
+ * world-state / knowledge / story-planner scans makes trackers stale or
+ * misrepresent the current scene. Set to 0 to disable.
+ */
+export const DEFAULT_RECENT_HISTORY_EXCLUDE = 2;
+export const MAX_RECENT_HISTORY_EXCLUDE = 10;
+
+/**
+ * Read and clamp the global number of newest messages that are considered
+ * in-flight rather than stable history. This is intentionally global: World
+ * State, Chronicle, Knowledge, Relationships, Growth, and Story Planner must
+ * agree on the same cutoff. Interiority evaluates the current turn and does
+ * not call this helper.
+ *
+ * @returns {number} integer in the inclusive range 0–10
+ */
+export function getRecentHistoryExclude() {
+    const raw = getContextSafe()?.extensionSettings?.[GLOBAL_SETTINGS_KEY]?.recentHistoryExclude;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return DEFAULT_RECENT_HISTORY_EXCLUDE;
+    return Math.min(MAX_RECENT_HISTORY_EXCLUDE, Math.max(0, Math.round(parsed)));
+}
+
+/**
+ * Return the exclusive end index of settled chat history. Messages at or after
+ * this index are the configurable in-flight tail and must be deferred for a
+ * later scan, never treated as consumed. This is the single definition of
+ * "stable history" for tracker refreshes.
+ *
+ * @param {Array} [chat=getChat()]
+ * @returns {number}
+ */
+export function getStableHistoryEnd(chat = getChat()) {
+    return Math.max(0, (chat?.length || 0) - getRecentHistoryExclude());
+}
+
+/**
+ * Retrieve recent chat messages as formatted text.
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.maxMessages=50]  — max messages to include
+ * @param {number} [opts.maxChars=500000] — character budget
+ * @param {boolean} [opts.filterSystem=false] — exclude system messages
+ * @param {number} [opts.excludeLast=0] — trailing messages to skip (in-flight/swipe safety)
+ * @param {boolean} [opts.stableHistory=false] — use the global settled-history cutoff
+ * @param {boolean} [opts.strip=false] — strip non-narrative blocks from each message
+ * @param {boolean} [opts.stripAffordances=false] — also strip timestamp-adjacent
+ *   numbered suggestion divs when strip is enabled (Interiority only)
+ * @param {boolean} [opts.preserveOffScreen=true] — when stripping, keep Off-Screen
+ *   Events module blocks (the actor/witness-sealed log). Consumers without
+ *   partition rules for that block (Knowledge) must pass false.
+ * @returns {string} newline-separated "Name: text" lines, oldest-first
+ */
+export function getRecentMessages({
+    maxMessages = 50,
+    maxChars = 500000,
+    filterSystem = false,
+    strip = false,
+    stripAffordances = false,
+    preserveOffScreen = true,
+    excludeLast = 0,
+    stableHistory = false,
+} = {}) {
+    const chat = getChat();
+    // Skip the trailing messages that may still be in flight (swiped, edited,
+    // or discarded) so tracker refreshes don't capture stale/misrepresented
+    // turns. Defaults to 0; stable-history tracker helpers use
+    // getStableHistoryEnd() instead.
+    const end = stableHistory ? getStableHistoryEnd(chat) : Math.max(0, chat.length - excludeLast);
+    let slice = chat.slice(Math.max(0, end - maxMessages), end);
+    if (filterSystem) {
+        slice = slice.filter(m => !m?.is_system && m?.extra?.type !== 'narrator');
+    }
+    const lines = [];
+    let total = 0;
+    for (let i = slice.length - 1; i >= 0; i--) {
+        const msg = slice[i];
+        const name = msg?.name || (msg?.is_user ? 'User' : 'Assistant');
+        let text = String(msg?.mes || '').trim();
+        if (strip) text = stripNonNarrative(text, { preserveOffScreen, stripAffordances });
+        if (!text) continue;
+        const line = `${name}: ${text}`;
+        if (total + line.length > maxChars) break;
+        lines.push(line);
+        total += line.length + 1;
+    }
+    return lines.reverse().join('\n');
+}
+
+/**
+ * Returns a Set of player / co-protagonist names (lower-cased).
+ * Includes BOTH {{user}} (name1) AND {{char}} (name2), plus all group-chat
+ * member names. Useful for filtering out non-NPCs during scans (knowledge
+ * tracker). Interiority should use {@link getUserNames} instead, since
+ * {{char}} is a valid NPC target for thought generation.
+ */
+export function getPlayerNames({ lower = true, includeFirstChat = false } = {}) {
+    const ctx = getContextSafe();
+    const names = new Set();
+    const transform = lower ? (s) => s.toLowerCase() : (s) => s;
+    if (ctx?.name1) names.add(transform(String(ctx.name1).trim()));
+    if (ctx?.name2) names.add(transform(String(ctx.name2).trim()));
+    // Group-chat member names
+    if (Array.isArray(ctx?.characters)) {
+        for (const ch of ctx.characters) {
+            if (ch?.name) names.add(transform(String(ch.name).trim()));
+        }
+    }
+    // Fallback: first message in chat (usually the AI character's greeting)
+    if (includeFirstChat) {
+        const chat = getChat();
+        if (chat) {
+            const first = chat[0];
+            if (first?.name) names.add(transform(first.name.trim()));
+        }
+    }
+    return names;
+}
+
+/**
+ * Returns a Set containing ONLY the user persona name(s) ({{user}} / name1),
+ * lower-cased by default. Group-chat member names that aren't the current
+ * persona are NOT included.
+ *
+ * Use this instead of {@link getPlayerNames} when you need to exclude only
+ * the human user but keep {{char}} and other AI characters as valid targets
+ * (e.g. the interiority roster builder).
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.lower=true] — lower-case the names
+ * @returns {Set<string>}
+ */
+export function getUserNames({ lower = true } = {}) {
+    const ctx = getContextSafe();
+    const names = new Set();
+    const transform = lower ? (s) => s.toLowerCase() : (s) => s;
+    if (ctx?.name1) names.add(transform(String(ctx.name1).trim()));
+    return names;
+}
+
+/**
+ * Access the current chat's metadata object.
+ *
+ * If key is provided, returns that specific sub-key.
+ * If key is omitted, returns the entire chatMetadata object
+ * (creating it on the context if it doesn't exist yet).
+ *
+ * @param {string} [key] — optional metadata key
+ * @returns {*} the stored value, or the whole metadata object
+ */
+export function getChatMeta(key) {
+    const ctx = getContextSafe();
+    if (!ctx) return key ? undefined : {};
+    if (!ctx.chatMetadata) ctx.chatMetadata = {};
+    if (key !== undefined) return ctx.chatMetadata[key];
+    return ctx.chatMetadata;
+}
+
+/**
+ * Write a patch into the current chat's metadata and trigger a save.
+ *
+ * @param {string} key   — metadata key
+ * @param {object} patch — object to merge into the existing metadata value
+ */
+export function setChatMeta(key, patch) {
+    const ctx = getContextSafe();
+    if (!ctx) return;
+    if (!ctx.chatMetadata) ctx.chatMetadata = {};
+    const prev = ctx.chatMetadata[key] || {};
+    ctx.chatMetadata[key] = { ...prev, ...patch, lastUpdated: Date.now() };
+    if (typeof ctx.saveMetadataDebounced === 'function') ctx.saveMetadataDebounced();
+    else if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
+}
+
+/**
+ * Get the context's setExtensionPrompt function for injection.
+ * Returns null if unavailable.
+ */
+export function getSetExtensionPrompt() {
+    const ctx = getContextSafe();
+    if (ctx && typeof ctx.setExtensionPrompt === 'function') return ctx.setExtensionPrompt.bind(ctx);
+    // Try global (some ST versions export it directly)
+    if (typeof window !== 'undefined' && typeof window.setExtensionPrompt === 'function') return window.setExtensionPrompt;
+    return null;
+}
+
+/**
+ * Escape a string for use in a RegExp.
+ */
+export function escapeRegex(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Build a whole-phrase RegExp for a free-text name form (a user-approved
+ * alias, a registry spelling), with word boundaries derived from the phrase's
+ * actual EDGE characters instead of unconditional `\b`s.
+ *
+ * A `\b` only exists between a word character and a non-word character, so
+ * wrapping an escaped phrase in `\b…\b` never matches when the phrase begins
+ * or ends with punctuation: beside "A.J."'s trailing dot or "(Vixen)"'s
+ * brackets there is no boundary to find, and evidence that names the person
+ * goes unseen. A boundary is therefore emitted only on the side whose edge
+ * character is a word character; a punctuation edge keeps its literal match
+ * and deliberately accepts a longer neighbour ("A.J." inside "A.J.'s").
+ * Whitespace runs inside the phrase collapse to `\s+` so a form split by
+ * formatting still matches. Case-insensitive by default.
+ *
+ * @param {string} phrase — the raw, unescaped phrase (trimmed here)
+ * @param {string} [flags='i']
+ * @returns {RegExp} never matches when the phrase is empty/blank
+ */
+export function wholePhraseRegex(phrase, flags = 'i') {
+    const trimmed = String(phrase ?? '').trim();
+    if (!trimmed) return new RegExp('(?!x)x', flags); // matches nothing
+    const escaped = escapeRegex(trimmed).replace(/\s+/g, '\\s+');
+    const lead = /\w/.test(trimmed[0]) ? '\\b' : '';
+    const tail = /\w/.test(trimmed[trimmed.length - 1]) ? '\\b' : '';
+    return new RegExp(`${lead}${escaped}${tail}`, flags);
+}
+
+/**
+ * Convert a SillyTavern message `send_date` to epoch milliseconds.
+ *
+ * `send_date` is a STRING whose format varies by ST build:
+ *   - Live ST (`getMessageTimeStamp` → `toISOString`): ISO 8601
+ *     `"2023-06-19T14:20:15.123Z"` — `Date.parse` handles it natively.
+ *   - Aikobots-4 fork (custom humanized string): `"June 19, 2023 2:20pm"` —
+ *     needs ST's `timestampToMoment` parser.
+ *   - Legacy builds may still emit a numeric Unix timestamp (seconds or ms).
+ *
+ * Returns `null` when the value can't be resolved; callers choose their own
+ * fallback (0 for windowing, `Date.now()` for capture-time stamping). This is
+ * the single source of truth for `send_date` parsing — both
+ * `normalizeSendDate` (ils_compat.js) and `extractMsgTs` (evidence.js) route
+ * through it so the two paths can't drift apart again.
+ *
+ * @param {number|string|undefined|null} sendDate
+ * @returns {number|null} epoch milliseconds, or null when unresolved
+ */
+export function sendDateToMs(sendDate) {
+    if (sendDate == null) return null;
+    // Numeric or all-digit string → Unix timestamp (seconds or ms).
+    if (typeof sendDate === 'number' ||
+        (typeof sendDate === 'string' && /^\d+$/.test(sendDate.trim()))) {
+        const n = Number(sendDate);
+        if (Number.isFinite(n) && n > 0) return n > 1e12 ? n : n * 1000;
+    }
+    // ISO 8601 (live ST getMessageTimeStamp → toISOString). Native — no import.
+    const parsed = Date.parse(sendDate);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    // Custom humanized format (Aikobots-4 fork) — only if ST exposes the parser.
+    try {
+        const ctx = getContextSafe();
+        const m = ctx?.timestampToMoment?.(sendDate);
+        if (m && typeof m.isValid === 'function' && m.isValid()) return m.valueOf();
+    } catch { /* parser unavailable — fall through */ }
+    return null;
+}
+
+/**
+ * Rough characters-per-token ratio used by the fallback estimator.
+ *
+ * Empirical data for English text on common BPE tokenizers (GPT-2, Llama,
+ * Claude) places the average around 4–5 chars/token.  We use 4.5 as a
+ * middle-ground that avoids the systematic overestimation of the previous
+ * `length / 4` heuristic while still erring slightly high for safety in
+ * budget/usage displays.
+ */
+const FALLBACK_CHARS_PER_TOKEN = 4.5;
+
+/**
+ * Estimate token count for a string.
+ * Tries SillyTavern's built-in tokenizer first, falls back to a length-based
+ * heuristic (see `FALLBACK_CHARS_PER_TOKEN`).
+ * @param {string} text
+ * @returns {number}
+ */
+export function estimateTokens(text) {
+    if (!text || typeof text !== 'string') return 0;
+
+    // Try SillyTavern's tokenizer
+    try {
+        if (typeof window !== 'undefined') {
+            // SillyTavern exposes getTokenCount globally or via context
+            const ctx = getContextSafe();
+            if (ctx && typeof ctx.getTokenCount === 'function') {
+                return ctx.getTokenCount(text);
+            }
+            if (typeof getTokenCount === 'function') {
+                return getTokenCount(text);
+            }
+            // Try the tokenizers module
+            if (typeof SillyTavern !== 'undefined' && SillyTavern?.tokenizers?.getTokenCount) {
+                return SillyTavern.tokenizers.getTokenCount(text);
+            }
+        }
+    } catch { /* fallback */ }
+
+    // Fallback: rough length-based estimate (see FALLBACK_CHARS_PER_TOKEN).
+    return Math.ceil(text.length / FALLBACK_CHARS_PER_TOKEN);
+}

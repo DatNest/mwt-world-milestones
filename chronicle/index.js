@@ -1,0 +1,353 @@
+/**
+ * chronicle/index.js — Session Chronicle module (thin orchestrator).
+ *
+ * Public API: { init, render, onMessageReceived, onChatChanged,
+ *               onGenerationStarted, onGenerationStopped }
+ *
+ * Re-exports additional helpers used by root index.js for slash commands,
+ * macros, and the floating button bar.
+ *
+ * Sub-modules:
+ *   data.js          — constants, state, settings, data access, helpers
+ *   prompts.js       — prompt templates
+ *   injection.js     — prompt injection logic
+ *   snapshots.js     — generation, validation, CRUD, world state sync
+ *   import-export.js — export/import
+ *   render.js        — all UI rendering
+ */
+
+import {
+    syncSharedConnectionSettings, estimateTokens, notify, getChat,
+    captureScope, assertSameScope,
+} from '../core/index.js';
+
+import {
+    state, _render,
+    getSettings, saveSettings, hasValidSettings,
+    getChronicleData, setChronicleData, setChronicleDataChecked, getSnapshots,
+    persistMsgSinceSnapshot, restoreReceiptBookkeeping, getReceiptIdentity,
+    isAnchorStale,
+} from './data.js';
+
+import {
+    isInjectionEnabled, getEntriesForInjection, applyInjection, buildChronicleInjectionText,
+} from './injection.js';
+
+import { generateSnapshot } from './snapshots.js';
+
+import { renderContent, showRegenerateDiff, showConsolidationPreview } from './render.js';
+
+// ─── Wire late-binding render registry ───────────────────────────────────────
+// This allows data.js and snapshots.js to call render functions without
+// creating circular imports (data → render → data).
+
+_render.renderContent = renderContent;
+_render.showRegenerateDiff = showRegenerateDiff;
+_render.showConsolidationPreview = showConsolidationPreview;
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+export function init(parentModal) {
+    if (parentModal) {
+        state.modal = parentModal;
+        state.contentEl = null;  // Reset so it re-queries
+        renderContent();
+    }
+    applyInjection();
+    initializeReceiptBookkeeping();
+    console.log('[MWT:Chronicle] Module initialized');
+}
+
+function initializeReceiptBookkeeping() {
+    restoreReceiptBookkeeping();
+}
+
+function recordCurrentReceiptEvent(chat, messageIndex = null) {
+    if (Number.isInteger(messageIndex) && messageIndex >= 0 && messageIndex < chat.length) {
+        const receipt = chat[messageIndex];
+        if (receipt && !receipt.is_user && !receipt.is_system) {
+            const key = getReceiptIdentity(receipt);
+            state.countedReceiptEvents.set(key, (state.countedReceiptEvents.get(key) || 0) + 1);
+        }
+        return;
+    }
+    for (let index = chat.length - 1; index >= 0; index--) {
+        const message = chat[index];
+        if (!message || message.is_user || message.is_system) continue;
+        const key = getReceiptIdentity(message);
+        state.countedReceiptEvents.set(key, (state.countedReceiptEvents.get(key) || 0) + 1);
+        return;
+    }
+}
+
+export function render() {
+    // Return placeholder — init() will call renderContent() once modal is in DOM
+    return '<div style="text-align:center;padding:20px;color:var(--mwt-text-dim)">Loading chronicle…</div>';
+}
+
+export { applyInjection };
+
+export function getModuleRender() { return render; }
+export function getModuleWireEvents() {
+    return () => {
+        // The modal body is rebuilt (innerHTML) on every open, so the cached
+        // content element goes stale and init() only runs once. Re-query and
+        // re-render here or the tab stays stuck on the "Loading…" placeholder.
+        state.contentEl = null;
+        renderContent();
+    };
+}
+
+export async function onMessageReceived({ countMessage = true, messageIndex = null } = {}) {
+    // CHRONICLE-03: Messages arriving while a snapshot is being generated
+    // must still increment the counter and update lastChatLength. The old
+    // early-return on isGenerating meant those messages were never counted,
+    // and generateSnapshot()'s success path resets the counter — so they were
+    // permanently lost from the auto-snapshot cadence.
+    //
+    // Only the snapshot trigger itself should be suppressed during generation
+    // (otherwise two concurrent generations could fire).
+    const chat = getChat() || [];
+    state.lastChatLength = chat.length;
+
+    // PANIC-COUNTER-SYMMETRY (receive side): counting toward the auto-snapshot
+    // threshold and the snapshot generation are gated by the panic flag
+    // (countMessage). lastChatLength bookkeeping above runs every turn — even
+    // during a panic window — so onMessageDeleted always computes `removed`
+    // from a live length, not a frozen one. Mirrors the MESSAGE_DELETED
+    // adjustCounters gate.
+    if (!countMessage) return;
+
+    state.msgSinceSnapshot++;
+    recordCurrentReceiptEvent(chat, messageIndex);
+    persistMsgSinceSnapshot();
+
+    const settings = getSettings();
+    const threshold = settings.autoSnapshotThreshold || 40;
+
+    console.log(`[MWT:Chronicle] MESSAGE_RECEIVED — counter ${state.msgSinceSnapshot}/${threshold}`);
+
+    if (state.isGenerating) {
+        console.log('[MWT:Chronicle] Snapshot generation in progress — deferring trigger.');
+        return;
+    }
+
+    if (!settings.autoSnapshot || !hasValidSettings() || state.msgSinceSnapshot < Math.max(threshold, state.autoSnapshotRetryAt || 0)) {
+        return;
+    }
+
+    console.log(`[MWT:Chronicle] Auto-snapshot at ${state.msgSinceSnapshot} messages`);
+    // CHRONICLE-02: A chat switch must not update the incoming chat's retry
+    // gate or announce success for the outgoing chat.
+    const scopeBefore = captureScope();
+    const snapshot = await generateSnapshot(true);
+    if (!assertSameScope(scopeBefore).ok) return;
+    // A failed call leaves receipts pending. Back off until another full
+    // threshold arrives, rather than retrying on every subsequent message.
+    if (!snapshot) {
+        state.autoSnapshotRetryAt = state.msgSinceSnapshot + threshold;
+    } else {
+        state.autoSnapshotRetryAt = 0;
+    }
+    // Only notify on success — generateSnapshot returns null on failure and
+    // already shows its own error status/notification in that case.
+    if (snapshot) {
+        notify('Session Chronicle', 'A new chronicle snapshot has been generated and is ready to review.', 'info');
+    }
+}
+
+export function onChatChanged() {
+    state.isGenerating = false;
+    state.autoSnapshotRetryAt = 0;
+    state.isMainGenerating = false;
+    state.selectedSnapshotId = null;
+    state.consolidateMode = false;
+    state.consolidateBaseId = null;
+    state.bulkDeleteMode = false;
+    state.checkedForMerge.clear();
+    state.pendingSearch = '';
+    state._lastStatusMsg = '';
+    state._lastStatusLevel = '';
+    // Restore counter from the incoming chat's metadata instead of zeroing,
+    // so the counter survives chat switches and reloads.
+    const saved = getChronicleData()?.msgSinceSnapshot;
+    state.msgSinceSnapshot = (typeof saved === 'number' && Number.isFinite(saved)) ? saved : 0;
+    initializeReceiptBookkeeping();
+    // Persist the restored pair together; persisting before restoration would
+    // overwrite valid stored provenance with the previous chat's empty map.
+    persistMsgSinceSnapshot();
+    // Track chat length for bulk-delete counter adjustment
+    const chat = getChat() || [];
+    state.lastChatLength = chat.length;
+    applyInjection();
+    console.log('[MWT:Chronicle] Chat changed — state reset.');
+}
+
+/**
+ * The scope-INDEPENDENT half of onChatChanged(), run by index.js's
+ * CHAT_CHANGED handler while the chronicle store is paused for this chat
+ * (Part 6 §7.4/§5.4). Resets transient session/UI state and clears the
+ * previous chat's injection (applyInjection()'s paused branch) without one
+ * read of the blocked store — no counter restore, no receipt bookkeeping,
+ * no persistMsgSinceSnapshot() (the write seam would refuse anyway).
+ */
+export function onChatChangedWhilePaused() {
+    state.isGenerating = false;
+    state.autoSnapshotRetryAt = 0;
+    state.isMainGenerating = false;
+    state.selectedSnapshotId = null;
+    state.consolidateMode = false;
+    state.consolidateBaseId = null;
+    state.bulkDeleteMode = false;
+    state.checkedForMerge.clear();
+    state.pendingSearch = '';
+    state._lastStatusMsg = '';
+    state._lastStatusLevel = '';
+    applyInjection();
+    console.log('[MWT:Chronicle] Chat changed while paused — injection cleared, transient state reset (store hydration skipped).');
+}
+
+// ─── Swipe / edit / delete awareness ─────────────────────────────────────────
+// Keep the auto-snapshot counter and anchor in sync when the user mutates the
+// chat history, so tracking doesn't drift after edits/deletes/swipes.
+
+/**
+ * A message was deleted. Decrement `msgSinceSnapshot` to reflect the shorter
+ * chat, and invalidate the chronicle anchor if it pointed at or after the
+ * deleted message.
+ *
+ * @param {number} deletedIndex - The chat-array index of the removed message.
+ * @param {{ adjustCounters?: boolean }} [opts] - When false (panic switch on),
+ *   the counter decrement is skipped but bookkeeping + integrity still run.
+ */
+export function onMessageDeleted(deletedIndex, { adjustCounters = true } = {}) {
+    if (typeof deletedIndex !== 'number') return;
+
+    // SillyTavern fires a single MESSAGE_DELETED event for bulk deletes
+    // ("delete above/below"), so compute the actual number removed by comparing
+    // against the cached chat length. Falls back to 1 for single deletes.
+    const currentLen = getChat()?.length || 0;
+    const removed = state.lastChatLength > currentLen
+        ? state.lastChatLength - currentLen
+        : 1;
+    const liveReceiptKeys = new Set((getChat() || [])
+        .map(message => (!message || message.is_user || message.is_system ? null : getReceiptIdentity(message)))
+        .filter(Boolean));
+    let removedReceipts = 0;
+    let provenanceChanged = false;
+    for (const [key, eventCount] of state.countedReceiptEvents) {
+        if (!liveReceiptKeys.has(key)) {
+            removedReceipts += eventCount;
+            state.countedReceiptEvents.delete(key);
+            provenanceChanged = true;
+        }
+    }
+    // Bookkeeping — ALWAYS live
+    state.lastChatLength = currentLen;
+
+    if (adjustCounters && state.msgSinceSnapshot > 0) {
+        state.msgSinceSnapshot = Math.max(0, state.msgSinceSnapshot - removedReceipts);
+        persistMsgSinceSnapshot();
+        console.log(`[MWT:Chronicle] MESSAGE_DELETED at index ${deletedIndex} (removed ${removed} entries / ${removedReceipts} counted receipt events) — counter adjusted to ${state.msgSinceSnapshot}`);
+    }
+    else if (provenanceChanged) persistMsgSinceSnapshot();
+    // Integrity — ALWAYS live. If the anchor referenced the deleted message (or
+    // something after it), mark it stale so the next snapshot re-anchors against
+    // the live chat.
+    const data = getChronicleData();
+    if (data.lastAnchor && typeof data.lastAnchor.msgIndex === 'number') {
+        if (data.lastAnchor.msgIndex >= deletedIndex) {
+            setChronicleData({ anchorStale: true });
+            console.log('[MWT:Chronicle] lastAnchor invalidated by delete — flagged stale.');
+        }
+    }
+    // Force the message-count badge to refresh
+    document.dispatchEvent(new CustomEvent('mwt:busy-changed'));
+}
+
+/**
+ * A message was swiped (its content replaced with an alternate generation).
+ * The auto-snapshot counter does not need adjustment (chat length is unchanged),
+ * but if the swiped message is the chronicle anchor, its content fingerprint
+ * no longer matches, so flag staleness.
+ *
+ * @param {number} swipedIndex - The chat-array index of the swiped message.
+ */
+export function onMessageSwiped(swipedIndex) {
+    const data = getChronicleData();
+    if (isAnchorStale(data.lastAnchor)) {
+        setChronicleData({ anchorStale: true });
+        console.log(`[MWT:Chronicle] MESSAGE_SWIPED at index ${swipedIndex} — anchor flagged stale.`);
+    }
+}
+
+/**
+ * A message was edited. Similar to swipe: if the edited message is the
+ * chronicle anchor (or the anchor is otherwise unresolvable), flag it stale
+ * so the user is aware the chronicle may be out of sync.
+ *
+ * @param {number} editedIndex - The chat-array index of the edited message.
+ */
+export function onMessageEdited(editedIndex) {
+    const data = getChronicleData();
+    if (isAnchorStale(data.lastAnchor)) {
+        setChronicleData({ anchorStale: true });
+        console.log(`[MWT:Chronicle] MESSAGE_EDITED at index ${editedIndex} — anchor flagged stale.`);
+    }
+}
+
+export function onGenerationStarted() { state.isMainGenerating = true; }
+export function onGenerationStopped() { state.isMainGenerating = false; }
+
+/**
+ * Returns auto-snapshot countdown status for the floating button badge,
+ * or null if auto-snapshot is disabled.
+ */
+export function getAutoSnapshotStatus() {
+    const settings = getSettings();
+    if (!settings.autoSnapshot) return null;
+    const threshold = settings.autoSnapshotThreshold || 40;
+    return { threshold, counter: state.msgSinceSnapshot };
+}
+
+/** Returns true if a snapshot is currently being generated */
+export function isGeneratingSnapshot() {
+    return state.isGenerating;
+}
+
+export function getTotalTokens() {
+    if (!isInjectionEnabled()) return 0;
+    return estimateTokens(buildChronicleInjectionText());
+}
+
+export function syncGlobalSettings(patch) {
+    return syncSharedConnectionSettings(getSettings, saveSettings, patch, '[MWT:Chronicle]');
+}
+
+/** Slash command: trigger a chronicle snapshot */
+export async function triggerSnapshot() {
+    return generateSnapshot();
+}
+
+/** Slash command / macro: set injection enabled/disabled */
+export function setInjectionEnabled(enabled) {
+    if (!setChronicleDataChecked({ injectEnabled: !!enabled }).ok) return false;
+    applyInjection();
+    return true;
+}
+
+/** Macro: return the full chronicle injection text */
+export function getChronicleText() {
+    if (!isInjectionEnabled()) return '';
+    const entries = getEntriesForInjection();
+    if (!entries.length) return '';
+    return entries.map(s => s.text || '').join('\n\n---\n\n');
+}
+
+/** Macro: return only the most recent chronicle entry */
+export function getLastEntryText() {
+    const snapshots = getSnapshots();
+    if (!snapshots.length) return '';
+    const sorted = [...snapshots].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    return sorted[0]?.text || '';
+}

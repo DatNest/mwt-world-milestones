@@ -1,0 +1,68 @@
+/* Overview layout. Theme colors come from the shared MWT variables. */
+.mwt-overview-header,
+.mwt-overview-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.mwt-overview-header p { color: var(--mwt-text-dim); margin: 4px 0 0; }
+.mwt-overview-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+    margin: 14px 0;
+}
+.mwt-overview-card {
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    padding: 12px;
+    background: var(--mwt-bg-secondary, transparent);
+}
+.mwt-overview-card h3 { margin: 0 0 8px; font-size: 14px; }
+.mwt-overview-card-body { min-height: 24px; color: var(--mwt-text-dim); }
+.mwt-overview-card button,
+.mwt-overview-footer button { margin-top: 8px; }
+/* The pane's buttons carry the shared .mwt-btn chrome (theme-aware background
+   and text — the host default left them white-on-white); overview contexts
+   size them compactly so they sit inside cards and finding rows. */
+.mwt-overview-card .mwt-btn,
+.mwt-overview-footer .mwt-btn,
+.mwt-overview-maintenance .mwt-btn,
+.mwt-overview-tools .mwt-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+.mwt-overview-error { border-color: var(--mwt-error, #b44); }
+.mwt-overview-error p { margin: 0; color: var(--mwt-error, #b44); }
+.mwt-overview-empty { opacity: .75; }
+.mwt-overview-health { margin: 0; padding-left: 18px; font-size: 12px; }
+.mwt-overview-footer { justify-content: flex-start; color: var(--mwt-text-dim); font-size: 12px; }
+
+.mwt-overview-card .mwt-overview-link { white-space: nowrap; }
+
+/* 🧰 Maintenance — filled in below the grid once the async audit settles. */
+.mwt-overview-maintenance {
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 14px;
+}
+.mwt-overview-maintenance h3 { margin: 0 0 4px; font-size: 14px; }
+.mwt-overview-maintenance > p { margin: 0 0 8px; color: var(--mwt-text-dim); font-size: 12px; }
+.mwt-overview-maintenance > ul { margin: 0; padding-left: 18px; }
+.mwt-overview-finding + .mwt-overview-finding { margin-top: 6px; }
+.mwt-overview-review { margin: 4px 0 0; padding-left: 18px; color: var(--mwt-text-dim); font-size: 12px; }
+.mwt-overview-maintenance code { overflow-wrap: anywhere; }
+.mwt-overview-maintenance-error { margin: 0 0 14px; color: var(--mwt-error, #b44); }
+.mwt-overview-tools { border-top: 1px solid var(--mwt-border); margin: 0 0 14px; padding-top: 8px; }
+.mwt-overview-tools summary { cursor: pointer; color: var(--mwt-text-dim); }
+.mwt-overview-tools > p { color: var(--mwt-text-dim); font-size: 12px; }
+.mwt-overview-tools-error { margin: 0 0 14px; color: var(--mwt-error, #b44); }
+.mwt-overview-tool-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.mwt-overview-tool-consequence { color: var(--mwt-danger, #b44); }
+.mwt-overview-tool-preview table { border-collapse: collapse; margin: 4px 0; }
+.mwt-overview-tool-preview th,
+.mwt-overview-tool-preview td { border: 1px solid var(--mwt-border); padding: 2px 6px; text-align: left; font-size: 12px; }
+.mwt-overview-tool-preview th { color: var(--mwt-text-dim); }
