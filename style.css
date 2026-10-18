@@ -1,0 +1,25 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   Merged World Tracker — CSS Entry Point
+   ──────────────────────────────────────────────────────────────────────────
+   SillyTavern loads this file (declared in manifest.json). Module-specific
+   styles are imported from each module directory. The @import statements
+   MUST come before any other rules in this file.
+
+   File map:
+     core/style.css         — variables, modal, tabs, buttons, forms, diffs,
+                              light-theme overrides, mobile, classic buttons
+     chronicle/style.css    — .sc-* (Session Chronicle)
+     knowledge/style.css    — .kt-* (Knowledge Tracker + NPC Growth Profile)
+     interiority/style.css  — .mwt-int-* (Interiority thoughts & intentions)
+     story_planner/style.css — .sp-* (Story Planner arc cards)
+     backup/style.css       — .mwt-backup-* (unified backup/restore UI)
+   ────────────────────────────────────────────────────────────────────────── */
+
+@import url('core/style.css');
+@import url('chronicle/style.css');
+@import url('knowledge/style.css');
+@import url('interiority/style.css');
+@import url('story_planner/style.css');
+@import url('backup/style.css');
+@import url('budget/style.css');
+@import url('dashboard/style.css');

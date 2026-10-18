@@ -1,0 +1,19 @@
+{
+  "name": "merged-world-tracker",
+  "version": "2.13.0",
+  "description": "Unified extension combining World State, Session Chronicle, Knowledge Tracker, Story Planner, and Interiority into a single modular system.",
+  "license": "MIT",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5",
+    "eslint-plugin-import": "^2.32.0",
+    "globals": "^17.9.0",
+    "jsdom": "^26.1.0",
+    "vitest": "^3.0.0"
+  }
+}

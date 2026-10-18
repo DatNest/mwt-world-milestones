@@ -1,0 +1,1202 @@
+/**
+ * world_state/render.js — UI rendering, event wiring, archive/import/clear,
+ * revert/diff, and preview for the World State module.
+ *
+ * Depends on all other world_state sub-modules.
+ */
+
+import {
+    escapeHtml, computeLcsDiff, renderDiffHtml, estimateTokens,
+    createModal, showModal, hideModal, setStatus,
+    downloadJson, pickTextFile,
+    renderApiSettingsFields, readApiSettingsValues, wireApiSettingsFields,
+    getChat,
+    captureScope, assertSameScope,
+    resolveApiCall, normaliseOutput,
+} from '../core/index.js';
+// Direct import (not the barrel) so the real helper runs under the test
+// barrel→stub alias — the wireTablist precedent (accessibility Slice 2).
+// setControlBusy keeps `disabled` and `aria-busy` in step on async handlers
+// (a11y plan §4.4).
+import { setControlBusy } from '../core/ui.js';
+
+import {
+    DEFAULT_AUTO_SAVE_INTERVAL, getSettings, saveSettings, getPinnedEntities, EXPIRY_SECTIONS_DEFAULT,
+    DETAIL_LEVELS, normalizeDetailLevel, getPromptProfile,
+} from './settings.js';
+
+// One id map for renderApiSettingsFields, wireApiSettingsFields and
+// readApiSettingsValues, so the rendered fields and the Save reader agree.
+const WS_API_FIELD_IDS = {
+    profileId: 'ws-connection-profile',
+    urlId: 'ws-api-url', keyId: 'ws-api-key', modelId: 'ws-model',
+    maxTokensId: 'ws-max-tokens', tempId: 'ws-temp',
+    includeAdvanced: false, includeHeaders: false,
+};
+import {
+    state, SECTIONS, VARIETY_LABELS,
+    getWorldStateText, getWorldStateData, setWorldStateData, setWorldStateDataChecked,
+    parseWorldStateImport,
+    getAutoSaveHistory, commitHistorySnapshot,
+    isInjectionEnabled, isAutoRefreshEnabled, getAutoRefreshInterval,
+    usesGlobalDefaults, setUsesGlobalDefaults, setWorldSetting,
+    getMaxScanMessages, setProvenance, getProvenance,
+} from './data.js';
+import {
+    applyWorldStateInjection, getHookMode, buildInjectionPreview,
+} from './injection.js';
+import { refreshWorldState, refreshWorldStateDelta, restartAutoSaveTimer } from './refresh.js';
+import { regenerateSection } from './sections.js';
+import { HOOK_SECTIONS, DETAIL_LEVEL_NAMES, detailLevelIncludesSection } from './prompts.js';
+import { buildProvenance, getStalenessReport, purgeStaleEntries } from './provenance.js';
+import { deriveDocumentStatus, getDeltaReconcileEvery, getDeltaStaleAfterMsgs } from './delta.js';
+
+// ─── Document status chip (TODO §3-F / PI §3) ────────────────────────────────
+// Surfaces whether the document is fully reconciled / delta-updated / manually
+// edited / stale relative to chat. The facts come from delta.js's
+// deriveDocumentStatus(); this maps them to the chip's emoji + label + color.
+
+const DOC_STATUS_STYLES = {
+    reconciled: { color: '#22c55e' },   // green
+    delta: { color: '#eab308' },        // yellow
+    manual: { color: '#38bdf8' },       // blue
+    stale: { color: '#f87171' },        // red
+    empty: { color: 'var(--mwt-text-dim)' },
+};
+
+function documentStatusPresentation(status) {
+    switch (status.kind) {
+        case 'reconciled':
+            return {
+                emoji: '🟢',
+                title: `Fully reconciled by a full refresh${status.msgsSinceRefresh !== null ? ` — ${status.msgsSinceRefresh} message(s) ago` : ''}.`,
+                label: 'Fully reconciled',
+            };
+        case 'delta':
+            return {
+                emoji: '🟡',
+                title: `Delta-updated — ${status.deltasSinceFull} partial update(s) since the last full refresh. A full reconciliation runs automatically every ${getDeltaReconcileEvery()}.`,
+                label: `Delta ×${status.deltasSinceFull}`,
+            };
+        case 'manual':
+            return {
+                emoji: '✏️',
+                title: 'Manually edited (or imported) since the last refresh — not LLM-reconciled yet.',
+                label: 'Manually edited',
+            };
+        case 'stale':
+            return {
+                emoji: '🔴',
+                title: `Stale — ${status.msgsSinceRefresh} message(s) since the last refresh (threshold ${getDeltaStaleAfterMsgs()}).`,
+                label: `Stale · ${status.msgsSinceRefresh} msgs`,
+            };
+        default:
+            return { emoji: '⚪', title: 'No world state yet.', label: 'No state' };
+    }
+}
+
+export function refreshDocumentStatusChip() {
+    if (!state.modal) return;
+    const chip = state.modal.querySelector('#ws-doc-status');
+    if (!chip) return;
+    const status = deriveDocumentStatus();
+    const presentation = documentStatusPresentation(status);
+    // The emoji duplicates the visible label + color, so it stays decorative:
+    // rebuilt through an aria-hidden span, never a raw textContent write
+    // (Slice 4 item 2).
+    chip.innerHTML = `<span aria-hidden="true">${presentation.emoji}</span> ${escapeHtml(presentation.label)}`;
+    chip.title = presentation.title;
+    chip.style.color = DOC_STATUS_STYLES[status.kind]?.color || '';
+}
+
+// ─── Editor stat helpers ─────────────────────────────────────────────────────
+
+export function updateEditorStats() {
+    if (!state.modal) return;
+    const editor = state.modal.querySelector('#ws-editor');
+    if (!editor) return;
+    const text = editor.value;
+    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    const tokens = estimateTokens(text);
+
+    // Update the editor stats bar — include tokens (matching the initial
+    // render format) instead of line count, so the display stays consistent
+    // after the user types or saves.
+    const stats = state.modal.querySelector('#ws-editor-stats');
+    if (stats) stats.textContent = `${text.length} chars · ${words} words · ~${tokens} tokens`;
+
+    // Update the toolbar word/token counter span so Save reflects the new
+    // counts immediately without requiring a full re-render / modal reopen.
+    const toolbarStats = state.modal.querySelector('#ws-toolbar-stats');
+    if (toolbarStats) {
+        const autoEnabled = isAutoRefreshEnabled();
+        const autoInterval = getAutoRefreshInterval();
+        toolbarStats.textContent = `${words} words · ~${tokens} tokens${autoEnabled ? ` · Auto: ${state.autoRefreshCounter}/${autoInterval} msgs` : ''}`;
+    }
+
+    // Document status chip (TODO §3-F): recompute on every stats refresh so
+    // it tracks edits, refreshes, and chat growth between re-renders.
+    refreshDocumentStatusChip();
+}
+
+export function refreshRevertButton() {
+    if (!state.modal) return;
+    const btn = state.modal.querySelector('#ws-revert');
+    if (btn) btn.disabled = getAutoSaveHistory().length === 0;
+}
+
+// ─── Live editor persistence ─────────────────────────────────────────────────
+// The old "auto-save" only ever snapshotted the *persisted* text, so anything
+// typed into the editor but not explicitly Saved was lost when the modal
+// re-rendered. Debounce-persist the editor to metadata as the user types so
+// edits are durable; the periodic auto-save timer then snapshots those edits
+// into history naturally (it reads the now-updated persisted text).
+
+const EDITOR_PERSIST_DELAY_MS = 1000;
+
+export function scheduleEditorPersist() {
+    if (state.editorPersistTimer) clearTimeout(state.editorPersistTimer);
+
+    // WORLD-STATE-09: Capture the scope at schedule time. The callback used to
+    // check only that the modal still existed — but the modal survives a chat
+    // switch, and `editor.value` still holds the PREVIOUS chat's text until
+    // renderModalContent() runs. onChatChanged() clearing this timer is the
+    // happy path; this assert is the guard for any path that changes chat
+    // without that handler running in time (bulk load, programmatic switch,
+    // handler ordering). Every other deferred write in the module captures and
+    // asserts — this one was the last holdout.
+    const scopeAtSchedule = captureScope();
+
+    state.editorPersistTimer = setTimeout(() => {
+        state.editorPersistTimer = null;
+        if (!state.modal) return;
+        const scopeResult = assertSameScope(scopeAtSchedule);
+        if (!scopeResult.ok) {
+            console.warn(
+                `[MWT:WorldState] Editor persist skipped (${scopeResult.reason}) — ` +
+                `the pending edit belongs to a different chat.`
+            );
+            return;
+        }
+        const editor = state.modal.querySelector('#ws-editor');
+        if (!editor) return;
+        const val = editor.value;
+        const prev = getWorldStateText();
+        if (val === prev) return;
+        // On the first persist after a canonical state (save/refresh/import/…),
+        // snapshot the outgoing text to history so it stays revertable — this
+        // mirrors what the old explicit Save did. The guard ensures a burst of
+        // keystrokes snapshots the baseline only once, not on every debounce.
+        // One checked patch carries the baseline snapshot AND the edit; a
+        // refusal keeps the store intact and the burst un-snapshotted, so the
+        // next debounce retries instead of proceeding over an unwritten edit.
+        const snapshotBaseline = !state.editSessionActive;
+        const written = commitHistorySnapshot(snapshotBaseline ? prev : undefined, { text: val });
+        if (!written.ok) {
+            console.warn(`[MWT:WorldState] Editor persist refused (${written.reason ?? 'unknown reason'}) — the previous world state was kept.`);
+            return;
+        }
+        if (snapshotBaseline) state.editSessionActive = true;
+        state.isDirty = false;
+        applyWorldStateInjection();
+        updateArchiveButtonState();
+        refreshRevertButton();
+    }, EDITOR_PERSIST_DELAY_MS);
+}
+
+function updateArchiveButtonState() {
+    if (!state.modal) return;
+    const hasText = !!getWorldStateText()?.trim();
+    const btn = state.modal.querySelector('#ws-archive');
+    if (btn) btn.disabled = !hasText;
+    // The ⚡ Delta button shares the precondition: no document, no baseline
+    // to patch (TODO §3-F).
+    const deltaBtn = state.modal.querySelector('#ws-delta-refresh');
+    if (deltaBtn) deltaBtn.disabled = !hasText;
+}
+
+export function refreshButtonLabels() {
+    if (!state.modal) return;
+    const injectBtn = state.modal.querySelector('#ws-toggle-inject');
+    const autoBtn = state.modal.querySelector('#ws-toggle-auto');
+    // Labels are rebuilt with innerHTML so the decorative 🔌/🔄 glyphs stay
+    // inside their aria-hidden spans — a textContent write would fold them
+    // into the buttons' accessible names (Slice 4 item 2; must match the
+    // initial markup in render()).
+    if (injectBtn) {
+        injectBtn.innerHTML = isInjectionEnabled() ? '<span aria-hidden="true">🔌</span> Injection: ON' : '<span aria-hidden="true">🔌</span> Injection: OFF';
+    }
+    if (autoBtn) {
+        if (isAutoRefreshEnabled()) {
+            autoBtn.innerHTML = `<span aria-hidden="true">🔄</span> Auto: ${state.autoRefreshCounter}/${getAutoRefreshInterval()}`;
+        } else {
+            autoBtn.innerHTML = '<span aria-hidden="true">🔄</span> Auto: OFF';
+        }
+    }
+}
+
+export function renderModalContent() {
+    if (!state.modal) return;
+    const editor = state.modal.querySelector('#ws-editor');
+    if (editor) editor.value = getWorldStateText();
+    // The editor now reflects the persisted world state, so there are no
+    // pending unsaved edits. Reset isDirty to avoid a stale "dirty" flag
+    // from a previous editing session (e.g. user typed, closed without
+    // saving, then reopened the modal).
+    state.isDirty = false;
+    state.editSessionActive = false;
+    updateEditorStats();
+    refreshRevertButton();
+    updateArchiveButtonState();
+    refreshButtonLabels();
+    refreshProvenancePanel();
+}
+
+// ─── Archive / Import / Clear ────────────────────────────────────────────────
+
+function downloadWorldStateArchive() {
+    const data = getWorldStateData();
+    const archive = {
+        _meta: { type: 'world-state-archive', version: '1.0', exportedAt: new Date().toISOString() },
+        data,
+    };
+    downloadJson(`worldstate_${Date.now()}.json`, archive);
+}
+
+async function importWorldState() {
+    const text = await pickTextFile('.json,.md,.txt');
+    if (!text) return;
+    // WORLD-STATE-07: all shape/type/version/size validation now lives in the
+    // pure parseWorldStateImport() helper (unit-tested in tier3_fixes.test.js).
+    const result = parseWorldStateImport(text);
+    if (!result.ok) {
+        setStatus(state.modal, `Import failed: ${result.reason}`, 'error');
+        return;
+    }
+
+    if (result.kind === 'settings') {
+        if (!confirm('Import world state settings? This will overwrite current API/model settings.')) return;
+        saveSettings({ ...getSettings(), ...result.settings });
+        renderModalContent();
+        setStatus(state.modal, 'Settings imported.', 'success', 3000);
+        return;
+    }
+
+    // kind === 'text' (from a recognized JSON archive or plain text).
+    if (!confirm('Import this world state? It will replace the current one.')) return;
+    const oldText = getWorldStateText();
+    // Checked write (design §8 + §5.2): ONE commit carries the outgoing text's
+    // history snapshot, the imported text, AND the archive's schema findings
+    // (e.g. an invalid autoSaveHistory) so its rejected records are preserved.
+    // The findings ride the checked seam itself — the store validates the
+    // destination BEFORE the quarantine container is touched, so a refused
+    // write (an unsafe current store, or a container that refuses the records)
+    // leaves BOTH the previous World State AND the container intact. The old
+    // standalone preserve ran first and could not be undone when the checked
+    // write refused, stranding quarantine records in a chat whose import
+    // reported failure.
+    // The archive's findings carry the version their SOURCE was at (an
+    // unversioned standalone archive is prepared from legacy 0), not the
+    // destination's current version.
+    const written = commitHistorySnapshot(oldText, { text: result.text }, {
+        preserveIssues: { issues: result.issues || [], sourceVersion: result.sourceVersion },
+    });
+    if (!written.ok) {
+        setStatus(state.modal, `Import failed: the world state store refused the write (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+        return;
+    }
+    applyWorldStateInjection();
+    renderModalContent();
+    setStatus(state.modal, 'Imported.', 'success', 3000);
+}
+
+function clearWorldState() {
+    if (!confirm('Clear the world state? A snapshot will be saved to history.')) return;
+    const oldText = getWorldStateText();
+    // Checked write (design §8): one patch carries BOTH the pre-clear history
+    // snapshot and the emptied text; the store can refuse it (an unsafe
+    // current value, or a quarantine container that refuses the rejected
+    // records). Only reset UI/injection state after the write is confirmed —
+    // otherwise the UI showed an empty editor while the previous World State
+    // remained in storage.
+    const written = commitHistorySnapshot(oldText, { text: '' });
+    if (!written.ok) {
+        setStatus(state.modal, `Clear failed: the world state store refused the write (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+        return;
+    }
+    state.isDirty = false;
+    applyWorldStateInjection();
+    renderModalContent();
+}
+
+// ─── Revert / Diff ──────────────────────────────────────────────────────────
+
+function showRevertDiff() {
+    const history = getAutoSaveHistory();
+    if (history.length === 0) { alert('No history available to revert to.'); return; }
+
+    const latest = history[history.length - 1];
+    const currentText = getWorldStateText();
+    const diffHtml = renderDiffHtml(computeLcsDiff(currentText, latest.text));
+
+    const diffModal = createModal({
+        id: 'mwt-ws-revert-modal',
+        title: 'Revert World State',
+        content: `
+            <p class="mwt-text-dim mwt-text-sm mwt-mb-8">
+                Showing diff: <strong>Current</strong> → <strong>Previous snapshot</strong>
+                (${new Date(latest.timestamp).toLocaleString()})
+            </p>
+            ${diffHtml}
+            <div class="mwt-flex mwt-gap-8 mwt-mt-8">
+                <button id="mwt-ws-revert-confirm" class="mwt-btn mwt-btn-danger">Revert to This</button>
+                <button id="mwt-ws-revert-cancel" class="mwt-btn">Cancel</button>
+            </div>
+        `,
+    });
+
+    diffModal.querySelector('#mwt-ws-revert-confirm').addEventListener('click', () => {
+        // Checked write (design §8): a refused store write must not update
+        // auto-save/injection/render state or report "Reverted." over the
+        // untouched previous value.
+        const written = setWorldStateDataChecked({ text: latest.text });
+        if (!written.ok) {
+            hideModal('mwt-ws-revert-modal');
+            setStatus(state.modal, `Revert failed: the world state store refused the write (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+            return;
+        }
+        state.autoSaveLastText = latest.text;
+        state.isDirty = false;
+        applyWorldStateInjection();
+        renderModalContent();
+        hideModal('mwt-ws-revert-modal');
+        setStatus(state.modal, 'Reverted.', 'success', 3000);
+    });
+    diffModal.querySelector('#mwt-ws-revert-cancel').addEventListener('click', () => {
+        hideModal('mwt-ws-revert-modal');
+    });
+    showModal('mwt-ws-revert-modal');
+}
+
+function showAutoSaveHistory() {
+    const history = getAutoSaveHistory();
+    if (history.length === 0) { alert('No auto-save history yet.'); return; }
+
+    const items = history.slice().reverse().map((h, i) => `
+        <div class="mwt-history-item" style="padding:8px;border-bottom:1px solid var(--mwt-border);cursor:pointer" data-idx="${history.length - 1 - i}">
+            <span class="mwt-text-dim mwt-text-sm">${new Date(h.timestamp).toLocaleString()}</span>
+            <span class="mwt-text-dim mwt-text-sm"> — ${h.text.length} chars</span>
+        </div>
+    `).join('');
+
+    const histModal = createModal({
+        id: 'mwt-ws-history-modal',
+        title: 'Auto-Save History',
+        content: `<div>${items}</div>`,
+    });
+
+    histModal.querySelectorAll('.mwt-history-item').forEach(el => {
+        el.addEventListener('click', () => {
+            const idx = parseInt(el.dataset.idx);
+            const entry = history[idx];
+            const currentText = getWorldStateText();
+            const diffHtml = renderDiffHtml(computeLcsDiff(currentText, entry.text));
+            const diffModal2 = createModal({
+                id: 'mwt-ws-hist-diff-modal',
+                title: `History: ${new Date(entry.timestamp).toLocaleString()}`,
+                content: `
+                    ${diffHtml}
+                    <div class="mwt-flex mwt-gap-8 mwt-mt-8">
+                        <button id="mwt-ws-restore-hist" class="mwt-btn mwt-btn-primary">Restore This</button>
+                        <button id="mwt-ws-close-hist" class="mwt-btn">Close</button>
+                    </div>
+                `,
+            });
+            diffModal2.querySelector('#mwt-ws-restore-hist').addEventListener('click', () => {
+                const old = getWorldStateText();
+                // Checked write (design §8): one patch carries BOTH the
+                // outgoing text's history snapshot and the restored entry; a
+                // refused store write must not update auto-save/injection/
+                // render state or report "Restored from history." over the
+                // untouched previous value.
+                const written = commitHistorySnapshot(old, { text: entry.text });
+                if (!written.ok) {
+                    hideModal('mwt-ws-hist-diff-modal');
+                    hideModal('mwt-ws-history-modal');
+                    setStatus(state.modal, `Restore failed: the world state store refused the write (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+                    return;
+                }
+                state.autoSaveLastText = entry.text;
+                state.isDirty = false;
+                applyWorldStateInjection();
+                renderModalContent();
+                hideModal('mwt-ws-hist-diff-modal');
+                hideModal('mwt-ws-history-modal');
+                setStatus(state.modal, 'Restored from history.', 'success', 3000);
+            });
+            diffModal2.querySelector('#mwt-ws-close-hist').addEventListener('click', () => {
+                hideModal('mwt-ws-hist-diff-modal');
+            });
+            showModal('mwt-ws-hist-diff-modal');
+        });
+    });
+    showModal('mwt-ws-history-modal');
+}
+
+// ─── Entity provenance panel (read-only — see STALE_ENTRY_EXPIRY_DESIGN.md) ──
+
+function renderProvenanceRows() {
+    const report = getStalenessReport();
+    if (report.length === 0) {
+        return `<p class="mwt-text-dim mwt-text-sm" style="margin:6px 0">No provenance data yet — run a refresh, regenerate a section, or click "Rebuild" below.</p>`;
+    }
+    const staleAfter = getSettings().expiryStaleAfterMsgs || 40;
+    const staleCount = report.filter(e => e.age !== null && e.age > staleAfter).length;
+    const rows = report.map(e => {
+        const isStale = e.age !== null && e.age > staleAfter;
+        return `
+        <tr${isStale ? ' style="color:var(--mwt-warning,#e0a030)"' : ''}>
+            <td style="padding:3px 8px 3px 0">${escapeHtml(e.label)}${isStale ? ' ⚠️' : ''}</td>
+            <td style="padding:3px 8px;color:var(--mwt-text-dim)">${escapeHtml(e.section || '—')}</td>
+            <td style="padding:3px 8px;text-align:right">${e.lastTouchedMsg ?? '—'}</td>
+            <td style="padding:3px 8px;text-align:right">${e.age ?? 'never seen'}</td>
+            <td style="padding:3px 8px;text-align:right">${e.mentionCount}</td>
+        </tr>`;
+    }).join('');
+    return `
+        <p class="mwt-text-dim mwt-text-sm" style="margin:0 0 6px">${staleCount} of ${report.length} entities over the ${staleAfter}-message threshold.</p>
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+                <tr style="color:var(--mwt-text-dim);text-align:left;border-bottom:1px solid var(--mwt-border)">
+                    <th style="padding:3px 8px 3px 0">Entity</th>
+                    <th style="padding:3px 8px">Section</th>
+                    <th style="padding:3px 8px;text-align:right">Last touched (msg #)</th>
+                    <th style="padding:3px 8px;text-align:right">Msgs since</th>
+                    <th style="padding:3px 8px;text-align:right">Mentions</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+}
+
+export function refreshProvenancePanel() {
+    if (!state.modal) return;
+    const panel = state.modal.querySelector('#ws-provenance-panel');
+    if (panel) panel.innerHTML = renderProvenanceRows();
+}
+
+// ─── Main render ─────────────────────────────────────────────────────────────
+
+export function render() {
+    const s = getSettings();
+    const text = getWorldStateText();
+    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    const tokens = estimateTokens(text);
+    const autoEnabled = isAutoRefreshEnabled();
+    const autoInterval = getAutoRefreshInterval();
+    const maxScan = getMaxScanMessages(s);
+
+    const customPromptActive = !!s.customPrompt?.trim();
+    const detailLevel = normalizeDetailLevel(s.detailLevel);
+
+    const sectionOptions = SECTIONS.map(sec => {
+        const hookSection = HOOK_SECTIONS.includes(sec);
+        const outsideDetailLevel = !customPromptActive && !detailLevelIncludesSection(detailLevel, sec);
+        const disabled = (hookSection && s.hookMode === 'off') || outsideDetailLevel ? ' disabled' : '';
+        return `<option value="${escapeHtml(sec)}" data-hook-section="${hookSection}"${disabled}>${escapeHtml(sec)}</option>`;
+    }).join('');
+
+    return `
+        <div class="ws-toolbar mwt-flex mwt-gap-4 mwt-mb-8" style="flex-wrap:wrap">
+            <button id="ws-refresh" class="mwt-btn mwt-btn-primary"><span aria-hidden="true">🔄</span> Refresh</button>
+            <button id="ws-delta-refresh" class="mwt-btn" ${!text?.trim() ? 'disabled' : ''} title="Delta refresh: ask the model only for changed sections and apply a validated patch (cheap). Needs an existing refresh baseline."><span aria-hidden="true">⚡</span> Delta</button>
+            <button id="ws-save" class="mwt-btn"><span aria-hidden="true">💾</span> Save</button>
+            <button id="ws-revert" class="mwt-btn" ${getAutoSaveHistory().length === 0 ? 'disabled' : ''}><span aria-hidden="true">⏪</span> Revert</button>
+            <button id="ws-history" class="mwt-btn"><span aria-hidden="true">📋</span> History</button>
+            <button id="ws-archive" class="mwt-btn" ${!text?.trim() ? 'disabled' : ''}><span aria-hidden="true">📦</span> Export</button>
+            <button id="ws-import" class="mwt-btn"><span aria-hidden="true">📥</span> Import</button>
+            <button id="ws-clear" class="mwt-btn mwt-btn-danger"><span aria-hidden="true">🗑️</span> Clear</button>
+            <span id="ws-doc-status" class="mwt-text-sm" style="margin-left:auto;line-height:28px;white-space:nowrap" title=""></span>
+            <span id="ws-toolbar-stats" class="mwt-text-dim mwt-text-sm" style="line-height:28px">${words} words · ~${tokens} tokens${autoEnabled ? ` · Auto: ${state.autoRefreshCounter}/${autoInterval} msgs` : ''}</span>
+        </div>
+
+        <div class="mwt-form-row">
+            <textarea id="ws-editor" class="mwt-textarea" style="min-height:300px">${escapeHtml(text)}</textarea>
+            <div id="ws-editor-stats" class="mwt-text-dim mwt-text-sm mwt-mt-8">${text.length} chars · ${words} words · ~${tokens} tokens</div>
+        </div>
+
+        ${autoEnabled ? `<div style="color:var(--mwt-accent);font-size:12px;margin-bottom:4px">🔄 Auto-refresh: ON — refreshes every ${autoInterval} messages (${state.autoRefreshCounter}/${autoInterval} since last)</div>` : ''}
+
+        <details class="mwt-mt-8" open>
+            <summary style="cursor:pointer;color:var(--mwt-accent);font-weight:500">🎯 Regenerate Section</summary>
+            <div style="padding:8px 0">
+                <div class="mwt-flex mwt-gap-4" style="align-items:center;flex-wrap:wrap">
+                    <select id="ws-section-select" class="mwt-input" style="max-width:200px">
+                        ${sectionOptions}
+                    </select>
+                    <div class="mwt-flex mwt-gap-4" style="align-items:center">
+                        <label class="mwt-label" style="margin:0;white-space:nowrap" for="ws-variety-slider">Variety:</label>
+                        <input id="ws-variety-slider" type="range" min="1" max="5" value="2" style="width:120px" aria-label="Regeneration variety" disabled>
+                        <span id="ws-variety-label" style="font-size:11px;color:#c4b5fd;min-width:80px">Not used</span>
+                    </div>
+                    <button id="ws-regen-section" class="mwt-btn" style="background:#6d28d9;border-color:#7c3aed;color:#fff"><span aria-hidden="true">🎲</span> Regenerate Section</button>
+                </div>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin:6px 0 0">Variety applies only to Story Momentum, Plot Seeds, and Potential Entrances. Factual sections always use the base temperature and factual instructions.</p>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0"><b>Note:</b> The temperature boost for hook sections only applies when using a custom API connection (URL + Model). With a Connection Profile, temperature is controlled by the profile/preset.</p>
+            </div>
+        </details>
+
+        <details class="mwt-mt-8">
+            <summary style="cursor:pointer;color:var(--mwt-accent);font-weight:500">🕒 Entity Provenance</summary>
+            <div style="padding:8px 0">
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin:0 0 6px">
+                    Tracks the last chat message each tracked entity (bolded name in the world state) was mentioned in.
+                    Rows past the stale threshold are highlighted. Configure automatic expiry below in "Stale-Entry Expiry & Grounding".
+                    See <code>world_state/STALE_ENTRY_EXPIRY_DESIGN.md</code>.
+                </p>
+                <div class="mwt-flex mwt-gap-4" style="flex-wrap:wrap">
+                    <button id="ws-rebuild-provenance" class="mwt-btn"><span aria-hidden="true">🔄</span> Rebuild Provenance</button>
+                    <button id="ws-purge-stale" class="mwt-btn mwt-btn-danger"><span aria-hidden="true">🧹</span> Purge Stale Entries</button>
+                </div>
+                <div id="ws-provenance-panel" class="mwt-mt-8">${renderProvenanceRows()}</div>
+            </div>
+        </details>
+
+        <details class="mwt-mt-8">
+            <summary style="cursor:pointer;color:var(--mwt-accent);font-weight:500">🧹 Stale-Entry Expiry &amp; Grounding</summary>
+            <div class="mwt-settings-grid mwt-mt-8">
+                <div class="mwt-label">Expiry</div>
+                <div>
+                    <label class="mwt-text-sm" for="ws-expiry-enabled" style="display:flex;align-items:center;gap:6px">
+                        <input id="ws-expiry-enabled" type="checkbox" ${s.expiryEnabled ? 'checked' : ''}>
+                        Automatically expire stale entries on full refresh
+                    </label>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Off by default. When on, entries in the sections below that haven't been mentioned in the configured message window are marked/quarantined/removed on every full refresh.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-expiry-stale-after">Stale After (msgs)</label>
+                <input id="ws-expiry-stale-after" class="mwt-input" type="number" value="${s.expiryStaleAfterMsgs ?? 40}" min="1" style="max-width:100px">
+
+                <label class="mwt-label" for="ws-expiry-mode">Expiry Mode</label>
+                <div>
+                    <select id="ws-expiry-mode" class="mwt-input" style="max-width:180px">
+                        <option value="mark" ${(s.expiryMode || 'mark') === 'mark' ? 'selected' : ''}>Mark (non-destructive)</option>
+                        <option value="quarantine" ${s.expiryMode === 'quarantine' ? 'selected' : ''}>Quarantine (move to Archive)</option>
+                        <option value="remove" ${s.expiryMode === 'remove' ? 'selected' : ''}>Remove (delete outright)</option>
+                    </select>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0"><b>Mark:</b> appends "(stale)" to the entry. <b>Quarantine:</b> moves it to a "## Archive (Stale)" section, kept out of prompt injection. <b>Remove:</b> deletes it outright.</p>
+                </div>
+
+                <div class="mwt-label">Expiry Sections</div>
+                <div>
+                    ${SECTIONS.filter(sec => sec !== 'Current Scene' && sec !== 'Key Character States').map((sec, i) => {
+                        const checked = (s.expirySections || EXPIRY_SECTIONS_DEFAULT).includes(sec);
+                        return `<label class="mwt-text-sm" for="ws-expiry-section-${i}" style="display:inline-flex;align-items:center;gap:4px;margin:2px 10px 2px 0"><input type="checkbox" id="ws-expiry-section-${i}" class="ws-expiry-section" value="${escapeHtml(sec)}" ${checked ? 'checked' : ''}>${escapeHtml(sec)}</label>`;
+                    }).join('')}
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">"Current Scene" and "Key Character States" are always exempt (active cast).</p>
+                </div>
+
+                <div class="mwt-label">Grounding Gate</div>
+                <div>
+                    <label class="mwt-text-sm" for="ws-grounding-enabled" style="display:flex;align-items:center;gap:6px">
+                        <input id="ws-grounding-enabled" type="checkbox" ${s.groundingEnabled ? 'checked' : ''}>
+                        Reject/strip names not grounded in chat or prior state
+                    </label>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Off by default. Catches invented characters/entities the model didn't actually see. Checked against the scan window, the previous world state, and Pinned Entities below.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-grounding-mode">Grounding Mode</label>
+                <div>
+                    <select id="ws-grounding-mode" class="mwt-input" style="max-width:180px">
+                        <option value="soft" ${(s.groundingMode || 'soft') === 'soft' ? 'selected' : ''}>Soft (strip + log)</option>
+                        <option value="strict" ${s.groundingMode === 'strict' ? 'selected' : ''}>Strict (retry once, then discard)</option>
+                    </select>
+                </div>
+
+                <label class="mwt-label" for="ws-pinned-entities">Pinned Entities</label>
+                <div>
+                    <input id="ws-pinned-entities" class="mwt-input" type="text" value="${escapeHtml(s.pinnedEntities || '')}" placeholder="e.g. Protagonist Name, Companion Name">
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Comma-separated names that never expire and are never flagged as ungrounded.</p>
+                </div>
+            </div>
+        </details>
+
+        <details class="mwt-mt-8">
+            <summary style="cursor:pointer;color:var(--mwt-accent);font-weight:500">⚡ Delta Refresh (Low-cost Mode)</summary>
+            <div class="mwt-settings-grid mwt-mt-8">
+                <div class="mwt-label">Delta Mode</div>
+                <div>
+                    <label class="mwt-text-sm" for="ws-delta-enabled" style="display:flex;align-items:center;gap:6px">
+                        <input id="ws-delta-enabled" type="checkbox" ${s.deltaMode ? 'checked' : ''}>
+                        Use cheap delta refreshes for the scheduled auto-refresh
+                    </label>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Off by default. When on, the scheduled auto-refresh asks the model only for the sections that changed and applies a validated patch, instead of regenerating the whole document. A full refresh still runs for the first generation, after manual edits, and on the reconciliation cadence below. The ⚡ Delta button always runs a delta on demand.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-delta-reconcile-every">Full Refresh Every</label>
+                <div>
+                    <div class="mwt-flex mwt-gap-4" style="align-items:center">
+                        <input id="ws-delta-reconcile-every" class="mwt-input" type="number" value="${s.deltaReconcileEvery ?? 5}" min="1" max="50" style="max-width:100px">
+                        <span class="mwt-text-sm mwt-text-dim">delta update(s)</span>
+                    </div>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Periodic reconciliation: after this many consecutive delta (or section) updates, the next scheduled refresh is a full one. Default 5.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-delta-stale-after">Stale After (msgs)</label>
+                <div>
+                    <div class="mwt-flex mwt-gap-4" style="align-items:center">
+                        <input id="ws-delta-stale-after" class="mwt-input" type="number" value="${s.deltaStaleAfterMsgs ?? 15}" min="1" style="max-width:100px">
+                        <span class="mwt-text-sm mwt-text-dim">message(s)</span>
+                    </div>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">The status chip next to the word count reports the document as stale once this many messages have arrived since the last refresh of any kind. Default 15.</p>
+                </div>
+            </div>
+        </details>
+
+        <details class="mwt-mt-8">
+            <summary style="cursor:pointer;color:var(--mwt-accent);font-weight:500"><span aria-hidden="true">⚙️</span> World State Settings</summary>
+            <div class="mwt-settings-grid mwt-mt-8">
+                ${renderApiSettingsFields(s, WS_API_FIELD_IDS)}
+
+                <div class="mwt-label">Settings Scope</div>
+                <div>
+                    <label class="mwt-text-sm" for="ws-use-global-defaults"><input id="ws-use-global-defaults" type="checkbox" ${usesGlobalDefaults() ? 'checked' : ''}> Use global defaults</label>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">When checked, Injection, Auto, and its interval are shared across chats. Uncheck to override them for this chat.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-injection-depth">Injection Depth</label>
+                <input id="ws-injection-depth" class="mwt-input" type="number" value="${s.injectionDepth ?? 1}" min="0" max="999">
+
+                <label class="mwt-label" for="ws-max-scan-messages">Scan Messages</label>
+                <div>
+                    <input id="ws-max-scan-messages" class="mwt-input" type="number" value="${maxScan}" min="1" max="30" style="max-width:100px">
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">How many previous messages to scan (max 30). Auto-snapshot interval cannot exceed this.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-auto-save-interval">Auto-Save (sec)</label>
+                <input id="ws-auto-save-interval" class="mwt-input" type="number" value="${s.autoSaveInterval || DEFAULT_AUTO_SAVE_INTERVAL}" min="30">
+
+                <label class="mwt-label" for="ws-detail-level">Detail Level</label>
+                <div>
+                    <select id="ws-detail-level" class="mwt-input" style="max-width:180px"${customPromptActive ? ' disabled' : ''}>
+                        ${DETAIL_LEVELS.map(level => `<option value="${level}"${level === detailLevel ? ' selected' : ''}>${DETAIL_LEVEL_NAMES[level]}</option>`).join('')}
+                    </select>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0"><b>Minimal:</b> one line per character and no Recent Changes — the smallest injection. <b>Standard:</b> short character blocks (mood, goal, condition, items) and tighter section limits. <b>Detailed:</b> full six-field character blocks. Every level keeps injuries, possessions, and open obligations. A change applies from the next full 🔄 Refresh, which rebuilds the current document in the new format (⚡ Delta waits for it). Not used while a Custom Prompt is set.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-custom-prompt">Custom Prompt</label>
+                <textarea id="ws-custom-prompt" class="mwt-input" rows="3" placeholder="Leave blank for default prompt">${escapeHtml(s.customPrompt || '')}</textarea>
+                <div></div><p style="font-size:11px;color:var(--mwt-text-dim);margin:0">Custom Prompt completely replaces the built-in generation prompt. Structural output checks still apply, but built-in compactness guidance is not added. With Hook Mode Off, hook sections are removed before saving and injection. Click "Reset Prompt" to clear.</p>
+
+                <label class="mwt-label" for="ws-hook-mode">Hook Mode</label>
+                <div>
+                    <select id="ws-hook-mode" class="mwt-input" style="max-width:180px">
+                        <option value="off" ${s.hookMode === 'off' ? 'selected' : ''}>Off</option>
+                        <option value="passive" ${(s.hookMode || 'passive') === 'passive' ? 'selected' : ''}>Passive</option>
+                        <option value="proactive" ${s.hookMode === 'proactive' ? 'selected' : ''}>Proactive</option>
+                        <option value="assertive" ${s.hookMode === 'assertive' ? 'selected' : ''}>Assertive</option>
+                    </select>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0"><b>Off:</b> built-in generation, saved output, and injection omit Story Momentum, Plot Seeds, and Potential Entrances. <b>Passive:</b> hooks remain optional. <b>Proactive:</b> the narrator should introduce a hook unless the scene is at a climax. <b>Assertive:</b> the narrator must introduce at least one hook.</p>
+                </div>
+
+                <label class="mwt-label" for="ws-message-filter">Message Filter</label>
+                <div>
+                    <textarea id="ws-message-filter" class="mwt-input" rows="3" placeholder="One regex per line. Matching text is stripped from messages before scanning.&#10;Example: \\[NPC thoughts][\\s\\S]*?\\[/NPC thoughts]">${escapeHtml(s.messageFilter || '')}</textarea>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Each line is a separate regex pattern (case-insensitive). Matching content is removed from chat messages <i>before</i> the World State scanner sees them. Use this to strip out NPC thought blocks, OOC notes, or other content that shouldn't influence the world state.</p>
+                </div>
+
+                <div></div>
+                <div class="mwt-flex mwt-gap-4" style="flex-wrap:wrap">
+                    <button id="ws-test-connection" class="mwt-btn">Test Connection</button>
+                    <button id="ws-toggle-inject" class="mwt-btn">${isInjectionEnabled() ? '<span aria-hidden="true">🔌</span> Injection: ON' : '<span aria-hidden="true">🔌</span> Injection: OFF'}</button>
+                    <button id="ws-toggle-auto" class="mwt-btn">${isAutoRefreshEnabled() ? '<span aria-hidden="true">🔄</span> Auto: ON (' + getAutoRefreshInterval() + ')' : '<span aria-hidden="true">🔄</span> Auto: OFF'}</button>
+                    <button id="ws-reset-prompt" class="mwt-btn">Reset Prompt</button>
+                    <button id="ws-preview-injection" class="mwt-btn"><span aria-hidden="true">📄</span> Preview Injection</button>
+                </div>
+            </div>
+        </details>
+
+        <!-- Save Settings persists EVERY disclosure above (Expiry & Grounding and
+             Delta Refresh included), so it must not live inside one of them. Sitting
+             in the collapsed ⚙️ block, it made a click in another block look
+             successful while the value was silently discarded on close. -->
+        <div class="mwt-mt-8 mwt-flex mwt-gap-4" style="flex-wrap:wrap;align-items:center;border-top:1px solid var(--mwt-border);padding-top:8px">
+            <button id="ws-save-settings" class="mwt-btn mwt-btn-primary">Save Settings</button>
+            <span class="mwt-text-sm mwt-text-dim">Saves every section above, including Expiry &amp; Grounding and Delta Refresh.</span>
+        </div>
+    `;
+}
+
+// ─── Event wiring ────────────────────────────────────────────────────────────
+
+function syncDetailLevelControl() {
+    const select = state.modal?.querySelector('#ws-detail-level');
+    const customPrompt = state.modal?.querySelector('#ws-custom-prompt');
+    if (select && customPrompt) select.disabled = !!customPrompt.value.trim();
+}
+
+export function wireEvents() {
+    if (!state.modal) return;
+
+    // Save
+    state.modal.querySelector('#ws-save')?.addEventListener('click', () => {
+        const newText = state.modal.querySelector('#ws-editor')?.value || '';
+        const currentText = getWorldStateText();
+        if (newText !== currentText) {
+            // Checked write (design §8): one patch carries BOTH the outgoing
+            // text's history snapshot and the new text. A refusal keeps the
+            // previous world state (history included) and reports the failure —
+            // the UI must not claim "Saved." over an unwritten editor value.
+            const written = commitHistorySnapshot(currentText, { text: newText });
+            if (!written.ok) {
+                setStatus(state.modal, `Save failed: the world state store refused the write (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+                return;
+            }
+            state.autoSaveLastText = newText;
+        }
+        state.isDirty = false;
+        state.editSessionActive = false;
+        applyWorldStateInjection();
+        refreshRevertButton();
+        updateArchiveButtonState();
+        updateEditorStats();
+        setStatus(state.modal, 'Saved.', 'success', 3000);
+    });
+
+    // Refresh
+    state.modal.querySelector('#ws-refresh')?.addEventListener('click', async () => {
+        const btn = state.modal.querySelector('#ws-refresh');
+        try {
+            const editorEl = state.modal.querySelector('#ws-editor');
+            if (editorEl && editorEl.value && editorEl.value !== getWorldStateText()) {
+                // Checked write (design §8): a refused pre-sync must not begin
+                // the dependent refresh over an editor value that never landed.
+                const written = setWorldStateDataChecked({ text: editorEl.value });
+                if (!written.ok) {
+                    setStatus(state.modal, `Refresh cancelled: the world state store refused the editor pre-sync (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+                    return;
+                }
+            }
+            setControlBusy(btn, true); btn.innerHTML = '<span aria-hidden="true">⏳</span> Refreshing…';
+            setStatus(state.modal, 'Generating world state…', 'info');
+            const text = await refreshWorldState();
+            if (text === null) { setStatus(state.modal, 'Refresh aborted.', 'info'); return; }
+            const editor = state.modal.querySelector('#ws-editor');
+            if (editor) editor.value = text;
+            state.autoSaveLastText = text; state.isDirty = false; state.editSessionActive = false;
+            updateArchiveButtonState();
+            updateEditorStats();
+            refreshRevertButton();
+            refreshProvenancePanel();
+            setStatus(state.modal, 'Refresh complete.', 'success', 3000);
+        } catch (err) {
+            setStatus(state.modal, `Error: ${err.message}`, 'error');
+        } finally {
+            // Restore through innerHTML with the hidden span so the treatment
+            // survives the busy cycle (Slice 4 item 2; matches the toolbar
+            // markup above).
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">🔄</span> Refresh';
+        }
+    });
+
+    // Delta refresh (TODO §3-F) — on-demand incremental update. Mirrors
+    // #ws-refresh (editor pre-sync included) but calls the cheap patch path.
+    state.modal.querySelector('#ws-delta-refresh')?.addEventListener('click', async () => {
+        const btn = state.modal.querySelector('#ws-delta-refresh');
+        try {
+            const editorEl = state.modal.querySelector('#ws-editor');
+            if (editorEl && editorEl.value && editorEl.value !== getWorldStateText()) {
+                // Checked write (design §8): a refused pre-sync must not begin
+                // the dependent refresh over an editor value that never landed.
+                const written = setWorldStateDataChecked({ text: editorEl.value });
+                if (!written.ok) {
+                    setStatus(state.modal, `Delta refresh cancelled: the world state store refused the editor pre-sync (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+                    return;
+                }
+            }
+            setControlBusy(btn, true); btn.innerHTML = '<span aria-hidden="true">⏳</span> Patching…';
+            setStatus(state.modal, 'Generating delta patch…', 'info');
+            const text = await refreshWorldStateDelta();
+            if (text === null) { setStatus(state.modal, 'Delta refresh aborted.', 'info'); return; }
+            const editor = state.modal.querySelector('#ws-editor');
+            if (editor) editor.value = text;
+            state.autoSaveLastText = text; state.isDirty = false; state.editSessionActive = false;
+            updateArchiveButtonState();
+            updateEditorStats();
+            refreshRevertButton();
+            refreshProvenancePanel();
+            setStatus(state.modal, 'Delta refresh complete.', 'success', 3000);
+        } catch (err) {
+            // A patch-protocol failure is expected occasionally — point the
+            // user at the full Refresh instead of a bare error.
+            setStatus(state.modal, `Delta refresh failed: ${err.message}${err.name === 'DeltaPatchError' ? ' — run a full 🔄 Refresh instead.' : ''}`, 'error', 8000);
+        } finally {
+            // Restore through innerHTML with the hidden span (Slice 4 item 2;
+            // matches the toolbar markup above).
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">⚡</span> Delta';
+            // Re-derive the disabled state instead of unconditionally
+            // enabling: the editor-pre-sync early return above can leave the
+            // store empty, and updateArchiveButtonState() would disable the
+            // Delta button there (no document → no baseline to patch).
+            updateArchiveButtonState();
+        }
+    });
+
+    // Revert
+    state.modal.querySelector('#ws-revert')?.addEventListener('click', () => showRevertDiff());
+
+    // History
+    state.modal.querySelector('#ws-history')?.addEventListener('click', () => showAutoSaveHistory());
+
+    // Archive
+    state.modal.querySelector('#ws-archive')?.addEventListener('click', () => downloadWorldStateArchive());
+
+    // Import
+    state.modal.querySelector('#ws-import')?.addEventListener('click', () => importWorldState());
+
+    // Clear
+    state.modal.querySelector('#ws-clear')?.addEventListener('click', () => clearWorldState());
+
+    // Editor input
+    state.modal.querySelector('#ws-editor')?.addEventListener('input', () => {
+        state.isDirty = true;
+        updateArchiveButtonState();
+        updateEditorStats();
+        scheduleEditorPersist();
+    });
+
+    // Variety is meaningful only for hook sections. Keep the inactive state
+    // visible in the UI as well as enforcing the boundary in sections.js.
+    const sectionSelect = state.modal.querySelector('#ws-section-select');
+    const varietySlider = state.modal.querySelector('#ws-variety-slider');
+    const varietyLabel = state.modal.querySelector('#ws-variety-label');
+    const syncVarietyAvailability = () => {
+        const enabled = HOOK_SECTIONS.includes(sectionSelect?.value) && getHookMode() !== 'off';
+        if (varietySlider) varietySlider.disabled = !enabled;
+        if (varietyLabel) {
+            const level = parseInt(varietySlider?.value || '2', 10);
+            varietyLabel.textContent = enabled ? (VARIETY_LABELS[level] || `Level ${level}`) : 'Not used';
+        }
+    };
+    sectionSelect?.addEventListener('change', syncVarietyAvailability);
+    varietySlider?.addEventListener('input', (e) => {
+        const val = parseInt(e.target.value, 10);
+        if (varietyLabel) varietyLabel.textContent = VARIETY_LABELS[val] || `Level ${val}`;
+    });
+    syncVarietyAvailability();
+
+    // Regenerate section
+    state.modal.querySelector('#ws-regen-section')?.addEventListener('click', async () => {
+        const regenBtn = state.modal.querySelector('#ws-regen-section');
+        const sectionName = sectionSelect?.value;
+        const variety = parseInt(varietySlider?.value || '2', 10);
+
+        if (!sectionName) { setStatus(state.modal, 'Select a section first.', 'error'); return; }
+
+        try {
+            setControlBusy(regenBtn, true); regenBtn.innerHTML = '<span aria-hidden="true">⏳</span> Regenerating…';
+            setStatus(state.modal, `Regenerating "${sectionName}" (variety: ${VARIETY_LABELS[variety]})…`, 'info');
+
+            // Preserve unsaved editor edits. regenerateSection() rebuilds the
+            // entry from the *persisted* world state (getWorldStateText()),
+            // not the live textarea, so typing that hasn't been Saved would be
+            // silently dropped. Sync the editor into state first — and push the
+            // live text into history so it stays recoverable. Mirrors #ws-refresh.
+            const editorBefore = state.modal.querySelector('#ws-editor');
+            if (editorBefore && editorBefore.value && editorBefore.value !== getWorldStateText()) {
+                // Checked write (design §8): one patch carries BOTH the baseline
+                // history snapshot and the editor text; a refused pre-sync
+                // cancels the regeneration instead of rebuilding a section
+                // from text that never landed.
+                const written = commitHistorySnapshot(getWorldStateText(), { text: editorBefore.value });
+                if (!written.ok) {
+                    setStatus(state.modal, `Regeneration cancelled: the world state store refused the editor pre-sync (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+                    return;
+                }
+                state.autoSaveLastText = editorBefore.value;
+            }
+
+            const updated = await regenerateSection(sectionName, variety);
+            if (updated) {
+                const editor = state.modal.querySelector('#ws-editor');
+                if (editor) editor.value = updated;
+                state.autoSaveLastText = updated;
+                state.isDirty = false;
+                state.editSessionActive = false;
+                updateEditorStats();
+                updateArchiveButtonState();
+                refreshRevertButton();
+                refreshProvenancePanel();
+                setStatus(state.modal, `Section "${sectionName}" regenerated (${VARIETY_LABELS[variety]}).`, 'success', 3000);
+            } else {
+                // null = quiet discard (coordinator cancellation on a chat
+                // switch, a mid-flight edit of this section, or a refused
+                // store write) — regenerateSection() already logged why.
+                // Neutral info, not an error, mirroring #ws-refresh's null
+                // handling ("Refresh aborted.").
+                setStatus(state.modal, 'Section regen aborted.', 'info');
+            }
+        } catch (err) {
+            setStatus(state.modal, `Section regen failed: ${err.message}`, 'error');
+        } finally {
+            // Restore through innerHTML with the hidden span so the treatment
+            // survives the busy cycle (Slice 4 item 2).
+            setControlBusy(regenBtn, false); regenBtn.innerHTML = '<span aria-hidden="true">🎲</span> Regenerate Section';
+        }
+    });
+
+    // Rebuild provenance — see STALE_ENTRY_EXPIRY_DESIGN.md
+    state.modal.querySelector('#ws-rebuild-provenance')?.addEventListener('click', () => {
+        try {
+            setProvenance(buildProvenance());
+            refreshProvenancePanel();
+            setStatus(state.modal, 'Provenance rebuilt.', 'success', 3000);
+        } catch (err) {
+            setStatus(state.modal, `Provenance rebuild failed: ${err.message}`, 'error');
+        }
+    });
+
+    // Purge stale entries (§8 manual trigger) — always removes, regardless of
+    // the configured Expiry Mode, using the current expiry sections/threshold/pinned settings.
+    state.modal.querySelector('#ws-purge-stale')?.addEventListener('click', () => {
+        const currentText = getWorldStateText();
+        if (!currentText?.trim()) { setStatus(state.modal, 'No world state text to purge.', 'warning'); return; }
+        const s = getSettings();
+        const { text: purged, changed, report } = purgeStaleEntries(currentText, getProvenance(), {
+            staleAfterMsgs: s.expiryStaleAfterMsgs,
+            sections: s.expirySections || EXPIRY_SECTIONS_DEFAULT,
+            pinned: getPinnedEntities(s),
+            currentMsgIndex: getChat()?.length || 0,
+        });
+        if (!changed) { setStatus(state.modal, 'No stale entries found.', 'info', 3000); return; }
+        if (!confirm(`Remove ${report.length} stale entr${report.length === 1 ? 'y' : 'ies'} (${report.map(r => r.label).join(', ')})?`)) return;
+        // Checked write (design §8): one patch carries BOTH the pre-purge
+        // history snapshot and the purged text; a refusal keeps both and
+        // reports the failure instead of claiming the purge succeeded.
+        const written = commitHistorySnapshot(currentText, { text: purged });
+        if (!written.ok) {
+            setStatus(state.modal, `Purge failed: the world state store refused the write (${written.reason ?? 'unknown reason'}); the previous world state was kept.`, 'error');
+            return;
+        }
+        applyWorldStateInjection();
+        renderModalContent();
+        setStatus(state.modal, `Purged ${report.length} stale entr${report.length === 1 ? 'y' : 'ies'}.`, 'success', 3000);
+    });
+
+    wireApiSettingsFields(state.modal, WS_API_FIELD_IDS);
+
+    // Save settings
+    state.modal.querySelector('#ws-save-settings')?.addEventListener('click', () => {
+        const apiValues = readApiSettingsValues(state.modal, WS_API_FIELD_IDS);
+        const autoSaveSec = parseInt(state.modal.querySelector('#ws-auto-save-interval')?.value, 10) || DEFAULT_AUTO_SAVE_INTERVAL;
+        const customPrompt = state.modal.querySelector('#ws-custom-prompt')?.value.trim() || '';
+        const depth = parseInt(state.modal.querySelector('#ws-injection-depth')?.value, 10);
+        const maxScan = parseInt(state.modal.querySelector('#ws-max-scan-messages')?.value, 10);
+        const hookMode = state.modal.querySelector('#ws-hook-mode')?.value || 'passive';
+        const detailLevel = normalizeDetailLevel(state.modal.querySelector('#ws-detail-level')?.value);
+        const messageFilter = state.modal.querySelector('#ws-message-filter')?.value || '';
+
+        const expiryEnabled = !!state.modal.querySelector('#ws-expiry-enabled')?.checked;
+        const expiryStaleAfterMsgs = Math.max(1, parseInt(state.modal.querySelector('#ws-expiry-stale-after')?.value, 10) || 40);
+        const expiryMode = state.modal.querySelector('#ws-expiry-mode')?.value || 'mark';
+        const expirySections = Array.from(state.modal.querySelectorAll('.ws-expiry-section:checked')).map(el => el.value);
+        const groundingEnabled = !!state.modal.querySelector('#ws-grounding-enabled')?.checked;
+        const groundingMode = state.modal.querySelector('#ws-grounding-mode')?.value || 'soft';
+        const pinnedEntities = state.modal.querySelector('#ws-pinned-entities')?.value.trim() || '';
+
+        const deltaMode = !!state.modal.querySelector('#ws-delta-enabled')?.checked;
+        const deltaReconcileEvery = Math.min(50, Math.max(1, parseInt(state.modal.querySelector('#ws-delta-reconcile-every')?.value, 10) || 5));
+        const deltaStaleAfterMsgs = Math.max(1, parseInt(state.modal.querySelector('#ws-delta-stale-after')?.value, 10) || 15);
+
+        // Both empty is fine — the module then falls back to the global API
+        // settings (see resolveApiCall). Only a *partial* config is an error,
+        // since it would silently mix module and global connection fields.
+        // A selected profile makes the (hidden) custom fields irrelevant.
+        if (!apiValues.connectionProfileId && !!apiValues.apiUrl !== !!apiValues.modelName) {
+            setStatus(state.modal, 'Fill in both API URL and Model, or leave both blank to use the global settings.', 'error');
+            return;
+        }
+
+        const promptProfileBefore = getPromptProfile();
+        saveSettings({
+            ...apiValues,
+            autoSaveInterval: Math.max(30, autoSaveSec),
+            customPrompt,
+            injectionDepth: isNaN(depth) ? 1 : depth,
+            maxScanMessages: Math.min(Math.max(1, isNaN(maxScan) ? 20 : maxScan), 30),
+            hookMode,
+            detailLevel,
+            messageFilter,
+            expiryEnabled,
+            expiryStaleAfterMsgs,
+            expiryMode,
+            expirySections,
+            groundingEnabled,
+            groundingMode,
+            pinnedEntities,
+            deltaMode,
+            deltaReconcileEvery,
+            deltaStaleAfterMsgs,
+        });
+        applyWorldStateInjection();
+        restartAutoSaveTimer();
+        refreshProvenancePanel();
+        // The saved document keeps its old format (and its injection size)
+        // until a full refresh rebuilds it — say so rather than let the user
+        // wonder why nothing shrank.
+        const formatChanged = getPromptProfile() !== promptProfileBefore && !!getWorldStateText().trim();
+        setStatus(
+            state.modal,
+            formatChanged
+                ? 'Settings saved. The prompt format changed — run 🔄 Refresh to rebuild this chat\'s World State in the new format.'
+                : 'Settings saved.',
+            formatChanged ? 'info' : 'success',
+            formatChanged ? 8000 : 3000,
+        );
+    });
+
+    // Detail Level only shapes the built-in prompt, so it is greyed out while
+    // a Custom Prompt is typed in — live, not only at the next render.
+    state.modal.querySelector('#ws-custom-prompt')?.addEventListener('input', syncDetailLevelControl);
+
+    // Test connection
+    state.modal.querySelector('#ws-test-connection')?.addEventListener('click', async () => {
+        const btn = state.modal.querySelector('#ws-test-connection');
+        try {
+            const values = readApiSettingsValues(state.modal, WS_API_FIELD_IDS);
+            const resolved = resolveApiCall({ moduleSettings: { ...getSettings(), ...values } });
+            if (resolved.mode === 'custom' && (!resolved.settings.apiUrl || !resolved.settings.modelName)) {
+                setStatus(state.modal, 'Fill URL and Model, or configure a connection profile first.', 'error');
+                return;
+            }
+            setControlBusy(btn, true); btn.textContent = 'Testing…';
+            setStatus(state.modal, 'Testing connection…', 'info');
+            const response = await resolved.fetchFn({
+                systemPrompt: 'Reply with: OK', userContent: 'Reply with: OK',
+                settings: { ...resolved.settings, maxTokens: 10, temperature: 0 }, retries: 0,
+            });
+            setStatus(state.modal, `OK — model replied: "${normaliseOutput(response).trim()}"`, 'success', 5000);
+        } catch (err) {
+            setStatus(state.modal, `Failed: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(btn, false); btn.textContent = 'Test Connection';
+        }
+    });
+
+    // Toggle injection
+    state.modal.querySelector('#ws-toggle-inject')?.addEventListener('click', () => {
+        const next = !isInjectionEnabled();
+        setWorldSetting('injectEnabled', next);
+        applyWorldStateInjection();
+        refreshButtonLabels();
+        setStatus(state.modal, `Injection ${next ? 'enabled' : 'disabled'}.`, 'info', 3000);
+    });
+
+    // Toggle auto-refresh
+    state.modal.querySelector('#ws-toggle-auto')?.addEventListener('click', () => {
+        if (!isAutoRefreshEnabled()) {
+            const raw = prompt(`Auto-refresh every N messages:`, String(getAutoRefreshInterval()));
+            if (!raw) return;
+            const n = parseInt(raw, 10);
+            if (isNaN(n) || n < 1) { setStatus(state.modal, 'Invalid interval.', 'error'); return; }
+            let maxScan = getMaxScanMessages(getSettings());
+            let interval = n;
+            if (n > maxScan) {
+                if (n > 30) {
+                    // 30 is the hard cap for maxScanMessages; clamp and explain.
+                    // Also persist the raised scan window — clamping only the
+                    // local variable left the saved setting (e.g. 20) below the
+                    // new interval, the exact mismatch this dialog exists to prevent.
+                    interval = 30;
+                    if (maxScan < 30) {
+                        saveSettings({ ...getSettings(), maxScanMessages: 30 });
+                        const maxScanInput = state.modal.querySelector('#ws-max-scan-messages');
+                        if (maxScanInput) maxScanInput.value = '30';
+                    }
+                    maxScan = 30;
+                    setStatus(state.modal, `Auto-refresh interval set to 30 (maximum scan messages).`, 'warning', 5000);
+                } else if (confirm(`The auto-refresh interval (${n}) exceeds the current "Scan Messages" limit (${maxScan}).\n\nIncrease "Scan Messages" to ${n} to allow the full interval?`)) {
+                    // Raise maxScanMessages to match the desired interval so the
+                    // scanner can actually see enough messages to refresh on.
+                    maxScan = n;
+                    saveSettings({ ...getSettings(), maxScanMessages: n });
+                    const maxScanInput = state.modal.querySelector('#ws-max-scan-messages');
+                    if (maxScanInput) maxScanInput.value = String(n);
+                } else {
+                    // User declined to raise the limit — clamp the interval.
+                    interval = maxScan;
+                    setStatus(state.modal, `Auto-refresh interval clamped to ${maxScan} (max scan messages).`, 'warning', 5000);
+                }
+            }
+            state.autoRefreshCounter = 0;
+            // Persist the reset counter together with the auto-refresh flags
+            // so a stale value isn't restored on the next chat change.
+            setWorldSetting('autoRefresh', true);
+            setWorldSetting('autoRefreshInterval', interval);
+            setWorldStateData({ autoRefreshCounter: 0 });
+            if (n <= maxScan) setStatus(state.modal, `Auto-refresh: every ${interval} messages.`, 'success', 3000);
+        } else {
+            setWorldSetting('autoRefresh', false);
+            setStatus(state.modal, 'Auto-refresh disabled.', 'info', 3000);
+        }
+        refreshButtonLabels();
+    });
+
+    state.modal.querySelector('#ws-use-global-defaults')?.addEventListener('change', (e) => {
+        setUsesGlobalDefaults(e.target.checked);
+        renderModalContent();
+        applyWorldStateInjection();
+        setStatus(state.modal, e.target.checked ? 'Using global defaults.' : 'Using settings for this chat.', 'info', 3000);
+    });
+
+    // Reset prompt
+    state.modal.querySelector('#ws-reset-prompt')?.addEventListener('click', () => {
+        const ta = state.modal.querySelector('#ws-custom-prompt');
+        if (ta) ta.value = '';
+        syncDetailLevelControl();
+        setStatus(state.modal, 'Custom prompt cleared.', 'info', 3000);
+    });
+
+    // Preview injection
+    state.modal.querySelector('#ws-preview-injection')?.addEventListener('click', () => {
+        const text = getWorldStateText();
+        if (!text?.trim()) {
+            setStatus(state.modal, 'No world state text to preview.', 'warning');
+            return;
+        }
+
+        const injected = buildInjectionPreview(text);
+        const tokens = estimateTokens(injected);
+
+        const previewModal = createModal({
+            id: 'mwt-ws-injection-preview',
+            title: 'Injection Preview',
+            content: `
+                <p class="mwt-text-dim mwt-text-sm mwt-mb-8">
+                    This is exactly what gets injected into the prompt (${injected.length} chars, ~${tokens} tokens).
+                    Hook mode: <strong>${getHookMode()}</strong>.
+                </p>
+                <pre style="white-space:pre-wrap;font-family:var(--mwt-font-mono);font-size:12px;line-height:1.5;background:var(--mwt-bg-light);padding:12px;border-radius:var(--mwt-radius);border:1px solid var(--mwt-border);max-height:60vh;overflow-y:auto">${escapeHtml(injected)}</pre>
+                <div class="mwt-flex mwt-gap-8 mwt-mt-8">
+                    <button id="mwt-ws-preview-copy" class="mwt-btn mwt-btn-primary"><span aria-hidden="true">📋</span> Copy to Clipboard</button>
+                    <button id="mwt-ws-preview-close" class="mwt-btn">Close</button>
+                </div>
+            `,
+        });
+
+        previewModal.querySelector('#mwt-ws-preview-copy')?.addEventListener('click', () => {
+            navigator.clipboard.writeText(injected).then(() => {
+                setStatus(previewModal, 'Copied to clipboard.', 'success', 2000);
+            }).catch(() => {
+                setStatus(previewModal, 'Failed to copy.', 'error');
+            });
+        });
+
+        previewModal.querySelector('#mwt-ws-preview-close')?.addEventListener('click', () => {
+            hideModal('mwt-ws-injection-preview');
+        });
+
+        showModal('mwt-ws-injection-preview');
+    });
+}

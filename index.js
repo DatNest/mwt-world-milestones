@@ -1,0 +1,2268 @@
+/**
+ * Merged World Tracker — Main Entry Point
+ *
+ * Loads core modules, creates a tabbed UI shell, registers SillyTavern
+ * event hooks, and delegates floating-button / drawer / wand-menu UI to
+ * core/ui.js. Slash commands and macros are handled by core/commands.js.
+ */
+
+// ─── Core imports ────────────────────────────────────────────────────────────
+
+import { getContextSafe } from './core/context.js';
+import * as Ambient from './ambient/index.js';
+import { renderAmbientSettings, wireAmbientSettings } from './ambient/render.js';
+import { clearAmbientInjection } from './ambient/injection.js';
+import { bumpEpoch } from './core/scope.js';
+// Generation coordinator (TODO §1 / PI §P1): the central cross-module job
+// queue both API transports submit through. Same direct-import rule as the
+// diagnostics accessors — reads the real singleton regardless of the
+// test-only barrel→stub alias.
+import {
+    beginUserGeneration,
+    endUserGeneration,
+    onChatScopeChanged,
+    pumpCoordinator,
+    getCoordinatorSnapshot,
+    cancelWhere,
+} from './core/coordinator.js';
+import { createSettingsManager, GLOBAL_SETTINGS_DEFAULTS } from './core/settings.js';
+// TODO §2 context budget — the per-chat settings accessors behind the
+// MWT.budget console bridge. Direct import (the barrel is aliased under
+// Vitest; the bridge must read the real chat metadata). resetBudgetInjections
+// is the two-phase chat-change reset (TODO §2 P1): clears every managed
+// module's slot + snapshot at the start of CHAT_CHANGED so the new chat's
+// injections are never rejected by the previous chat's stale snapshots.
+import { getBudgetSettings, saveBudgetSettings, resetBudgetInjections } from './core/budget.js';
+import { createModal, showModal, setStatus, releaseManagedInert } from './core/modal.js';
+import { createFloatingButtonBar, renderApiSettingsFields, readApiSettingsValues, renderConnectionProfileSelect, setControlBusy } from './core/ui.js';
+// Main modal tab shell — the render/wire seam core/main_tabs.js owns so the
+// main tab bar's exact rendering path is testable under jsdom (index.js
+// itself cannot be imported into Vitest; see test/main_tabbar_adoption.test.js).
+import { renderMainTabShell, wireMainTabBar } from './core/main_tabs.js';
+import { createCommands } from './core/commands.js';
+import { routeMessageReceived, routeMessageDeleted, routeMessageSwiped, routeMessageEdited, extractMessageIndex } from './core/event_router.js';
+// Diagnostics accessors (Phases 0–1). Read-only peek at the in-memory capture,
+// exposed to testers as window.MWT.diagnostics near the bottom of this file.
+// Imported directly (not via the core/index.js barrel) so the namespace reads
+// the real singleton regardless of the test-only barrel→stub alias.
+import { getEvents, getApiCalls, getLastApiCall, getAllLastApiCalls, getAllLastRuns, getInjectedSnapshot, getAllInjectedSnapshots, clearEvents, clearApiCalls, clearLastRuns, clearInjections } from './core/diagnostics.js';
+// Lifecycle plan Tier 1 item 4 — read-only peek at the generation-scoped
+// intentions capture (interiority/capture.js, a leaf module: in-memory only,
+// no store dependency). Same direct-import rule as above.
+import { getIntentionsCaptureSnapshot } from './interiority/capture.js';
+// Diagnostics Phase 6 — Tab 1 Health: the snapshot collector behind the ❤️
+// Health sub-tab (one row per module: enabled · gate · busy · tokens · auto ·
+// last run). Same direct-import rule as above.
+import { collectHealthSnapshot } from './diagnostics_panel/health.js';
+// Diagnostics Phase 7 — Tab 2 Environment (fork-compat probe): the snapshot
+// collector + shared.js loader behind the 🌐 Environment sub-tab (versions,
+// feature detection, and the getCurrentChatId() premise behind core/scope.js,
+// validated live on the running build). Same direct-import rule as above.
+import { collectEnvironmentSnapshot, loadSharedModule } from './diagnostics_panel/environment.js';
+import { collectScopeSnapshot } from './diagnostics_panel/scope_storage.js';
+// Diagnostics Phase 9 — Tab 4 Injection: the snapshot collector behind the 💉
+// Injection sub-tab (per module: on/off · gate · role/depth with provenance ·
+// token estimate · the Phase 2 recorded payload). Same direct-import rule.
+import { collectInjectionSnapshot, redactInjectionSnapshot, formatInjectionAge, ROLE_NUMBERS } from './diagnostics_panel/injection.js';
+// Diagnostics Phase 10 — Tab 5 Last request: the snapshot collector behind the
+// 📡 Last request sub-tab (the Phase 1 capture for the most recent call plus
+// the short history, telemetry by construction). Same direct-import rule.
+import { collectLastRequestSnapshot, redactLastRequestSnapshot, formatRequestAge } from './diagnostics_panel/last_request.js';
+// Diagnostics Phase 11 — Tab 6 Log: the snapshot collector + redaction gate
+// behind the 📋 Log sub-tab (the Phase 0 ring, filterable by level and module,
+// newest first; details are content-gated because toast bodies quote the
+// chat and error bodies can too). Same direct-import rule.
+import { collectLogSnapshot, redactLogSnapshot, logLevelCount } from './diagnostics_panel/log.js';
+// Diagnostics Phase 12 — Tab 7 Integrity: the async snapshot collector + safe-
+// return redaction gate behind the 🛡️ Integrity sub-tab (on-demand read-only
+// checks over lorebooks + chat metadata). Same direct-import rule.
+import { collectIntegritySnapshot, redactIntegritySnapshot } from './diagnostics_panel/integrity.js';
+// Schema plan Part 5 (§9.1): the schema-status collector behind the Scope &
+// storage tab's schema section and the MWT.diagnostics.schemaStatus() bridge.
+import { collectSchemaStatusSnapshot, redactSchemaStatusSnapshot } from './diagnostics_panel/schema_status.js';
+// Diagnostics Phase 13 — Copy-report finalize: the D1 report the 📋 Copy
+// Report button produces (sections = Phase 0–4 accessors + the tab accessors,
+// redacted through the Phase 5 layer). The console bridge's report() returns
+// the same Markdown the button copies. Same direct-import rule.
+import { collectReportSections, buildReport } from './diagnostics_panel/report.js';
+// Phase 4 (settings provenance, design §I.4.6): the two resolvers that can
+// attribute a behavior setting to its precedence level, plus their key lists
+// (single source of truth — no second key list here). Direct imports for the
+// same singleton rule as above.
+import { getEffectiveWorldSetting, GLOBAL_SETTING_KEYS as WS_GLOBAL_SETTING_KEYS } from './world_state/data.js';
+import { getEffectivePlanSetting, GLOBAL_SETTING_KEYS as SP_GLOBAL_SETTING_KEYS } from './story_planner/data.js';
+
+// ─── Feature module imports ─────────────────────────────────────────────────
+
+import * as WorldState from './world_state/index.js';
+import * as Chronicle from './chronicle/index.js';
+import * as Knowledge from './knowledge/index.js';
+import * as StoryPlanner from './story_planner/index.js';
+import * as Interiority from './interiority/index.js';
+import { exportBackup, previewRestore, restoreBackup, undoLastRestore, fingerprintPreview } from './backup/index.js';
+import { renderBackupPanel, wireBackupEvents, describeRecoveryExportResult } from './backup/render.js';
+// Schema plan Part 5 — the visible paused-state surface (§5.4) and the
+// recovery export/clear actions (§5.3). The banner renders in each module's
+// OWN tab (Diagnostics is read-only by contract — it shows the same state in
+// 🗂️ Scope & storage and ❤️ Health, but the actions live here).
+import { renderPausedStoresBanner, retryStore, isModulePausedForCurrentScope, setStoreResumeInitializer, STORE_MODULE_IDS } from './core/schema_status.js';
+// Schema plan Part 6 — the runtime chat-metadata cutover (§7): the synchronous
+// load gate + atomic migration commit that runs on every startup and chat
+// change BEFORE the module handlers, the §7.5 privileged preparation for
+// deferred stores, and the Retry handlers for chat-metadata stores.
+import {
+    applySchemaLoadGate,
+    runSchemaPreparations,
+    registerSchemaGateRetryHandlers,
+} from './schema/runtime.js';
+import { collectQuarantineStatus, exportRecoveryData, clearQuarantineData } from './backup/recovery.js';
+// Diagnostics panel shell (Phase 5): the 🩺 tab inside this modal, its redaction
+// layer (core/redaction.js), and the D1 copy-report shape.
+import { renderDiagnosticsPanel, wireDiagnosticsPanel } from './diagnostics_panel/render.js';
+// TODO §2 context budget: the 📊 Budget tab's collector/renderer/wiring
+// (budget/panel.js on top of core/budget.js).
+import { collectBudgetSnapshot, renderBudgetPane, wireBudgetTab } from './budget/panel.js';
+import { renderOverviewPane, wireOverviewPane } from './dashboard/render.js';
+// Shared with the Overview 🧰 Maintenance section — the console bridge below
+// only prints and applies these plans, so the two surfaces cannot drift.
+import { auditNpcIdentities, auditProfiles, planProfilePrune, planProfileRelink } from './knowledge/profiles_audit.js';
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const SETTINGS_KEY = 'merged_world_tracker';   // localStorage key
+
+// ID opts for shared API settings helpers (renderApiSettingsFields / readApiSettingsValues)
+const GLOBAL_API_FIELD_IDS = {
+    urlId: 'mwt-s-api-url',
+    keyId: 'mwt-s-api-key',
+    modelId: 'mwt-s-model',
+    maxTokensId: 'mwt-s-max-tokens',
+    tempId: 'mwt-s-temp',
+    topPId: 'mwt-s-top-p',
+    freqId: 'mwt-s-freq-pen',
+    presId: 'mwt-s-pres-pen',
+    headersId: 'mwt-s-headers',
+};
+
+// ─── SillyTavern imports ────────────────────────────────────────────────────
+
+let eventSource = null;
+let event_types = null;
+let registerSlashCommand = null;
+
+try {
+    const stScript = await import('../../../../script.js');
+    eventSource = stScript.eventSource;
+    event_types = stScript.event_types;
+    if (typeof stScript.registerSlashCommand === 'function') {
+        registerSlashCommand = stScript.registerSlashCommand;
+    }
+    console.log('[MWT] SillyTavern script.js imports loaded.');
+} catch (err) {
+    console.warn('[MWT] Could not import from script.js:', err);
+}
+
+// Fallback: get registerSlashCommand from context
+if (!registerSlashCommand) {
+    const ctx = getContextSafe();
+    if (ctx && typeof ctx.registerSlashCommand === 'function') {
+        registerSlashCommand = ctx.registerSlashCommand.bind(ctx);
+    }
+}
+
+// Load macro registration via the modern macro system (requires ST 1.12+)
+let macroRegistry = null;
+try {
+    const macroSystem = await import('../../../../scripts/macros/macro-system.js');
+    if (macroSystem?.macros?.registry && typeof macroSystem.macros.registry.registerMacro === 'function') {
+        macroRegistry = macroSystem.macros.registry;
+    }
+} catch { /* macro-system.js not available */ }
+
+// Fallback: the Aikobots v4 fork (and some older ST versions) don't have
+// scripts/macros/macro-system.js. They expose the legacy MacrosParser in
+// scripts/macros.js with a different API: registerMacro(key, fn, description)
+// instead of registerMacro(key, { handler, category, description }). Build a
+// compatibility wrapper so commands.js can use the modern spec format on both.
+if (!macroRegistry) {
+    try {
+        const macrosModule = await import('../../../../scripts/macros.js');
+        if (macrosModule?.MacrosParser && typeof macrosModule.MacrosParser.registerMacro === 'function') {
+            const legacyParser = macrosModule.MacrosParser;
+            macroRegistry = {
+                registerMacro: (key, spec) => {
+                    // Accept both the modern spec object { handler, description }
+                    // and the legacy bare-function form (key, fn, description).
+                    const fn = typeof spec === 'function' ? spec : (spec?.handler || (() => ''));
+                    const desc = (typeof spec === 'object' && spec?.description) ? spec.description : '';
+                    return legacyParser.registerMacro(key, fn, desc);
+                },
+            };
+            console.log('[MWT] Using legacy MacrosParser fallback for macro registration.');
+        }
+    } catch { /* scripts/macros.js not available either */ }
+}
+
+// ─── Shared settings ────────────────────────────────────────────────────────
+
+const { getSettings, saveSettings } = createSettingsManager({
+    settingsKey: SETTINGS_KEY,
+    // The shared global field-level catalog (core/settings.js) — the SAME
+    // catalog the canonical accessor (getGlobalSettings) validates against,
+    // so the saver and the reader can never disagree about a field's type.
+    // This manager merges it as PUBLIC defaults: the Settings tab has always
+    // materialized every field.
+    defaults: GLOBAL_SETTINGS_DEFAULTS,
+    logPrefix: '[MWT]',
+});
+
+// ─── Tab definitions ─────────────────────────────────────────────────────────
+
+const TABS = [
+    { id: 'overview', label: '🏠 Overview', module: null },
+    { id: 'world-state', label: '🌍 World State', module: WorldState },
+    { id: 'chronicle', label: '📜 Chronicle', module: Chronicle },
+    { id: 'knowledge', label: '🧠 Knowledge', module: Knowledge },
+    { id: 'story-planner', label: '🗺️ Story Planner', module: StoryPlanner },
+    { id: 'interiority', label: '💭 Interiority', module: Interiority },
+    // Diagnostics Phase 5: the panel shell (7 placeholder sub-tabs + content
+    // opt-in + Copy Report). Read-only; rendered/wired by
+    // diagnostics_panel/render.js, not by a feature module.
+    { id: 'diagnostics', label: '🩺 Diagnostics', module: null },
+    // TODO §2: the cross-module context/token budget panel (core/budget.js
+    // engine + budget/panel.js UI). Sits beside Diagnostics — it MANAGES
+    // token load where Diagnostics deliberately only reports it.
+    { id: 'budget', label: '📊 Budget', module: null },
+    { id: 'settings', label: '⚙️ Settings', module: null },
+];
+
+// ─── UI ──────────────────────────────────────────────────────────────────────
+
+function renderSettingsTab() {
+    const s = getSettings();
+    const hasProfile = !!s.connectionProfileId;
+    const apiFieldsStyle = hasProfile ? 'display:none' : '';
+
+    // Accessibility plan §4.4 / Slice 4, in the markup below:
+    //  - decorative leading emoji sit in aria-hidden spans, so a heading is
+    //    "Injection Settings", not "wrench Injection Settings";
+    //  - a `.mwt-label` that labels a whole grid section rather than one
+    //    control is a <div> — a <label> with no control is not a label;
+    //  - the float-button and per-tracker rows point BOTH cells' labels at the
+    //    row's checkbox, so its name reads "World State Visible" rather than
+    //    the six identical "Visible"s the right-hand cell alone would give.
+    // Save writes EVERY section, so its row sits below the collapsible
+    // sections rather than inside one — collapsing that section would hide it.
+    return `
+        <details class="mwt-settings-disclosure" open>
+            <summary><span aria-hidden="true">🔌</span> API Connection</summary>
+            <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:12px">
+                These global API settings serve as defaults for all modules. Each module can override them in its own Settings panel.
+            </p>
+            <div class="mwt-settings-grid">
+            <label class="mwt-label" style="grid-column:1/2" for="mwt-s-connection-profile">Connection Profile</label>
+            ${renderConnectionProfileSelect('mwt-s-connection-profile', s.connectionProfileId, '— None (use custom API below) —')}
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin:0;grid-column:1/3">
+                Select a Connection Manager profile to use with all backends (OpenAI, TextGen, etc.) with full preset/instruct support. Leave empty to configure a custom API URL/Key below. Profiles marked (active) are ST's currently selected profile.
+            </p>
+
+            <div id="mwt-s-api-fields" style="grid-column:1/3;${apiFieldsStyle}" class="mwt-settings-grid">
+                ${renderApiSettingsFields(s, GLOBAL_API_FIELD_IDS)}
+            </div>
+            </div>
+        </details>
+
+        <details class="mwt-settings-disclosure">
+            <summary><span aria-hidden="true">🕒</span> Stable History</summary>
+        <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:12px">
+            Defer the newest chat messages from World State, Chronicle, Knowledge, Relationships, Growth, and Story Planner scans. They are included on a later refresh instead of discarded. <strong>2</strong> usually means the latest user/assistant exchange. Interiority is intentionally excluded because it evaluates the current turn.
+        </p>
+            <div class="mwt-settings-grid">
+            <label class="mwt-label" for="mwt-s-recent-history-exclude">Messages to defer</label>
+            <input id="mwt-s-recent-history-exclude" class="mwt-input" type="number" value="${s.recentHistoryExclude ?? 2}" min="0" max="10" step="1">
+            </div>
+        </details>
+
+        <details id="mwt-settings-generation-coordinator" class="mwt-settings-disclosure">
+            <summary><span aria-hidden="true">🚦</span> Generation Coordinator</summary>
+        <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:12px">
+            All tracker API calls go through one central queue. Each module runs at most one generation at a time; this caps how many may run in parallel <em>across</em> modules, so a burst of tracker work cannot stampede your API endpoint (manual clicks always jump ahead of automatic work). Switching chats cancels queued tracker jobs from the old chat. See what's queued any time with <code>MWT.coordinator.status()</code> in the console.
+        </p>
+            <div class="mwt-settings-grid">
+            <label class="mwt-label" for="mwt-s-api-max-concurrent">Max parallel API calls</label>
+            <input id="mwt-s-api-max-concurrent" class="mwt-input" type="number" value="${s.apiMaxConcurrent ?? 2}" min="1" max="8" step="1">
+            <label class="mwt-label" for="mwt-s-pause-background" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="mwt-s-pause-background" ${s.pauseBackgroundJobsDuringGeneration ? 'checked' : ''}>
+                Hold automatic tracker work while you generate
+            </label>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin:0">
+                When on, automatic calls (auto-refresh, auto-snapshot, NPC updates, auto-thoughts, …) wait until your own generation finishes. Button-pressed generations are never held.
+            </p>
+            </div>
+        </details>
+
+        <details class="mwt-settings-disclosure">
+            <summary><span aria-hidden="true">🔧</span> Injection Settings</summary>
+        <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:12px">
+            Control how each module's entries are injected into the prompt. Depth = how far back from the bottom; Role = which message role. (Knowledge uses SillyTavern's built-in lorebook system and does not use extension prompt injection. Disabling the Knowledge tracker below only stops it from scanning/updating; existing lorebook entries will continue to be injected by SillyTavern's World Info until you disable them manually in the World Info panel.)
+        </p>
+            <div class="mwt-settings-grid">
+            <div class="mwt-label" style="grid-column:1/3;font-weight:bold"><span aria-hidden="true">🌍</span> World State</div>
+            <label class="mwt-label" for="mwt-s-ws-depth">Depth</label>
+            <input id="mwt-s-ws-depth" class="mwt-input" type="number" value="${s.worldStateDepth ?? 4}" min="0" max="999">
+            <label class="mwt-label" for="mwt-s-ws-role">Role</label>
+            <select id="mwt-s-ws-role" class="mwt-input">
+                <option value="system" ${s.worldStateRole === 'system' ? 'selected' : ''}>system</option>
+                <option value="user" ${s.worldStateRole === 'user' ? 'selected' : ''}>user</option>
+                <option value="assistant" ${s.worldStateRole === 'assistant' ? 'selected' : ''}>assistant</option>
+            </select>
+
+            <div class="mwt-label" style="grid-column:1/3;font-weight:bold"><span aria-hidden="true">📜</span> Chronicle</div>
+            <label class="mwt-label" for="mwt-s-ch-depth">Depth</label>
+            <input id="mwt-s-ch-depth" class="mwt-input" type="number" value="${s.chronicleDepth ?? 4}" min="0" max="999">
+            <label class="mwt-label" for="mwt-s-ch-role">Role</label>
+            <select id="mwt-s-ch-role" class="mwt-input">
+                <option value="system" ${s.chronicleRole === 'system' ? 'selected' : ''}>system</option>
+                <option value="user" ${s.chronicleRole === 'user' ? 'selected' : ''}>user</option>
+                <option value="assistant" ${s.chronicleRole === 'assistant' ? 'selected' : ''}>assistant</option>
+            </select>
+
+            <div class="mwt-label" style="grid-column:1/3;font-weight:bold"><span aria-hidden="true">💭</span> Interiority</div>
+            <label class="mwt-label" for="mwt-s-int-depth">Depth</label>
+            <input id="mwt-s-int-depth" class="mwt-input" type="number" value="${s.interiorityDepth ?? 1}" min="0" max="999">
+            <label class="mwt-label" for="mwt-s-int-role">Role</label>
+            <select id="mwt-s-int-role" class="mwt-input">
+                <option value="system" ${s.interiorityRole === 'system' ? 'selected' : ''}>system</option>
+                <option value="user" ${s.interiorityRole === 'user' ? 'selected' : ''}>user</option>
+                <option value="assistant" ${s.interiorityRole === 'assistant' ? 'selected' : ''}>assistant</option>
+            </select>
+
+            <div class="mwt-label" style="grid-column:1/3;font-weight:bold"><span aria-hidden="true">🏷️</span> Structural Boundaries</div>
+            <label class="mwt-label" for="mwt-s-structural-boundaries" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="mwt-s-structural-boundaries" ${s.structuralBoundaries !== false ? 'checked' : ''}>
+                <span>Wrap injected blocks in XML tags</span>
+            </label>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin:0">
+                Wraps each injected reference block (World State, Plot Seeds, Chronicle) in tags like <code>&lt;mwt_world_state&gt;…&lt;/mwt_world_state&gt;</code>.
+                Recommended for smaller / open models (24–70B) that bleed between sections. Frontier models don't need it; turn off to save a few tokens.
+            </p>
+        </div>
+        </details>
+
+        <details class="mwt-settings-disclosure">
+            <summary><span aria-hidden="true">📍</span> Floating Buttons</summary>
+        <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:12px">
+            Show or hide individual floating buttons. You can also access the MWT modal from the Extensions panel drawer or the wand menu.
+        </p>
+        <div class="mwt-settings-grid">
+            <label class="mwt-label" for="mwt-s-collapse-float" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="mwt-s-collapse-float" ${s.collapseFloatButtons ? 'checked' : ''}>
+                <span>Collapse into single button</span>
+            </label>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin:0">Replace the 4 floating buttons with one that expands on tap/click.</p>
+
+            <label class="mwt-label" for="mwt-s-show-world"><span aria-hidden="true">🌍</span> World State</label>
+            <label for="mwt-s-show-world" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-show-world" ${s.showFloatWorld !== false ? 'checked' : ''}> Visible</label>
+
+            <label class="mwt-label" for="mwt-s-show-chronicle"><span aria-hidden="true">📜</span> Chronicle</label>
+            <label for="mwt-s-show-chronicle" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-show-chronicle" ${s.showFloatChronicle !== false ? 'checked' : ''}> Visible</label>
+
+            <label class="mwt-label" for="mwt-s-show-knowledge"><span aria-hidden="true">🧠</span> Knowledge</label>
+            <label for="mwt-s-show-knowledge" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-show-knowledge" ${s.showFloatKnowledge !== false ? 'checked' : ''}> Visible</label>
+
+            <label class="mwt-label" for="mwt-s-show-story-planner"><span aria-hidden="true">🗺️</span> Story Planner</label>
+            <label for="mwt-s-show-story-planner" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-show-story-planner" ${s.showFloatStoryPlanner !== false ? 'checked' : ''}> Visible</label>
+
+            <label class="mwt-label" for="mwt-s-show-interiority"><span aria-hidden="true">💭</span> Interiority</label>
+            <label for="mwt-s-show-interiority" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-show-interiority" ${s.showFloatInteriority !== false ? 'checked' : ''}> Visible</label>
+
+            <label class="mwt-label" for="mwt-s-show-settings"><span aria-hidden="true">⚙️</span> Settings</label>
+            <label for="mwt-s-show-settings" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-show-settings" ${s.showFloatSettings !== false ? 'checked' : ''}> Visible</label>
+
+            <label class="mwt-label" for="mwt-s-button-style"><span aria-hidden="true">🎨</span> Style</label>
+            <select id="mwt-s-button-style" class="mwt-input" style="width:auto">
+                <option value="modern" ${(s.buttonStyle || 'modern') === 'modern' ? 'selected' : ''}>Modern (icons-only)</option>
+                <option value="classic" ${s.buttonStyle === 'classic' ? 'selected' : ''}>Classic (text + icon)</option>
+            </select>
+
+            <div></div>
+            <div>
+                <button id="mwt-s-reset-float-positions" class="mwt-btn" title="Restore all floating buttons to their default positions"><span aria-hidden="true">↩</span> Reset Button Positions</button>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin:4px 0 0">Dragged buttons return to the default right-edge stack. You can also use the <code>/wt-reset-buttons</code> slash command.</p>
+            </div>
+        </div>
+
+        </details>
+
+        <details class="mwt-settings-disclosure">
+            <summary><span aria-hidden="true">🛑</span> Per-Tracker Enable</summary>
+        <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:12px">
+            Disable a tracker you don't use: it stops injecting and scanning, and its floating button shows a red ✕
+            (right-click it again to re-enable). To remove a button entirely, uncheck its "Visible" box in the
+            Floating Buttons section above. You can also disable <em>everything</em> at once by right-clicking the ⚙️ button.
+        </p>
+        <div class="mwt-settings-grid">
+            <label class="mwt-label" for="mwt-s-master-off" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="mwt-s-master-off" ${s.injectionMasterOff ? 'checked' : ''}>
+                <span>Disable all trackers (panic switch)</span>
+            </label>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin:0">Stops injection and scanning for every module. Useful for testing or branching a chat. **Lorebook entries need to be manually disabled**.</p>
+
+            <label class="mwt-label" for="mwt-s-enable-world"><span aria-hidden="true">🌍</span> World State</label>
+            <label for="mwt-s-enable-world" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-enable-world" ${s.enableWorldState !== false ? 'checked' : ''}> Use this tracker</label>
+
+            <label class="mwt-label" for="mwt-s-enable-chronicle"><span aria-hidden="true">📜</span> Chronicle</label>
+            <label for="mwt-s-enable-chronicle" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-enable-chronicle" ${s.enableChronicle !== false ? 'checked' : ''}> Use this tracker</label>
+
+            <label class="mwt-label" for="mwt-s-enable-knowledge"><span aria-hidden="true">🧠</span> Knowledge</label>
+            <label for="mwt-s-enable-knowledge" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-enable-knowledge" ${s.enableKnowledge !== false ? 'checked' : ''}> Use this tracker</label>
+
+            <label class="mwt-label" for="mwt-s-enable-story-planner"><span aria-hidden="true">🗺️</span> Story Planner</label>
+            <label for="mwt-s-enable-story-planner" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-enable-story-planner" ${s.enableStoryPlanner !== false ? 'checked' : ''}> Use this tracker</label>
+
+            <label class="mwt-label" for="mwt-s-enable-interiority"><span aria-hidden="true">💭</span> Interiority</label>
+            <label for="mwt-s-enable-interiority" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mwt-s-enable-interiority" ${s.enableInteriority !== false ? 'checked' : ''}> Use this tracker</label>
+        </div>
+
+        </details>
+
+        <div class="mwt-settings-actions mwt-flex mwt-gap-4" style="flex-wrap:wrap">
+            <button id="mwt-s-save" class="mwt-btn mwt-btn-primary">Save Settings</button>
+            <button id="mwt-s-sync" class="mwt-btn" title="Copy these API settings to all module-specific configs"><span aria-hidden="true">↓</span> Sync to Modules</button>
+        </div>
+
+        <hr style="border-color:var(--mwt-border);margin:16px 0">
+        <p style="color:var(--mwt-text-dim);font-size:12px">
+            <strong>Module-specific settings</strong> are available in each tab's ⚙ Settings button.
+            Use "Sync to Modules" above to push the global API URL/Key/Model to all modules at once.
+        </p>
+        ${renderAmbientSettings()}
+        ${renderBackupPanel()}
+    `;
+}
+
+function buildTabContent(tab) {
+    if (tab.id === 'overview') return renderOverviewPane();
+    if (tab.id === 'settings') return renderSettingsTab();
+    // Diagnostics Phase 5 — the panel shell (placeholders for tabs 1–7).
+    if (tab.id === 'diagnostics') return renderDiagnosticsPanel();
+    // TODO §2 — the context/token budget panel (open-and-read, like the
+    // Diagnostics tabs: the modal is rebuilt on every open).
+    if (tab.id === 'budget') return renderBudgetPane();
+    // Part 5 (§5.4): the paused-store banner leads the module's own tab. It
+    // returns '' for a healthy module, so an unchanged tab renders exactly as
+    // before. The modal is rebuilt on every open, which is this banner's
+    // refresh model (the same D2 open-and-read rule the Diagnostics tabs use).
+    const pauseBanner = renderPausedStoresBanner(tab.id);
+    const renderFn = tab.module?.getModuleRender?.() || tab.module?.render;
+    if (typeof renderFn === 'function') return pauseBanner + renderFn();
+    return pauseBanner;
+}
+
+let modal = null;
+const _initedModules = new Set();
+
+function renderModal() {
+    // Accessibility plan §4.2 / Slice 2: the main tab bar follows the WAI-ARIA
+    // Tabs pattern — role=tablist/tab/tabpanel, aria-controls/aria-labelledby
+    // pairs through stable ids, roving tabindex (inactive tabs -1), hidden on
+    // inactive panels, and the decorative emoji in the labels hidden from
+    // assistive technology. The shell (markup + wiring) lives behind the
+    // render/wire seam in core/main_tabs.js, which
+    // test/main_tabbar_adoption.test.js drives under jsdom — this file's top
+    // level cannot be imported into Vitest.
+    const content = renderMainTabShell(TABS, buildTabContent);
+
+    if (!modal) {
+        modal = createModal({
+            id: 'mwt-modal',
+            title: 'Merged World Tracker',
+            content,
+            onClose: () => {
+                if (WorldState.isWorldStateDirty?.()
+                    && !confirm('You have unsaved changes to the World State. Close anyway?')) {
+                    return false;
+                }
+                console.log('[MWT] Modal closed.');
+            },
+        });
+    } else {
+        const body = modal.querySelector('.mwt-modal-body');
+        if (body) body.innerHTML = content;
+    }
+
+    // Wire the main tab bar through the shared tablist helper (accessibility
+    // plan §4.2 / Slice 2): automatic activation, arrow/Home/End navigation,
+    // and the aria-selected / hidden / roving-tabindex bookkeeping. The body
+    // is rebuilt on every open and chat change, so wiring runs on every
+    // render; see wireMainTabBar() for why repeated renders can neither drop
+    // the handlers nor stack duplicates.
+    wireMainTabBar(modal);
+
+    // Init feature modules with modal reference and wire their events
+    for (const tab of TABS) {
+        const mod = tab.module;
+        if (!mod) continue;
+        if (!_initedModules.has(mod)) {
+            _initedModules.add(mod);
+            if (mod.init) mod.init(modal);
+        }
+        if (mod.getModuleWireEvents) mod.getModuleWireEvents()();
+    }
+
+    // Wire the Backup/Restore control (lives in the Settings tab). The body is
+    // rebuilt on every open, so rebind each render like the module wire-events.
+    wireBackupEvents(modal);
+    wireAmbientSettings(modal);
+
+    // Part 5 (§5.4): wire the paused-store banner's actions — the module's
+    // OWN tab owns Retry and the recovery export (never the read-only
+    // Diagnostics panel). The body is rebuilt on every open, so rebind here
+    // like the backup control; buttons carry data-mwt-pause-* attributes.
+    const pauseRetryBtns = modal.querySelectorAll('[data-mwt-pause-retry]');
+    pauseRetryBtns.forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            const storeId = btn.dataset.mwtPauseRetry;
+            setControlBusy(btn, true);
+            const previousLabel = btn.textContent;
+            btn.textContent = 'Retrying…';
+            try {
+                const result = await retryStore(storeId);
+                if (result.ok) {
+                    setStatus(modal, `Retry succeeded — the store resumed. Re-open this tab to refresh it.`, 'success', 6000);
+                } else {
+                    setStatus(modal, `Retry did not clear the pause: ${result.message || result.reason || 'the store is still blocked'}`, 'error', 9000);
+                }
+            } finally {
+                setControlBusy(btn, false);
+                btn.textContent = previousLabel;
+            }
+        });
+    });
+    const pauseExportBtns = modal.querySelectorAll('[data-mwt-pause-export]');
+    pauseExportBtns.forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            // The export is async (it hydrates the resolved Knowledge books
+            // first when a chat switch left their loads still in flight), so
+            // await it before describing the result.
+            // One wording owner (backup/render.js describeRecoveryExportResult):
+            // an `unreadable` refusal surfaces its message as an error, never
+            // the "nothing was rejected" info line — same as the Backup panel.
+            // A11Y-S3-03: own the busy pair across the awaited export so the
+            // button can neither double-fire nor lie about being idle.
+            setControlBusy(btn, true);
+            try {
+                const { message, tone } = describeRecoveryExportResult(await exportRecoveryData());
+                setStatus(modal, message, tone, tone === 'info' ? 6000 : (tone === 'error' ? 12000 : 8000));
+            } finally {
+                setControlBusy(btn, false);
+            }
+        });
+    });
+
+    // Wire the Diagnostics panel shell (lives in the 🩺 Diagnostics tab).
+    // Same rebind-every-render rule as the backup control above.
+    wireDiagnosticsPanel(modal);
+
+    // Wire the 📊 Budget tab's Save control (TODO §2). Same
+    // rebind-every-render rule.
+    wireBudgetTab(modal, { setStatusFn: (root, message, type, ms) => setStatus(modal, message, type, ms) });
+
+    // Overview follows the same rebind-every-render rule; its maintenance
+    // tools wire their own guarded preview→confirm modals.
+    wireOverviewPane(modal);
+
+    // Wire connection profile toggle (hide API fields when a profile is selected)
+    const profileSelect = modal.querySelector('#mwt-s-connection-profile');
+    if (profileSelect) {
+        profileSelect.addEventListener('change', () => {
+            const apiFields = modal.querySelector('#mwt-s-api-fields');
+            if (apiFields) apiFields.style.display = profileSelect.value ? 'none' : '';
+        });
+    }
+
+    // Wire settings save
+    const saveBtn = modal.querySelector('#mwt-s-save');
+    if (saveBtn) {
+        saveBtn.addEventListener('click', () => {
+            const apiValues = readApiSettingsValues(modal, GLOBAL_API_FIELD_IDS);
+            // Depth 0 ("inject at the very bottom") is a legitimate value, so
+            // don't use `Number(...) || fallback` — that clobbers 0 to the fallback.
+            const depthOr = (sel, fallback) => {
+                const n = parseInt(modal.querySelector(sel)?.value, 10);
+                return Number.isFinite(n) && n >= 0 ? n : fallback;
+            };
+            const rawRecentHistoryExclude = Number(modal.querySelector('#mwt-s-recent-history-exclude')?.value);
+            const recentHistoryExclude = Number.isFinite(rawRecentHistoryExclude)
+                ? Math.min(10, Math.max(0, Math.round(rawRecentHistoryExclude)))
+                : 2;
+            // Generation coordinator (TODO §1): clamp to the coordinator's
+            // supported range; an empty/garbage field falls back to the default.
+            const rawApiMaxConcurrent = Number(modal.querySelector('#mwt-s-api-max-concurrent')?.value);
+            const apiMaxConcurrent = Number.isFinite(rawApiMaxConcurrent)
+                ? Math.min(8, Math.max(1, Math.round(rawApiMaxConcurrent)))
+                : 2;
+            const patch = {
+                ...apiValues,
+                connectionProfileId: modal.querySelector('#mwt-s-connection-profile')?.value || '',
+                recentHistoryExclude,
+                apiMaxConcurrent,
+                pauseBackgroundJobsDuringGeneration: modal.querySelector('#mwt-s-pause-background')?.checked ?? false,
+                // Per-module injection settings
+                worldStateDepth: depthOr('#mwt-s-ws-depth', 4),
+                worldStateRole: modal.querySelector('#mwt-s-ws-role')?.value || 'system',
+                chronicleDepth: depthOr('#mwt-s-ch-depth', 4),
+                chronicleRole: modal.querySelector('#mwt-s-ch-role')?.value || 'system',
+                // Structural boundaries
+                structuralBoundaries: modal.querySelector('#mwt-s-structural-boundaries')?.checked ?? true,
+                // Button visibility
+                showFloatWorld: modal.querySelector('#mwt-s-show-world')?.checked ?? true,
+                showFloatChronicle: modal.querySelector('#mwt-s-show-chronicle')?.checked ?? true,
+                showFloatKnowledge: modal.querySelector('#mwt-s-show-knowledge')?.checked ?? true,
+                showFloatStoryPlanner: modal.querySelector('#mwt-s-show-story-planner')?.checked ?? true,
+                showFloatInteriority: modal.querySelector('#mwt-s-show-interiority')?.checked ?? true,
+                showFloatSettings: modal.querySelector('#mwt-s-show-settings')?.checked ?? true,
+                collapseFloatButtons: modal.querySelector('#mwt-s-collapse-float')?.checked ?? false,
+                buttonStyle: modal.querySelector('#mwt-s-button-style')?.value || 'modern',
+                // Per-tracker enable + master panic switch
+                enableWorldState: modal.querySelector('#mwt-s-enable-world')?.checked ?? true,
+                enableChronicle: modal.querySelector('#mwt-s-enable-chronicle')?.checked ?? true,
+                enableKnowledge: modal.querySelector('#mwt-s-enable-knowledge')?.checked ?? true,
+                enableStoryPlanner: modal.querySelector('#mwt-s-enable-story-planner')?.checked ?? true,
+                enableInteriority: modal.querySelector('#mwt-s-enable-interiority')?.checked ?? true,
+                interiorityDepth: depthOr('#mwt-s-int-depth', 1),
+                interiorityRole: modal.querySelector('#mwt-s-int-role')?.value || 'system',
+                injectionMasterOff: modal.querySelector('#mwt-s-master-off')?.checked ?? false,
+            };
+            // NOTE: enableX and showFloatX are deliberately decoupled. Toggling
+            // "Use this tracker" here only flips enableX (button stays visible
+            // with a red ✕), matching the right-click quick-toggle behavior.
+            // The "Visible" checkboxes above are the sole control over presence.
+            // This avoids the "button vanished after an unrelated save" surprise
+            // that the previous one-way coupling created.
+
+            saveSettings(patch);
+            ui.applyButtonVisibility();
+            ui.applyButtonStyle();
+            ui.updateButtonStates();
+            // TODO §1 — the coordinator reads its limits live, but queued jobs
+            // only start on the next submit/settle; re-run the scheduler so a
+            // RAISED limit releases them immediately.
+            pumpCoordinator();
+            // Re-apply injections so the structural-boundaries toggle takes
+            // effect immediately without requiring a new chat message.
+            try {
+                WorldState.applyWorldStateInjection?.();
+                Chronicle.applyInjection?.();
+                StoryPlanner.applyPlanInjection?.();
+                Interiority.applyIntentionsInjection?.();
+                if (getSettings().injectionMasterOff) clearAmbientInjection({ kind: 'ambient-conditions', clearReason: 'panic-settings-save' });
+            } catch { /* modules may not be initialized yet */ }
+            setStatus(modal, 'Settings saved.', 'success', 3000);
+        });
+    }
+
+    // Wire reset-floating-button-positions button
+    const resetBtn = modal.querySelector('#mwt-s-reset-float-positions');
+    if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+            ui.resetFloatPositions();
+            setStatus(modal, 'Floating buttons reset to default positions.', 'success', 3000);
+        });
+    }
+
+    // Wire sync-to-modules button
+    const syncBtn = modal.querySelector('#mwt-s-sync');
+    if (syncBtn) {
+        syncBtn.addEventListener('click', () => {
+            const apiValues = readApiSettingsValues(modal, GLOBAL_API_FIELD_IDS);
+            const patch = {
+                connectionProfileId: modal.querySelector('#mwt-s-connection-profile')?.value || '',
+                ...apiValues,
+            };
+            if (WorldState.syncGlobalSettings) WorldState.syncGlobalSettings(patch);
+            if (Chronicle.syncGlobalSettings) Chronicle.syncGlobalSettings(patch);
+            if (Knowledge.syncGlobalSettings) Knowledge.syncGlobalSettings(patch);
+            if (StoryPlanner.syncGlobalSettings) StoryPlanner.syncGlobalSettings(patch);
+            if (Interiority.syncGlobalSettings) Interiority.syncGlobalSettings(patch);
+            setStatus(modal, 'API settings synced to all modules.', 'success', 3000);
+        });
+    }
+}
+
+// ─── Open modal helper (shared by button bar, wand menu, drawer) ────────────
+
+function openMwtModal(tabId) {
+    const isOpen = modal && modal.style.display === 'flex';
+    if (!isOpen) {
+        renderModal();
+        showModal('mwt-modal');
+    }
+    if (tabId) {
+        const tabBtn = modal?.querySelector(`.mwt-tab-btn[data-tab="${tabId}"]`);
+        if (tabBtn) tabBtn.click();
+    }
+}
+
+// ─── Shared module registry (used by the message-event routers below) ───────
+
+const modules = { WorldState, Chronicle, Knowledge, StoryPlanner, Interiority, Ambient };
+
+// Part 6 (§5.4/§7.5): the out-of-band resume seam. When a paused store
+// resumes through Retry or the privileged §7.5 preparation — long after
+// CHAT_CHANGED already skipped the paused module's hydration (see below) —
+// the module's onChatChanged() must re-run against the now-canonical store,
+// or the first event after the resume persists the stale in-memory state over
+// the repaired data. core/schema_status.js runStoreResumeInitializer() drives
+// these, deduped by OWNING MODULE (its run-once memo is module-keyed):
+// knowledge's three store ids share one initializer — the module, not the
+// store, owns the re-hydration — so a resume reporting several of them
+// re-hydrates the module exactly once.
+const MODULE_BY_MODULE_ID = Object.freeze({
+    world_state: WorldState,
+    chronicle: Chronicle,
+    knowledge: Knowledge,
+    story_planner: StoryPlanner,
+    interiority: Interiority,
+});
+for (const [resumeStoreId, resumeModuleId] of Object.entries(STORE_MODULE_IDS)) {
+    const resumeModule = MODULE_BY_MODULE_ID[resumeModuleId];
+    if (typeof resumeModule?.onChatChanged === 'function') {
+        setStoreResumeInitializer(resumeStoreId, () => resumeModule.onChatChanged());
+    }
+}
+
+// ─── Event hooks ─────────────────────────────────────────────────────────────
+
+if (eventSource && event_types?.CHAT_CHANGED) {
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        bumpEpoch(); // Tier 0.2 — invalidate all in-flight scope tokens BEFORE module handlers
+        // TODO §1 — retire coordinator jobs captured before the switch:
+        // queued copies never start, running ones abort where the backend
+        // supports it. Their results would be discarded by the scope guards
+        // anyway; this stops the spend too.
+        onChatScopeChanged();
+        console.log('[MWT] Chat changed — resetting state.');
+        // Schema plan Part 6 (§7.4): the synchronous fast load gate runs BEFORE
+        // any module handler, so no module reads or injects an unprepared
+        // store. Migrations that pass the §7.2 budget commit here — data,
+        // manifest stamp, and quarantine additions in ONE save (§7.3); a
+        // blocked store pauses ONLY its own module. This adds NO await:
+        // CHAT_CHANGED stays synchronous by contract.
+        applySchemaLoadGate();
+        // §7.5: chat-dependent preparations (Interiority's legacy-key
+        // conversion) run as privileged orchestration, fire-and-forget — the
+        // deferred module is already paused (preparing) above.
+        runSchemaPreparations().catch(err => console.warn('[MWT] Schema preparation after chat change failed:', err?.message || err));
+        const activeTab = modal?.querySelector('.mwt-tab-btn.active')?.dataset.tab;
+        // TODO §2 P1 — two-phase chat-change budget lifecycle, RESET phase:
+        // clear every managed module's injection slot + Phase 2 snapshot
+        // BEFORE the sequential reapply below. The injection snapshots are
+        // intentionally global (no scope), so without this reset the modules
+        // later in the reapply order would still see the PREVIOUS chat's
+        // payloads through registeredOthersTokens() and reject the new chat's
+        // injections purely on handler order. After this, each module sees an
+        // empty `others` map and registers only the new chat's payloads.
+        resetBudgetInjections();
+        Ambient.onChatChanged();
+        // Part 6 (§7.4/§5.4): a module paused by the runtime gate does NOT run
+        // its chat-change hydration. Its onChatChanged() would restore
+        // counters and bookkeeping from the BLOCKED store value and hold them
+        // in memory; after an out-of-band repair + Retry, the first event
+        // would persist that stale state over the repaired store. The pause
+        // banner owns the explanation, and the resume initializers registered
+        // above re-run the module's onChatChanged() when the store actually
+        // resumes (retryStore / the §7.5 preparation landing).
+        //
+        // Skipping the handler ENTIRELY, though, also skipped its
+        // scope-INDEPENDENT cleanup: the previous chat's World State /
+        // Chronicle / Story Planner / Interiority injection stayed registered
+        // in the blocked chat, pending auto-refresh/auto-generate timers kept
+        // running, and Interiority's old thought blocks stayed in the DOM.
+        // Each module therefore exposes onChatChangedWhilePaused() — exactly
+        // that safe half (each injection applier's paused branch clears its
+        // slot), without one read of the blocked store.
+        for (const [moduleKey, mod] of Object.entries(modules)) {
+            try {
+                if (isModulePausedForCurrentScope(moduleKey)) mod.onChatChangedWhilePaused?.();
+                else mod.onChatChanged();
+            } catch (err) {
+                console.error(`[MWT] ${moduleKey} chat-change handler failed:`, err);
+            }
+        }
+        if (modal?.style.display === 'flex') {
+            const activeElement = document.activeElement;
+            const focusWasInModal = modal.contains(activeElement);
+            const focusId = activeElement?.id;
+            const focusTab = activeElement?.dataset?.tab;
+            renderModal();
+            if (activeTab) modal.querySelector(`.mwt-tab-btn[data-tab="${activeTab}"]`)?.click();
+            if (focusWasInModal) {
+                const restored = focusId
+                    ? [...modal.querySelectorAll('[id]')].find(el => el.id === focusId)
+                    : (focusTab ? modal.querySelector(`.mwt-tab-btn[data-tab="${focusTab}"]`) : null);
+                (restored || modal.querySelector('.mwt-modal-close'))?.focus?.();
+            }
+        }
+    });
+}
+
+if (eventSource && event_types?.MESSAGE_RECEIVED) {
+    eventSource.on(event_types.MESSAGE_RECEIVED, (...args) => {
+        // Part 6: the decline predicate — a module whose store is paused by
+        // the runtime schema gate declines its own message-event work and says
+        // so, while every other module keeps running (§7.4).
+        routeMessageReceived(modules, getSettings(), extractMessageIndex(args[0]), isModulePausedForCurrentScope);
+    });
+}
+
+// Register generation lifecycle hooks — use every available event name for
+// compatibility across SillyTavern versions.
+function onAnyEvent(names, handler) {
+    for (const name of names) {
+        if (eventSource && event_types?.[name]) {
+            eventSource.on(event_types[name], handler);
+        }
+    }
+}
+
+// The user-generation DEPTH must move exactly once per generation. Registering
+// the decrement on BOTH GENERATION_STOPPED and GENERATION_ENDED (builds can
+// fire the pair for one generation — archive/bug_reports/01_core.md #4) needs a
+// heuristic to collapse them, and every heuristic has a failure mode: a
+// time-window deduper early-releases when a slow proxy separates the pair by
+// more than the window, and permanently wedges when the terminals of two
+// concurrent generations interleave with no START in between (quiet
+// generations from other extensions emit the same pair). Instead ONE
+// canonical terminal event is selected per build: GENERATION_ENDED when
+// event_types exposes it (it fires exactly once per generation — natural end
+// AND abort — from generate's close-out), else GENERATION_STOPPED (the only
+// terminal older builds have). A single event cannot double-count by
+// construction, and interleaved terminals each unwind their own window. A
+// terminal that never fires at all is bounded by onChatScopeChanged()'s hard
+// depth reset. Chronicle's own busy flag stays registered on BOTH terminals
+// (unchanged) — that module owns its flag semantics.
+const depthTerminalEvent = event_types?.GENERATION_ENDED ? 'GENERATION_ENDED' : 'GENERATION_STOPPED';
+console.log(`[MWT] Generation-depth terminal event: ${depthTerminalEvent}`);
+
+// ST invokes this after inserting pending input and deleting a regenerated
+// reply, before collecting extension prompts. Never resolve ambient time in the
+// early event.
+globalThis.mwtAmbientGenerationInterceptor = Ambient.generationInterceptor;
+
+onAnyEvent(['GENERATION_STARTED'], (type, options, dryRun) => {
+    Ambient.prepareGeneration(type, options, dryRun);
+    Chronicle.onGenerationStarted();
+    // TODO §1 — the optional "hold background tracker jobs while the user is
+    // generating" policy (Settings tab, default off). Depth-counted inside
+    // the coordinator; the decrement side fires on ONE canonical terminal
+    // event (depthTerminalEvent above), so builds that emit both stop events
+    // cannot double-decrement.
+    beginUserGeneration();
+});
+onAnyEvent(['GENERATION_STOPPED', 'GENERATION_ENDED'], () => {
+    Chronicle.onGenerationStopped();
+});
+onAnyEvent([depthTerminalEvent], () => {
+    endUserGeneration();
+});
+
+// ─── Swipe / edit / delete awareness (F2) ────────────────────────────────────
+// Keep module counters and chronicle anchors in sync when the user mutates chat
+// history, so tracking doesn't drift after edits/deletes/swipes.
+//
+// SillyTavern's event signatures vary across versions, so we normalize the
+// argument to a chat-array index (number) before delegating to modules. The
+// normalization + per-module dispatch lives in core/event_router.js.
+
+if (eventSource && event_types?.MESSAGE_DELETED) {
+    eventSource.on(event_types.MESSAGE_DELETED, (...args) => {
+        const idx = extractMessageIndex(args[0]);
+        console.log(`[MWT] MESSAGE_DELETED (index: ${idx}) — routing to modules.`);
+        routeMessageDeleted(modules, getSettings(), idx, isModulePausedForCurrentScope);
+    });
+}
+
+if (eventSource && event_types?.MESSAGE_SWIPED) {
+    eventSource.on(event_types.MESSAGE_SWIPED, (...args) => {
+        const idx = extractMessageIndex(args[0]);
+        console.log(`[MWT] MESSAGE_SWIPED (index: ${idx}) — checking anchor / scheduling refresh.`);
+        routeMessageSwiped(modules, getSettings(), idx, isModulePausedForCurrentScope);
+    });
+}
+
+// ─── Sparse-chat: MORE_MESSAGES_LOADED (Aikobots v4 fork) ─────────────────────
+// When older chat ranges are hydrated, re-render thought blocks for newly
+// visible messages and retry the privileged schema preparation (a deferral
+// that survived because the chat was not fully hydrated). On upstream ST this
+// event doesn't exist, so the guard skips silently.
+
+if (eventSource && event_types?.MORE_MESSAGES_LOADED) {
+    eventSource.on(event_types.MORE_MESSAGES_LOADED, () => {
+        console.log('[MWT] MORE_MESSAGES_LOADED — re-rendering interiority thought blocks.');
+        Interiority.onMoreMessagesLoaded?.();
+    });
+}
+
+if (eventSource && event_types?.MESSAGE_EDITED) {
+    eventSource.on(event_types.MESSAGE_EDITED, (...args) => {
+        const idx = extractMessageIndex(args[0]);
+        console.log(`[MWT] MESSAGE_EDITED (index: ${idx}) — checking anchor / scheduling refresh.`);
+        routeMessageEdited(modules, getSettings(), idx, isModulePausedForCurrentScope);
+    });
+}
+
+// ─── Interiority custom event listeners ──────────────────────────────────────
+// The render.js "Generate Now" button dispatches these custom events.
+
+document.addEventListener('mwt:interiority-generate', (e) => {
+    // trigger defaults to TRIGGER.MANUAL — this listener IS the 💭 button.
+    // A11Y-S3-03: publish the generation promise on the shared detail object
+    // so the dispatching handler (interiority/render.js "Generate Now") can
+    // await the work and own its control's busy state end to end.
+    const pending = Interiority.triggerGenerate?.();
+    if (e?.detail) e.detail.promise = pending ?? null;
+});
+
+document.addEventListener('mwt:interiority-ledger-changed', () => {
+    Interiority.applyIntentionsInjection?.();
+});
+
+// ─── Floating button bar, drawer, wand menu (via core/ui.js) ────────────────
+
+const ui = createFloatingButtonBar({
+    getSettings,
+    saveSettings,
+    openModal: openMwtModal,
+    modules,
+});
+
+// ─── Slash commands & macros (via core/commands.js) ──────────────────────────
+
+const commands = createCommands({
+    registerSlashCommand,
+    macroRegistry,
+    modules,
+    resetFloatPositions: ui.resetFloatPositions,
+    saveSettings,
+});
+
+// ─── Initialize ──────────────────────────────────────────────────────────────
+
+ui.setupButtonBar();
+ui.applyButtonStyle();
+ui.updateButtonStates(); // show disabled/red-X state immediately on load
+ui.setupExtensionsDrawer();
+ui.setupWandMenu();
+commands.setupSlashCommands();
+commands.setupMacros();
+
+// Start module runtime (injection, auto-save timers, notification panels).
+// Modules are re-initialized with a modal reference when the user opens the
+// MWT modal for the first time.
+//
+// Schema plan Part 6 (§7.6): the runtime load gate runs BEFORE module
+// injection — no module initializes against unprepared data. Startup MAY
+// await (index.js already top-level-awaits script.js), so the §7.5 privileged
+// preparation (Interiority's chat-dependent legacy-key conversion) is awaited
+// here too; on chat change the same pair runs synchronously + fire-and-forget.
+applySchemaLoadGate();
+await runSchemaPreparations();
+registerSchemaGateRetryHandlers();
+
+WorldState.init(null);
+Chronicle.init(null);
+Knowledge.init(null);
+StoryPlanner.init(null);
+Interiority.init(null);
+
+// Periodically update floating button token counts and auto-refresh countdown
+setInterval(ui.updateFloatTokenCounts, 5000);
+setTimeout(ui.updateFloatTokenCounts, 2000);
+
+// Listen for busy-state changes from any module (decoupled via CustomEvent)
+document.addEventListener('mwt:busy-changed', ui.updateButtonStates);
+
+// ─── Console debugging API ───────────────────────────────────────────────────
+//
+// Expose a small, stable API on `window.MWT` so users (and developers) can
+// inspect and reset growth evidence from the browser console without digging
+// through chat metadata by hand. The evidence store lives in
+// chat_metadata.knowledge_growth_evidence, keyed by NPC name.
+//
+// Usage examples:
+//   MWT.evidence.list()                  // list NPCs with evidence + counts
+//   MWT.evidence.clear('Kira')           // wipe one NPC's evidence (start over)
+//   MWT.evidence.clearAll(true)          // wipe ALL NPCs' evidence in this chat
+//   MWT.evidence.summary('Kira')         // show tiers + last-profile time
+//   MWT.evidence.inspect('Kira')         // dump the full evidence file object
+//   MWT.scope.diagnose()                 // which books this chat resolves to, and why
+//   MWT.scope.bindings()                 // every saved character/chat → lorebook binding
+//   MWT.scope.reload()                   // flush + re-hydrate the registry stores
+//   MWT.modal.releaseManagedInert()      // emergency: un-inert the page if a modal crash froze it
+//
+// NOTE ON CLEARING: evidence is the ROOT, a generated profile is a LEAF. Clearing
+// evidence does NOT delete the NPC's entry in the "NPC Profiles" lorebook, which
+// would leave a profile with nothing backing it — the unfalsifiable state this
+// feature exists to prevent. Both clear operations warn when that applies.
+try {
+    const evidenceApi = await import('./knowledge/evidence.js');
+    const registryApi = await import('./knowledge/registry.js');
+    const scopeApi = await import('./knowledge/scope.js');
+    const storeApi = await import('./knowledge/store.js');
+    const ktSettingsApi = await import('./knowledge/settings.js');
+    const cleanupRecoveryApi = await import('./knowledge/cleanup_recovery.js');
+
+    /**
+     * Warn when cleared NPCs still have a profile entry in the NPC Profiles
+     * lorebook — it is now unbacked by any evidence. The predicate and the
+     * wording are shared with the Overview Tools surface through
+     * knowledge/evidence.js, so the two cannot drift.
+     */
+    const warnOrphanedProfiles = (names) => {
+        const orphaned = evidenceApi.findOrphanedProfiles(names, registryApi.getProfileUid);
+        if (orphaned.length === 0) return;
+        console.warn(evidenceApi.orphanedProfilesWarning(orphaned));
+    };
+
+    window.MWT = window.MWT || {};
+    // Emergency console handle for the modal stack's managed-inert
+    // bookkeeping (core/modal.js): if a crash ever leaves the host frozen
+    // behind a modal, MWT.modal.releaseManagedInert() rolls every inert
+    // value MWT owns back. releaseManagedInert is a plain ES-module export,
+    // unreachable from a tester's console without this bridge.
+    window.MWT.modal = { releaseManagedInert };
+    window.MWT.evidence = {
+        list: () => {
+            const map = evidenceApi.getEvidenceMap();
+            const out = [];
+            for (const [name, file] of Object.entries(map)) {
+                out.push({
+                    npc: name,
+                    raw: (file.raw || []).length,
+                    consolidated: (file.consolidated || []).length,
+                    archivedRaw: (file.archivedRaw || []).length,
+                    overrides: (file.userOverrides || []).length,
+                    lastProfileAt: file.meta?.lastProfileAt || null,
+                });
+            }
+            console.table(out);
+            return out;
+        },
+        summary: (name) => {
+            const s = evidenceApi.getEvidenceSummary(name);
+            console.log('Evidence summary for', name, ':', s);
+            return s;
+        },
+        inspect: (name) => {
+            const file = evidenceApi.getEvidenceFile(name, false);
+            if (!file) { console.log(`No evidence file for "${name}".`); return; }
+            console.log(`Evidence file for "${name}":`, file);
+            return file;
+        },
+        clear: (name) => {
+            const ok = evidenceApi.clearEvidence(name);
+            if (!ok) { console.log(`No evidence file found for "${name}".`); return false; }
+            console.log(`Cleared all evidence for "${name}". The NPC remains enrolled in continuous capture.`);
+            warnOrphanedProfiles([name]);
+            return true;
+        },
+        clearAll: (confirm) => {
+            // Guarded: this wipes every NPC's evidence for the chat, including the
+            // archivedRaw audit trail. Rebuilding it means re-running capture over
+            // the whole history — real API cost — so a bare clearAll() (or a typo
+            // where clear('Name') was meant) must not be destructive.
+            if (confirm !== true) {
+                const names = Object.keys(evidenceApi.getEvidenceMap());
+                console.warn(
+                    `[MWT] clearAll() would wipe evidence for ${names.length} NPC(s) in THIS chat: ` +
+                    `${names.join(', ') || '(none)'}.\n` +
+                    `This cannot be undone and re-capturing costs API calls. ` +
+                    `Call MWT.evidence.clearAll(true) to confirm, or MWT.evidence.clear('Name') for one NPC.`
+                );
+                return 0;
+            }
+            const names = Object.keys(evidenceApi.getEvidenceMap());
+            const count = evidenceApi.clearAllEvidence();
+            console.log(count > 0 ? `Cleared evidence for ${count} NPC(s) in this chat.` : 'No evidence found to clear.');
+            if (count > 0) warnOrphanedProfiles(names);
+            return count;
+        },
+    };
+
+    // ── Profile entry audit (NPC Profiles lorebook ↔ registry consistency) ──
+    //
+    // A lost `profileUid` pointer makes the next save create a SECOND lorebook
+    // entry for the same NPC instead of overwriting. The pointer loss is fixed
+    // going forward (immediate flush + loud setProfileUid), but chats that
+    // already accumulated duplicates need a way to see and prune them.
+    //
+    // The audit and planning logic lives in knowledge/profiles_audit.js; the
+    // functions below own only the console output and the apply step.
+    const profileLorebookApi = await import('./knowledge/lorebook.js');
+
+    // ── Lorebook scope diagnostics ──────────────────────────────────────────
+    //
+    // Phase 3 (knowledge cleanup) recovery surface: durable pre-cleanup
+    // originals. The reviewed recovery UI (ledger review modal's "Recovery
+    // records…" manager) landed in Phase 4; this console surface stays as the
+    // scriptable/debug half — recovery survives review close and host reload
+    // either way (it lives in the lorebook).
+    window.MWT.cleanupRecovery = {
+        list: async () => {
+            const result = await cleanupRecoveryApi.listCleanupRecovery();
+            if (!result.ok) { console.error(`[MWT] Cleanup recovery container unreadable: ${result.reason}`); return result; }
+            console.table(result.records.map(r => ({
+                actionId: r.actionId, entity: r.entityName, uid: r.entryUid, type: r.actionType,
+                status: r.status, created: r.createdAt, estTokens: r.estimatedTokens,
+            })));
+            for (const issue of result.issues || []) {
+                console.warn(`[MWT] Unreadable recovery record ${issue.actionId} (${issue.reason}) — preserved on disk, never silently dropped.`);
+            }
+            return result;
+        },
+        usage: () => cleanupRecoveryApi.cleanupRecoveryUsage(),
+        export: (actionIds) => cleanupRecoveryApi.exportCleanupRecovery(actionIds),
+        import: (payload) => cleanupRecoveryApi.importCleanupRecovery(payload),
+        // Explicit deletion only (D2): recovery is never silently evicted.
+        delete: (actionIds) => cleanupRecoveryApi.deleteCleanupRecords(actionIds),
+    };
+
+    // The scope resolver reads SillyTavern context fields whose names vary
+    // across ST versions and forks. Every read is defensive and falls back to
+    // the global lorebooks, which is safe but SILENT — so this exists to make
+    // the fallback visible. `MWT.scope.diagnose()` reports which fields the
+    // running build actually exposes, what identity they resolve to, and which
+    // books that produces. Run it first whenever scoping misbehaves.
+    window.MWT.scope = {
+        diagnose: () => {
+            const ctx = (typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function')
+                ? SillyTavern.getContext() : null;
+            if (!ctx) { console.error('[MWT] No SillyTavern context available.'); return null; }
+
+            const card = (Array.isArray(ctx.characters) && ctx.characterId !== null && ctx.characterId !== undefined)
+                ? ctx.characters[ctx.characterId] : null;
+
+            let currentChatId = '(not a function)';
+            if (typeof ctx.getCurrentChatId === 'function') {
+                try { currentChatId = String(ctx.getCurrentChatId()); }
+                catch (err) { currentChatId = `(threw: ${err?.message})`; }
+            }
+
+            console.log('[MWT] Context fields the scope resolver reads:');
+            console.table({
+                'characterId': ctx.characterId ?? '(absent)',
+                'characters is array': Array.isArray(ctx.characters),
+                'characters[characterId]': card ? 'resolved' : '(not resolved)',
+                '  card.avatar': card?.avatar || '(absent)',
+                '  card.name': card?.name || '(absent)',
+                'name1 (user)': ctx.name1 || '(absent)',
+                'name2 (char)': ctx.name2 || '(absent)',
+                'groupId': ctx.groupId ?? '(absent)',
+                'groups is array': Array.isArray(ctx.groups),
+                'getCurrentChatId()': currentChatId,
+                'chatId': ctx.chatId ?? '(absent)',
+            });
+
+            const charIdentity = scopeApi.getCharacterIdentity();
+            const chatIdentity = scopeApi.getChatIdentity();
+            const scope = ktSettingsApi.getSettings().scope || 'global';
+            // null = a scoped name that still collides after disambiguation;
+            // Knowledge refuses every book for this scope until it is repaired.
+            const books = scopeApi.resolveBookNames();
+            const refused = '(refused: name collision)';
+
+            console.log('[MWT] Resolution:');
+            console.table({
+                'scope setting': scope,
+                'character identity': charIdentity
+                    ? `${charIdentity.key} → "${charIdentity.name}"${charIdentity.isGroup ? ' (group)' : ''}`
+                    : '(unresolved)',
+                'chat identity': chatIdentity ? chatIdentity.key : '(unresolved)',
+                'Knowledge book': books?.knowledge ?? refused,
+                'State book': books?.state ?? refused,
+                'Profiles book': books?.profiles ?? refused,
+                'Knowledge store loaded': books ? storeApi.isHydrated(books.knowledge) : false,
+                'State store loaded': books ? storeApi.isHydrated(books.state) : false,
+            });
+
+            const usedIdentity = scope === 'chat' ? chatIdentity : charIdentity;
+            if (scope !== 'global' && !usedIdentity) {
+                console.warn(
+                    `[MWT] ⚠ scope is "${scope}" but the current ${scope} could not be identified, ` +
+                    `so this is silently using the GLOBAL lorebooks. The field table above shows ` +
+                    `which lookup came back absent.`
+                );
+            }
+            if (!books) {
+                console.warn(
+                    `[MWT] ⚠ This ${scope}'s lorebook name collides with other saved bindings even ` +
+                    `after disambiguation, so Knowledge reads and writes no book here. Run ` +
+                    `MWT.scope.bindings() to see which binding holds the name, or open ` +
+                    `Diagnostics → Scope & storage.`
+                );
+            } else if (!storeApi.isHydrated(books.knowledge)) {
+                console.warn(
+                    '[MWT] ⚠ The Knowledge store is not loaded, so creating entries is blocked ' +
+                    '(this is deliberate — it prevents duplicate entries). Switch chats to retry, ' +
+                    'or look for an earlier store error above.'
+                );
+            }
+            return { scope, books, charIdentity, chatIdentity };
+        },
+        bindings: () => {
+            const saved = ktSettingsApi.getSettings().bookBindings || {};
+            const rows = Object.entries(saved).map(([key, v]) => ({
+                key, knowledge: v?.knowledge, state: v?.state, profiles: v?.profiles,
+            }));
+            if (rows.length === 0) { console.log('[MWT] No lorebook bindings saved yet.'); return []; }
+            console.table(rows);
+            console.log('[MWT] "key" is the stable identity (avatar filename), which is why renaming a card keeps its books.');
+            return rows;
+        },
+        reload: async () => {
+            const knowledgeApi = await import('./knowledge/index.js');
+            await knowledgeApi.reloadStores();
+            console.log('[MWT] Stores flushed and reloaded.');
+            return scopeApi.resolveBookNames();
+        },
+    };
+
+    window.MWT.profiles = {
+        list: async () => {
+            const rows = await auditProfiles();
+            if (rows.length === 0) { console.log('[MWT] No entries in the "NPC Profiles" lorebook.'); return []; }
+            console.table(rows);
+            return rows;
+        },
+        duplicates: async () => {
+            const rows = (await auditProfiles()).filter(r => r.duplicate);
+            if (rows.length === 0) { console.log('[MWT] No duplicate profile entries found.'); return []; }
+            console.table(rows);
+            console.log(
+                '[MWT] "referenced: true" is the entry the registry points at — that one is live. ' +
+                'The rest are orphans from lost pointers. MWT.profiles.pruneDuplicates() previews a cleanup.'
+            );
+            return rows;
+        },
+        pruneDuplicates: async (confirm) => {
+            const { toDelete, needsReview } = planProfilePrune(await auditProfiles());
+            for (const { reason, npc, rows: list } of needsReview) {
+                if (reason === 'unnamed') {
+                    console.warn(
+                        `[MWT] ${list.length} profile entries have no NPC name (uids ` +
+                        `${list.map(r => r.uid).join(', ')}). They cannot be grouped reliably — ` +
+                        `skipped. Inspect with MWT.profiles.list() and handle by hand.`
+                    );
+                    continue;
+                }
+                console.warn(
+                    `[MWT] "${npc}" has ${list.length} entries, none referenced by the registry ` +
+                    `and identical in size (uids ${list.map(r => r.uid).join(', ')}). Skipped — ` +
+                    `inspect them and delete by hand.`
+                );
+            }
+            if (toDelete.length === 0) { console.log('[MWT] Nothing to prune.'); return []; }
+
+            if (confirm !== true) {
+                console.table(toDelete.map(r => ({ npc: r.npc, deleteUid: r.uid, keepUid: r.keptUid, chars: r.chars, preview: r.preview })));
+                console.warn(
+                    `[MWT] DRY RUN — nothing deleted. The ${toDelete.length} entr${toDelete.length === 1 ? 'y' : 'ies'} above ` +
+                    `would be removed from the "NPC Profiles" lorebook. Review the previews first: ` +
+                    `profiles are regeneratable from evidence, but only if the evidence is still there. ` +
+                    `Call MWT.profiles.pruneDuplicates(true) to actually delete.`
+                );
+                return toDelete;
+            }
+
+            const result = await profileLorebookApi.deleteProfileEntries(toDelete.map(r => r.uid));
+            if (!result.success) { console.error('[MWT] Prune failed:', result.error); return []; }
+            console.log(`[MWT] Deleted ${result.deleted.length} duplicate profile entr${result.deleted.length === 1 ? 'y' : 'ies'}: uids ${result.deleted.join(', ')}.`);
+            return result.deleted;
+        },
+        relink: async (confirm) => {
+            // Recovery for pointers lost BEFORE saves became durable: the
+            // profile entry sits in the "NPC Profiles" lorebook while the
+            // registry has no profileUid for it, so the profile reads as
+            // "never generated" everywhere — the growth modal shows an empty
+            // box, and Interiority's "Profiled NPCs only" filters the NPC out.
+            // Nothing regenerates it, because the evidence is intact and the
+            // lorebook entry is right there; only the pointer is missing.
+            const reg = registryApi.getRegistry();
+            if (Object.keys(reg).length === 0) {
+                console.warn(
+                    '[MWT] The NPC registry is empty for this scope — nothing to relink against. ' +
+                    'Run MWT.scope.diagnose() to check which books this chat resolves to.'
+                );
+                return [];
+            }
+
+            const { planned, unmatched } = await planProfileRelink({ registry: reg });
+            for (const { npc } of unmatched) {
+                console.warn(
+                    `[MWT] Profile entry "${npc}" has no matching NPC registry entry — skipped. ` +
+                    `Scan that NPC into the Knowledge book first, then re-run.`
+                );
+            }
+
+            if (planned.length === 0) {
+                console.log('[MWT] Every named profile entry is already linked to its registry entry.');
+                return [];
+            }
+            if (confirm !== true) {
+                console.table(planned);
+                console.warn(
+                    `[MWT] DRY RUN — nothing written. The ${planned.length} link(s) above would be recorded ` +
+                    `in the NPC registry. Check "otherCandidates" is 0: anything higher means duplicates ` +
+                    `exist and MWT.profiles.duplicates() is worth a look first. ` +
+                    `Call MWT.profiles.relink(true) to apply.`
+                );
+                return planned;
+            }
+
+            const applied = planned.filter(p => registryApi.setProfileUid(p.npc, p.linkUid));
+            await storeApi.flushBook(scopeApi.getLorebookName());
+            console.log(
+                `[MWT] Relinked ${applied.length} profile(s): ` +
+                `${applied.map(p => `${p.npc} → uid ${p.linkUid}`).join(', ')}.`
+            );
+            return applied;
+        },
+    };
+
+    // ── Knowledge Tracker duplicate audit (registry alias identities) ──────
+    //
+    // The knowledge scan/import/staging paths used to accept the model's
+    // spelling verbatim, so one NPC could accumulate several registry
+    // identities ("Sophie" and "Sophie Simpson"), each with its own lorebook
+    // entry. Those paths now canonicalize through resolveRegistryKey, which
+    // stops NEW duplicates — but existing ones are deliberately NOT auto-
+    // merged: entries under alias spellings may contain different facts, so
+    // which copy is authoritative is a human decision. This audit is
+    // READ-ONLY; it reports and explains, it never mutates.
+    window.MWT.npcs = {
+        auditDuplicates: async () => {
+            const reg = registryApi.getRegistry();
+            // An EMPTY registry is the most important case to audit, not a
+            // reason to stop: an empty (or wiped) registry over a populated
+            // book is exactly the state that makes every scan re-propose every
+            // NPC as new. Warn, then fall through to the physical sweep below,
+            // which will report each entry as untracked.
+            if (Object.keys(reg).length === 0) {
+                console.warn(
+                    '[MWT] The NPC registry is empty for this scope. If the book below holds entries, ' +
+                    'the registry has lost its pointers — "From Lorebooks" will re-adopt them. ' +
+                    'Run MWT.scope.diagnose() to confirm which books this chat resolves to.'
+                );
+            }
+
+            const rows = await auditNpcIdentities({ registry: reg });
+
+            if (rows.length === 0) {
+                console.log('[MWT] No duplicate NPC identities found in the registry or lorebook.');
+                return [];
+            }
+            console.table(rows);
+            console.log(
+                '[MWT] READ-ONLY audit — nothing was merged or deleted.\n' +
+                '• registry-alias: one NPC under several registry identities; each row is a separate lorebook entry that may hold different facts.\n' +
+                '• ambiguous-name: a short name (e.g. "Mara") that could belong to two different full names. These are NOT proven to be the same character — do not merge them. Rename the short record to the full name it belongs to.\n' +
+                '• entry-not-linked: a physical entry whose label aliases a tracked NPC but is not the entry the registry points at.\n' +
+                '• untracked-entry: an entry no registry record owns (the "From Lorebooks" import would adopt it).\n' +
+                '\nCLEANUP — two different operations, do not confuse them:\n' +
+                '1. Delete the redundant LOREBOOK ENTRY in SillyTavern\'s World Info editor, by its uid above. ' +
+                'This is what actually removes the duplicate text from your prompts.\n' +
+                '2. The ✕ button in the MWT NPC list does NOT do that. It deletes the registry record, ' +
+                'relationships, stance and evidence for that name, and deliberately leaves the lorebook entry in place.\n' +
+                'So: merge the facts you want into the entry you are keeping, delete the other entry in the World Info editor, ' +
+                'then use ✕ only to clear the leftover registry identity. Automatic deletion is not offered because ' +
+                'duplicate entries routinely hold different facts.'
+            );
+            return rows;
+        },
+
+        // Entity identity + alias service (TODO §1) — the console surface of
+        // knowledge/identity.js. The ✏️ Identity button in the NPC list is the
+        // UI twin of these; both approve through the same service, so behavior
+        // cannot drift between them.
+        rename: async (npc, newName) => {
+            const identity = await import('./knowledge/identity.js');
+            const result = await identity.renameEntity(npc, newName);
+            if (!result.ok) { console.warn(`[MWT] Rename refused: ${result.reason}`); return result; }
+            // Flush the book the operation captured — after a mid-rename
+            // chat switch, the zero-argument form would flush the incoming
+            // chat's book instead.
+            if (result.renamed) await identity.flushIdentityWrites(result.book);
+            console.log(`[MWT] Renamed "${result.from}" → "${result.to}".${result.warnings?.length ? ` ${result.warnings.length} warning(s):` : ''}`);
+            for (const w of result.warnings ?? []) console.warn('[MWT]', w);
+            return result;
+        },
+        merge: async (keepNpc, mergeNpc) => {
+            const identity = await import('./knowledge/identity.js');
+            const result = await identity.mergeEntities(keepNpc, mergeNpc);
+            if (!result.ok) { console.warn(`[MWT] Merge refused: ${result.reason}`); return result; }
+            if (result.merged) await identity.flushIdentityWrites(result.book);
+            console.log(`[MWT] Merged "${result.from}" into "${result.to}".${result.warnings?.length ? ` ${result.warnings.length} warning(s):` : ''}`);
+            for (const w of result.warnings ?? []) console.warn('[MWT]', w);
+            return result;
+        },
+        addAlias: async (npc, alias) => {
+            const identity = await import('./knowledge/identity.js');
+            const result = identity.addAlias(npc, alias);
+            console.log(result.ok ? `[MWT] Alias "${alias}" ${result.added ? 'added to' : 'already on'} "${npc}".` : `[MWT] Alias refused: ${result.reason}${result.owner ? ` (belongs to ${result.owner})` : ''}`);
+            return result;
+        },
+        removeAlias: async (npc, alias) => {
+            const identity = await import('./knowledge/identity.js');
+            const result = identity.removeAlias(npc, alias);
+            console.log(result.ok ? `[MWT] Alias "${alias}" ${result.removed ? 'removed from' : 'was not on'} "${npc}".` : `[MWT] Refused: ${result.reason}`);
+            return result;
+        },
+        entityId: async (npc) => {
+            const identity = await import('./knowledge/identity.js');
+            const id = identity.getEntityId(npc);
+            console.log(id ? `[MWT] "${npc}" → ${id}` : `[MWT] "${npc}" has no entity id (unknown NPC, or a legacy record not yet saved/migrated).`);
+            return id;
+        },
+        repairLinks: async () => {
+            const identity = await import('./knowledge/identity.js');
+            const result = identity.repairEntityLinks();
+            console.log(`[MWT] Relationship identity repair: ${result.keysRekeyed} key(s) rekeyed, ${result.targetsRepointed} target(s) re-pointed, ${result.edgesMerged} edge(s) merged, ${result.idsStamped} id(s) stamped, ${result.conflicts.length} conflict(s) left alone.`);
+            for (const c of result.conflicts) console.warn('[MWT]', c.kind, '—', c.detail);
+            return result;
+        },
+
+        // Repair pass — the console twin of the "📚 From Lorebooks" button.
+        // Validates every registry uid against its physical entry and relinks
+        // crossed ones, detaches dead ones, and adopts untracked entries. It
+        // rewrites ONLY registry pointers — no lorebook entry is edited, merged,
+        // or deleted — so it is safe to run on a live chat that is throwing
+        // "Refusing to load uid … points at a different NPC" warnings.
+        reconcile: async () => {
+            const { reconcileRegistry } = await import('./knowledge/staging.js');
+            const r = await reconcileRegistry();
+            if (r.report.length) {
+                console.table(r.report.map(row => ({
+                    action: row.action, npc: row.npc, uid: row.to ?? row.from ?? '', detail: row.detail,
+                })));
+            }
+            console.log(
+                `[MWT] Reconcile complete (registry pointers only — no entry edited/merged/deleted): ` +
+                `${r.verified} already linked, ${r.relinked} relinked, ${r.adopted} adopted, ` +
+                `${r.detached} detached, ${r.ambiguous + r.duplicates} to review.` +
+                (r.detached ? ' Detached NPCs get a fresh entry on the next scan.' : '') +
+                (r.ambiguous + r.duplicates ? ' Review flagged rows with MWT.npcs.auditDuplicates().' : '') +
+                ' Reopen the NPCs tab to refresh the list.'
+            );
+            return r;
+        },
+    };
+
+    // ── Interiority deletion tombstones ─────────────────────────────────────
+    //
+    // Deleting an intention records a tombstone so the engine cannot re-propose
+    // it and a swipe cannot restore it. That is deliberately sticky, so there
+    // has to be a way back for a deletion the user regrets.
+    const interiorityData = await import('./interiority/data.js');
+
+    window.MWT.interiority = {
+        deletions: () => {
+            const rows = interiorityData.getDeletedIntentions().map(d => ({
+                npc: d.npc,
+                action: (d.actions || [])[0] || '',
+                trigger: (d.triggers || [])[0] || '',
+                deletedAt: d.at ? new Date(d.at).toLocaleString() : '(unknown)',
+            }));
+            if (rows.length === 0) { console.log('[MWT] No deleted intentions recorded in this chat.'); return []; }
+            console.table(rows);
+            console.log('[MWT] These will not be re-proposed. MWT.interiority.clearDeletions() forgets them all.');
+            return rows;
+        },
+        clearDeletions: () => {
+            const count = interiorityData.clearDeletedIntentions();
+            console.log(count > 0
+                ? `[MWT] Cleared ${count} deletion record(s) — these intentions may be proposed again.`
+                : '[MWT] Nothing to clear.');
+            return count;
+        },
+    };
+
+    // ── Generation coordinator (TODO §1) ──────────────────────────────────────
+    //
+    // Console twin of the 🚦 Settings section + the coordinator's diagnostics
+    // events: one command answers "what is MWT doing to my API right now?"
+    // status() returns the snapshot AND tables it; cancel() is the emergency
+    // stop (queued jobs never start; running ones abort where the backend
+    // supports it).
+    window.MWT.coordinator = {
+        status: () => {
+            const snap = getCoordinatorSnapshot();
+            const rows = [
+                ...snap.running.map(j => ({ phase: 'running', ...j })),
+                ...snap.queued.map(j => ({ phase: 'queued', ...j })),
+            ];
+            if (rows.length) console.table(rows.map(({ scopeKey, epoch, ...rest }) => rest));
+            else console.log('[MWT] Coordinator idle — nothing running or queued.');
+            console.log(
+                `[MWT] Limits: ${snap.running.length}/${snap.limits.global} global slots in use, ` +
+                `${snap.limits.perModule} per module; user-generation windows: ${snap.userGeneration.depth}` +
+                (snap.userGeneration.backgroundPaused ? ' (background jobs HELD)' : '') + '.'
+            );
+            return snap;
+        },
+        jobs: () => getCoordinatorSnapshot().recentSettled,
+        cancel: (module) => {
+            const counts = cancelWhere(module ? { module } : {});
+            console.log(`[MWT] Cancelled ${counts.queued} queued and aborted ${counts.running} running job(s)${module ? ` for module "${module}"` : ''}.`);
+            return counts;
+        },
+    };
+
+    // ── Budget console namespace (TODO §2 context/token budget) ─────────────
+    //
+    // The console twin of the 📊 Budget tab — the same snapshot the tab
+    // renders, plus the two settings accessors the tab's Save button uses.
+    // Read-only except the setters, which persist into THIS CHAT's metadata.
+    //
+    // Usage:
+    //   MWT.budget.status()          // the full snapshot (console.table + return)
+    //   MWT.budget.settings()        // the per-chat budget settings record
+    //   MWT.budget.set({ enforce: true, globalHardCap: 4000 })
+    //   MWT.budget.setModule('chronicle', { softCap: 500, hardCap: 1200 })
+    window.MWT.budget = {
+        status: () => {
+            const snap = collectBudgetSnapshot();
+            console.table(snap.modules.map((m) => ({
+                module: m.id,
+                tokens: m.tokens,
+                kind: m.tokenKind,
+                priority: m.priority,
+                softCap: m.softCap,
+                hardCap: m.hardCap,
+                action: m.plan?.action ?? '—',
+            })));
+            console.log(`[MWT] Budget — mode: ${snap.enforce ? 'ENFORCE' : 'observe'}; injected ${snap.injectedTokens} tokens${snap.contextLimit.value ? ` of a ${snap.contextLimit.value}-token context limit (${snap.contextLimit.source})` : ' (context limit unknown)'}. Drop order: ${snap.dropOrder.map((d) => d.id).join(' → ')}.`);
+            return snap;
+        },
+        settings: () => {
+            const s = getBudgetSettings();
+            console.log(`[MWT] Budget settings for this chat — enforce: ${s.enforce}, globalHardCap: ${s.globalHardCap}, contextLimitOverride: ${s.contextLimitOverride}.`);
+            console.table(Object.entries(s.modules).map(([id, m]) => ({ module: id, ...m })));
+            return s;
+        },
+        set: (patch) => {
+            const ok = saveBudgetSettings(patch || {});
+            console.log(ok ? '[MWT] Budget settings saved for this chat.' : '[MWT] Budget settings save FAILED — see the console.');
+            return getBudgetSettings();
+        },
+        setModule: (id, patch) => {
+            const ok = saveBudgetSettings({ modules: { [id]: patch || {} } });
+            console.log(ok ? `[MWT] Budget settings for "${id}" saved.` : '[MWT] Budget settings save FAILED — see the console.');
+            return getBudgetSettings().modules[id] ?? null;
+        },
+    };
+
+    console.log('[MWT] Console API ready: MWT.evidence.{list,summary,inspect,clear,clearAll}, MWT.profiles.{list,duplicates,pruneDuplicates,relink}, MWT.npcs.{auditDuplicates,reconcile}, MWT.interiority.{deletions,clearDeletions}, MWT.coordinator.{status,jobs,cancel}, MWT.budget.{status,settings,set,setModule}');
+} catch (err) {
+    console.warn('[MWT] Could not load console evidence API:', err.message);
+}
+
+// Phase 2b binds preview and commit to the live metadata/identity/message UUIDs.
+// Phase 3 adds the lorebook-store section; hardening adds a
+// preview fingerprint (confirm→commit reconfirmation) and the identity policy.
+window.MWT = window.MWT || {};
+window.MWT.backup = {
+    export: exportBackup,
+    preview: previewRestore,
+    restore: restoreBackup,
+    undo: undoLastRestore,
+    fingerprintPreview,
+};
+
+// ── Recovery console namespace (schema plan Part 5, design §5.3) ────────────
+//
+// The quarantine recovery surface. Quarantined records are preserved whole,
+// never injected, and never deleted — these tools list them, export them as a
+// repairable JSON file, and (explicitly confirmed) clear them. The clear is
+// deliberately console-only until a mutating recovery UI is designed: the
+// literal { confirm: 'CLEAR' } token IS the confirmation.
+//
+// Usage:
+//   MWT.recovery.status()                      // list/count per store (read-only)
+//   MWT.recovery.export()                      // download the recovery JSON
+//   MWT.recovery.clear({ confirm: 'CLEAR' })   // clear the chat-local container
+//   MWT.recovery.clear({ confirm: 'CLEAR', includeKnowledgeStore: true })
+//                                             // …and each hydrated book's embedded container
+window.MWT.recovery = {
+    status: () => {
+        const status = collectQuarantineStatus();
+        console.table(status.stores.map((s) => ({
+            store: s.id,
+            quarantined: s.count,
+            home: s.embedded ? 'inside the lorebook store' : 'chat recovery container',
+        })));
+        console.log(
+            `[MWT] Quarantine status — ${status.total} record(s) preserved across ${status.stores.length} store(s)` +
+            (status.knowledgeBooks.length ? ` (hydrated books: ${status.knowledgeBooks.join(', ')})` : '') +
+            '. Records are never deleted or injected. Export: MWT.recovery.export(). ' +
+            'Clear (DELETES the records — export first!): MWT.recovery.clear({ confirm: \'CLEAR\' }).'
+        );
+        if (status.chatContainer?.unknown) {
+            console.warn(
+                '[MWT] The chat recovery container was written by a NEWER version of MWT — its records are ' +
+                'preserved but cannot be read, counted, or exported by this build. Upgrade MWT to read them; ' +
+                'the confirmed clear can still remove the container whole.'
+            );
+        } else if (Number(status.chatContainer?.containerIssues) > 0) {
+            // A malformed same-version container is lossy even when some items
+            // remained readable: validation DROPPED the unreadable entries, so
+            // the counts above are a floor, never a total — and zero readable
+            // items must not read as "nothing was rejected".
+            const readable = Number(status.chatContainer?.items) || 0;
+            console.warn(
+                readable > 0
+                    ? `[MWT] The chat recovery container is malformed: ${readable} record(s) were read, but entries ` +
+                      'this build could not read were dropped from the counts above — treat them as a known minimum, ' +
+                      'not a total. Nothing was deleted; the container is preserved whole, and MWT.recovery.export() ' +
+                      'refuses rather than download an incomplete file.'
+                    : '[MWT] The chat recovery container is malformed, so it may hold quarantined records this build ' +
+                      'could not read or count — the zeros above cannot rule them out. Nothing was deleted; the ' +
+                      'container is preserved whole, and MWT.recovery.export() refuses rather than download an ' +
+                      'incomplete file.'
+            );
+        }
+        const blockedBooks = Array.isArray(status.knowledgeBookBlocks) ? status.knowledgeBookBlocks : [];
+        if (blockedBooks.length > 0) {
+            console.warn(
+                `[MWT] ${blockedBooks.length} resolved Knowledge-store book(s) cannot be read right now ` +
+                `(${blockedBooks.map((b) => `"${b.book}": ${b.reason}`).join(', ')}) — their embedded recovery ` +
+                'records are preserved in the books but invisible to this build, so MWT.recovery.export() refuses ' +
+                'rather than download an incomplete file. Reopen the chat (or resolve the Knowledge tab\'s store ' +
+                'banner) and check again.'
+            );
+        }
+        return status;
+    },
+    export: async ({ download = true } = {}) => {
+        // Async: the export hydrates the resolved Knowledge books first when a
+        // chat switch left their loads still in flight (§5.3 hydrate-first).
+        const result = await exportRecoveryData({ download });
+        if (!result.ok) {
+            console.log(result.message
+                || '[MWT] No quarantined records to export — nothing has been rejected for this chat/session.');
+            return result;
+        }
+        console.log(
+            `[MWT] Recovery export: ${result.count} record(s) → ${result.filename}. ` +
+            'Each item carries store, path, reasonCode, message, the RAW record, sourceVersion, detectedAt, and a ' +
+            'fingerprint — store + path are the ADDRESS the repaired record goes back to. This file is not itself ' +
+            'restorable (Restore takes an mwt-chat-backup envelope): repair the record into the matching sections ' +
+            'entry of a real backup and restore that, where the normal validated path checks it like any other ' +
+            'data. See DATA_SAFETY_GUIDE.md → "Recovering a quarantined record". The full envelope is on the ' +
+            'return value.'
+        );
+        return result;
+    },
+    clear: (options = {}) => clearQuarantineData(options),
+};
+
+// ── Diagnostics console namespace (Phases 0–4) ──────────────────────────────
+//
+// Read-only, in-memory peek at the capture the diagnostics panel will later
+// show. See DIAGNOSTICS_CONSOLE_GUIDE.md (repo root) for the tester guide.
+// API-call capture is TELEMETRY ONLY — no prompts, API keys, custom headers,
+// or response bodies. Injection snapshots (Phase 2) DO include the injected
+// payload text by design — that is the exact string sent to
+// setExtensionPrompt — but like everything here they stay in-memory only and
+// nothing is written to chat_metadata, localStorage, or settings. The buffer
+// resets on page reload. Settings provenance (Phase 4) resolves only the
+// World State / Story Planner BEHAVIOR keys (inject/auto toggles, intervals,
+// modes) — never apiKey, customHeaders, or apiUrl.
+//
+// Usage examples:
+//   MWT.diagnostics.events()                    // event ring, newest first
+//   MWT.diagnostics.events({ level: 'error' })  // only errors
+//   MWT.diagnostics.events({ module: 'api' })   // only one module
+//   MWT.diagnostics.apiCalls()                  // last ~20 API calls, newest first
+//   MWT.diagnostics.lastApiCall('world_state')  // most recent call for one module
+//   MWT.diagnostics.lastApiCalls()              // last call per module
+//   MWT.diagnostics.lastRuns()                  // per-module last-run stamps
+//   MWT.diagnostics.injections()                // last snapshot per injection key
+//   MWT.diagnostics.injection('mwt_world_state_injection')  // one key's payload
+//   MWT.diagnostics.intentionsCapture()         // latest intentions generation capture (prompts + raw responses! opt-in)
+//   MWT.diagnostics.settingsProvenance()        // where each WS/SP setting resolves from
+//   MWT.diagnostics.health()                    // the ❤️ Health tab snapshot (one row per module)
+//   MWT.diagnostics.environment()               // the 🌐 Environment tab snapshot (fork-compat probe)
+//   MWT.diagnostics.scope()                     // the 🗂️ Scope & storage tab snapshot (which books + why)
+//   MWT.diagnostics.schemaStatus()              // the schema-status section: versions, gate state, quarantine counts, paused reasons
+//   MWT.diagnostics.log({ level: 'warn' })      // the 📋 Log tab snapshot (ring + counts; redacted return)
+//   MWT.diagnostics.integrity()                 // the 🛡️ Integrity tab snapshot (on-demand checks; async, redacted return)
+//   await MWT.diagnostics.report()              // the FULL D1 Markdown report the 📋 Copy Report button copies
+//   MWT.diagnostics.clear()                     // wipe the in-memory buffer
+//
+// Each method prints a console.table(...) and RETURNS the full data, so the
+// return value can be copied for the complete JSON (the table hides nested
+// fields like usage/detail).
+window.MWT.diagnostics = {
+    events: (filter = {}) => {
+        const events = getEvents(filter);
+        console.table(events.map(e => ({
+            time: new Date(e.ts).toLocaleTimeString(),
+            level: e.level,
+            module: e.module,
+            event: e.event,
+        })));
+        console.log(events.length
+            ? `[MWT] ${events.length} event(s) shown (newest first). The return value carries full detail for copy-paste.`
+            : '[MWT] No diagnostics events captured yet — the buffer is in-memory and resets on reload.');
+        return events;
+    },
+
+    apiCalls: () => {
+        const calls = getApiCalls();
+        console.table(calls.map(c => ({
+            time: new Date(c.at).toLocaleTimeString(),
+            module: c.module,
+            mode: c.mode,
+            model: c.model,
+            status: c.status,
+            ok: c.ok,
+            durationMs: c.durationMs,
+            retries: c.retries,
+            errorClass: c.errorClass ?? null,
+            finish_reason: c.finish_reason ?? null,
+        })));
+        console.log(calls.length
+            ? `[MWT] ${calls.length} API call(s) shown (newest first). The return value carries full usage for copy-paste.`
+            : '[MWT] No API calls captured yet.');
+        return calls;
+    },
+
+    lastApiCall: (module = 'api') => {
+        const call = getLastApiCall(module);
+        if (!call) { console.log(`[MWT] No API call captured for module "${module}".`); return undefined; }
+        console.log(`[MWT] Last API call (${module}):`, call);
+        return call;
+    },
+
+    lastApiCalls: () => {
+        const byModule = getAllLastApiCalls();
+        const rows = Object.entries(byModule).map(([module, c]) => ({
+            module,
+            mode: c.mode,
+            model: c.model,
+            status: c.status,
+            ok: c.ok,
+            durationMs: c.durationMs,
+            errorClass: c.errorClass ?? null,
+            time: new Date(c.at).toLocaleTimeString(),
+        }));
+        console.table(rows);
+        if (rows.length === 0) console.log('[MWT] No API calls captured yet.');
+        return byModule;
+    },
+
+    lastRuns: () => {
+        const runs = getAllLastRuns();
+        const rows = Object.entries(runs).map(([module, r]) => ({
+            module,
+            startedAt: r.startedAt ? new Date(r.startedAt).toLocaleTimeString() : null,
+            finishedAt: r.finishedAt ? new Date(r.finishedAt).toLocaleTimeString() : null,
+            ok: r.ok,
+            error: r.error,
+            tokensIn: r.tokensIn,
+            tokensOut: r.tokensOut,
+            trigger: r.trigger,
+        }));
+        console.table(rows);
+        if (rows.length === 0) console.log('[MWT] No module runs recorded yet.');
+        return runs;
+    },
+
+    injections: () => {
+        const snaps = getAllInjectedSnapshots();
+        const rows = Object.entries(snaps).map(([key, s]) => ({
+            key,
+            enabled: s.enabled,
+            role: s.role,           // 0 system · 1 user · 2 assistant
+            depth: s.depth,
+            chars: s.payload.length,
+            appliedAt: s.at ? new Date(s.at).toLocaleTimeString() : null,
+            ageSec: s.at ? Math.round((Date.now() - s.at) / 1000) : null,
+        }));
+        console.table(rows);
+        if (rows.length === 0) console.log('[MWT] No injection snapshots recorded yet — they appear once a module applies its prompt.');
+        else console.log('[MWT] Snapshots are the exact strings last registered with SillyTavern via setExtensionPrompt (frozen until re-applied; registration only — final prompt placement is not verified). NOTE: the return value includes full payload text, unlike apiCalls() which is telemetry-only.');
+        return snaps;
+    },
+
+    injection: (key) => {
+        const snap = getInjectedSnapshot(key);
+        if (!snap) {
+            console.log(`[MWT] No injection snapshot recorded for key "${key}". Known keys appear in MWT.diagnostics.injections().`);
+            return undefined;
+        }
+        console.log(`[MWT] Injection snapshot (${key}):`, snap);
+        return snap;
+    },
+
+    // Lifecycle plan Tier 1 item 4 — the generation-scoped intentions capture:
+    // the latest intentions generation's constituent calls (prompts + raw
+    // responses), the ledger before/after, and every accept/reject/ignore
+    // decision with its reason. Opt-in (Interiority settings), in-memory
+    // only, latest generation only, cleared on chat switch and reload. The
+    // Copy Report carries the same data content-gated under its
+    // "include content" opt-in; this raw accessor always shows bodies, so
+    // skim before pasting publicly.
+    intentionsCapture: () => {
+        const snapshot = getIntentionsCaptureSnapshot();
+        if (!snapshot) {
+            console.log('[MWT] No intentions capture available — enable "Capture intentions generation diagnostics" in Interiority settings and run a generation (in-memory only; resets on reload and chat switch).');
+            return undefined;
+        }
+        console.table([{
+            generationId: snapshot.id,
+            mode: snapshot.mode,
+            calls: snapshot.counts.calls,
+            decisions: snapshot.counts.decisions,
+            ledgerBefore: snapshot.ledgerBefore.total,
+            ledgerAfter: snapshot.ledgerAfter.total,
+        }]);
+        console.log('[MWT] Intentions capture summarized above — the return value carries the full prompts, raw responses, and decision reasons for copy-paste. Content-sensitive: skim before pasting publicly.');
+        return snapshot;
+    },
+
+    // Phase 4 — settings provenance (design §I.4.6). Two jobs: show WHERE each
+    // World State / Story Planner behavior setting resolves from, and surface
+    // the asymmetry that Chronicle, Knowledge, and Interiority have no
+    // per-chat/global split at all — that asymmetry is itself diagnostic.
+    // Read-only; resolves live on every call.
+    settingsProvenance: () => {
+        const worldStateKeys = {};
+        for (const key of WS_GLOBAL_SETTING_KEYS) {
+            worldStateKeys[key] = getEffectiveWorldSetting(key, undefined, { provenance: true });
+        }
+        const storyPlannerKeys = {};
+        for (const key of SP_GLOBAL_SETTING_KEYS) {
+            storyPlannerKeys[key] = getEffectivePlanSetting(key, undefined, { provenance: true });
+        }
+        const rows = [
+            ...Object.entries(worldStateKeys).map(([key, r]) => ({ module: 'world_state', key, value: r.value, source: r.source })),
+            ...Object.entries(storyPlannerKeys).map(([key, r]) => ({ module: 'story_planner', key, value: r.value, source: r.source })),
+            ...['chronicle', 'knowledge', 'interiority'].map(m => ({
+                module: m, key: '(all behavior settings)', value: '', source: 'module-only — no per-chat/global split',
+            })),
+        ];
+        console.table(rows);
+        console.log(
+            '[MWT] World State and Story Planner behavior settings resolve through a 3-level chain ' +
+            '(per-chat override → legacy chat field → global). Chronicle, Knowledge, and Interiority ' +
+            'settings live only in their module tabs — that asymmetry is itself diagnostic. ' +
+            'API-config provenance (module profile → module custom → global profile → global custom) ' +
+            'is reported by resolveApiCall() as `source` on every resolved call.'
+        );
+        return {
+            world_state: { settingsScope: 'global-with-per-chat-override', keys: worldStateKeys },
+            story_planner: { settingsScope: 'global-with-per-chat-override', keys: storyPlannerKeys },
+            chronicle: { settingsScope: 'module-only' },
+            knowledge: { settingsScope: 'module-only' },
+            interiority: { settingsScope: 'module-only' },
+        };
+    },
+
+    // Phase 6 — Tab 1 Health (design §I.5 Tab 1): the same snapshot the ❤️
+    // Health sub-tab renders — one row per module (enabled · gate · busy ·
+    // tokens · auto-countdown · last run) plus the header (version, total
+    // token load, panic switch). Read-only; resolves live on every call.
+    health: () => {
+        const snap = collectHealthSnapshot();
+        if (snap.injectionMasterOff) {
+            console.warn('[MWT] ⛔ PANIC SWITCH IS ON (injectionMasterOff) — injection & scanning are stopped for every module.');
+        }
+        console.table(snap.modules.map(m => ({
+            module: m.id,
+            on: m.enabled,
+            gate: m.injectionAllowed,
+            busy: m.busy,
+            // Kind matters: 'stored' is lorebook corpus, not prompt load.
+            tokens: m.tokenKind === 'stored' ? `${m.tokens} (stored)` : m.tokens,
+            auto: m.auto
+                ? (m.auto.perTurn ? `every turn${m.auto.pollDue ? ' (dormant poll due)' : ''}` : `in ${m.auto.remaining} msg(s)`)
+                : 'off',
+            lastRun: m.lastRun
+                ? `${new Date(m.lastRun.at).toLocaleTimeString()} ${m.lastRun.ok ? 'ok' : 'FAILED'}${m.lastRun.durationMs != null ? ` ${(m.lastRun.durationMs / 1000).toFixed(1)}s` : ''}`
+                : 'never',
+        })));
+        console.log(
+            `[MWT] Health snapshot for MWT v${snap.mwtVersion} — injecting ${snap.injectedTokens} tokens` +
+            (snap.storedTokens > 0
+                ? `, plus ${snap.storedTokens} stored in the Knowledge lorebook (NOT injected — SillyTavern activates `
+                  + 'only the entries whose keywords match recent chat). '
+                : '. ') +
+            'The return value carries the full rows (auto schedule, last-run source/model/HTTP status, per-field errors) for copy-paste.'
+        );
+        return snap;
+    },
+
+    // Phase 7 — Tab 2 Environment, the fork-compat probe (design §I.5 Tab 2):
+    // the same snapshot the 🌐 Environment sub-tab renders — MWT + SillyTavern
+    // versions, feature detection, the raw context fields, and the banner
+    // verdict on the getCurrentChatId() premise behind core/scope.js. Async
+    // because the shared.js Connection Manager probe (the exact import
+    // core/api.js uses) can only settle through a dynamic import. Read-only;
+    // resolves live on every call.
+    environment: async () => {
+        const loaded = await loadSharedModule();
+        const snap = collectEnvironmentSnapshot({ sharedModule: loaded });
+        const premise = snap.chatIdPremise;
+        if (premise.level === 'fallback' || premise.level === 'fail-closed' || premise.level === 'unknown') {
+            console.warn(`[MWT] ⚠ chat-ID premise: ${premise.level} — ${premise.note}`);
+        }
+        console.table(snap.features.map(f => ({
+            feature: f.id,
+            available: f.available,
+            detail: f.detail,
+        })));
+        console.table({
+            'MWT version': snap.mwtVersion,
+            'SillyTavern version': snap.stVersion ?? `(not exposed${snap.stVersionSource ? ` via ${snap.stVersionSource}` : ''})`,
+            'context': snap.contextAvailable ? (snap.contextSource ?? 'resolved') : '(none)',
+            'chat-ID premise': `${premise.level}${premise.method ? ` via ${premise.method}` : ''}`,
+            'identity key': premise.identityKey ?? '(none)',
+            'CMRS (shared.js)': snap.connectionManager.probed
+                ? (snap.connectionManager.error
+                    ? `import failed: ${snap.connectionManager.error}`
+                    : `${snap.connectionManager.available ? 'available' : 'missing'} · constructPrompt ${snap.connectionManager.constructPrompt ? '✓' : 'MISSING'}`)
+                : 'not probed',
+        });
+        console.table(snap.contextFields);
+        console.log(
+            '[MWT] Environment probe — when reporting from a non-reference build or fork, copy the returned object ' +
+            '(or screenshot the 🌐 Environment tab) into the report. The chat-ID premise row is core/scope.js\'s ' +
+            'getCurrentChatId() assumption, validated live on this build; the context fields are the same table ' +
+            'MWT.scope.diagnose() prints. Context field values can contain your character\'s name — skim before pasting.'
+        );
+        return snap;
+    },
+
+    // Phase 8 — Tab 3 Scope & storage (design §I.5 Tab 3): the same snapshot
+    // the 🗂️ Scope & storage sub-tab renders — resolved identity + epoch,
+    // which lorebooks this chat resolves to and WHY (re-derived read-only:
+    // calling this never saves a binding), per-book hydration + store
+    // version, saved bindings, and every scope_fallback_global warn Phase 3
+    // recorded this session. Synchronous; read-only; resolves live per call.
+    // MWT.scope.diagnose() remains the deeper dump (raw context fields); this
+    // is the pasteable one-table answer.
+    scope: () => {
+        const snap = collectScopeSnapshot();
+        const r = snap.resolution;
+        for (const w of snap.warnings || []) {
+            console.warn(`[MWT] ${w.level === 'fail' ? '⛔' : '⚠'} [${w.id}] ${w.text}`);
+        }
+        console.table({
+            'scope setting': `${r.scope}${r.valid ? '' : ' (INVALID — treated as global)'}`,
+            'resolution mode': r.mode,
+            'character identity': snap.character
+                ? `${snap.character.key} → "${snap.character.name}"${snap.character.isGroup ? ' (group)' : ''}`
+                : '(unresolved)',
+            'chat identity': snap.chat ? snap.chat.key : '(unresolved)',
+            'identity used': r.identityKey ?? '(none — global books)',
+            'Knowledge book': r.books.knowledge,
+            'State book': r.books.state,
+            'Profiles book': r.books.profiles,
+            'epoch': snap.epoch,
+            'bindings saved': snap.bindings.count,
+            'scope_fallback_global events': snap.fallbackEvents.count,
+        });
+        console.table(snap.books.map((b) => ({
+            book: b.id,
+            name: b.name,
+            // Whether ST will actually scan this book. 'inactive' means MWT is
+            // writing to a book ST never injects — the silent-injection gap.
+            'active (WI)': b.injectable === false
+                ? 'n/a — never injected'
+                : ({
+                    yes: b.activeIn?.length ? `active (${b.activeIn.join(', ')})` : 'active',
+                    no: 'INACTIVE — ST will not inject',
+                    unknown: 'unknown (WI unreadable)',
+                }[b.active] ?? 'unknown'),
+            // 'not attempted yet' is the ordinary early state (hydration is
+            // async, on chat change); only 'LOAD FAILED' blocks writes.
+            store: {
+                'no-store': 'no store',
+                loaded: b.dirty ? 'loaded (dirty)' : 'loaded',
+                failed: 'LOAD FAILED — writes blocked',
+                'not-attempted': 'not attempted yet',
+            }[b.storeState] ?? 'unknown',
+            version: b.hasStore ? (b.storeVersion != null ? `v${b.storeVersion}` : '—') : '—',
+        })));
+        if (snap.bindings.rows.length > 0) {
+            console.table(snap.bindings.rows.map((row) => ({
+                key: row.key,
+                current: row.isCurrent,
+                knowledge: row.knowledge,
+                state: row.state,
+                profiles: row.profiles,
+            })));
+            console.log('[MWT] "key" is the stable identity (avatar filename), which is why renaming a card keeps its books.');
+        }
+        console.log(
+            '[MWT] Scope & storage snapshot for MWT v' + snap.mwtVersion + ' — read-only, re-derived live; nothing was ' +
+            'saved by looking. The return value carries the full rows (resolution note, per-book dirty/version, ' +
+            'fallback-event details, per-field errors) for copy-paste. For scoping/identity bug reports pair it with ' +
+            'MWT.scope.diagnose() (raw context fields) or the 🌐 Environment tab.'
+        );
+        return snap;
+    },
+
+    // Schema plan Part 5 (§9.1): the schema-status snapshot behind the Scope &
+    // storage tab's schema section — per registered store: stored vs. current
+    // version, the fast-gate state (ready/preparing/blocked/unknown),
+    // migration-persisted, the quarantined-record count, and the SAME
+    // plain-language pause reason a paused module's own banner shows. Read-only
+    // and O(stores); deep validation stays on the 🛡️ Integrity tab's Run
+    // button. SAFE BY DEFAULT: what this RETURNS is
+    // redactSchemaStatusSnapshot() output — metadata by construction (no
+    // quarantined record content), every string still secret-scrubbed.
+    schemaStatus: () => {
+        const snap = redactSchemaStatusSnapshot(collectSchemaStatusSnapshot());
+        for (const w of snap.warnings || []) {
+            console.warn(`[MWT] ${w.level === 'fail' ? '⛔' : '⚠'} [${w.id}] ${w.text}`);
+        }
+        console.table([...(snap.rows || []), snap.knowledgeStore].map((r) => ({
+            store: r?.id,
+            present: r?.present,
+            'stored/current': `${r?.storedVersion ?? '?'} / ${r?.currentVersion ?? '?'}`,
+            state: r?.id === 'knowledgeStore'
+                ? `${r?.hydration ?? '?'}${r?.paused ? ' ⛔ PAUSED' : ''}`
+                : `${r?.state ?? '?'}${r?.paused ? ' ⛔ PAUSED' : ''}${r?.migrationPersisted ? ' (migration persisted)' : ''}`,
+            quarantined: r?.quarantineCount ?? 0,
+        })));
+        console.log(
+            '[MWT] Schema status for MWT v' + snap.mwtVersion + ' — read-only, O(stores). A PAUSED or BLOCKED store ' +
+            'pauses only its own module (its tab carries the banner with Retry + recovery export). Quarantined records ' +
+            'export any time via MWT.recovery.export(); the confirmed clear is MWT.recovery.clear({ confirm: \'CLEAR\' }).'
+        );
+        return snap;
+    },
+
+    // Phase 9 — Tab 4 Injection (design §I.5 Tab 4): the same snapshot the 💉
+    // Injection sub-tab renders — per module: on/off · gate · resolved
+    // role/depth WITH provenance · token estimate · the Phase 2 registered
+    // payload (with its age) — plus the mandatory Knowledge lorebook caveat.
+    // Named injectionStatus() because Phase 2 already took injections() (all
+    // keys) and injection(key) (one key's raw snapshot). Read-only; resolves
+    // live on every call. Synchronous.
+    //
+    // SAFE BY DEFAULT (the redaction contract): what this RETURNS is
+    // redactInjectionSnapshot() output — payload text gated to size markers
+    // and every string secret-scrubbed — so a tester can paste the return
+    // value without auditing it. `injectionStatus({ includeContent: true })`
+    // includes (still scrubbed) payloads; the EXACT recorded text is only
+    // available through the deliberate single-key path, injection(key).
+    injectionStatus: ({ includeContent = false } = {}) => {
+        const snap = redactInjectionSnapshot(collectInjectionSnapshot(), { includeContent });
+        for (const w of snap.warnings || []) {
+            console.warn(`[MWT] ${w.level === 'fail' ? '⛔' : '⚠'} [${w.id}] ${w.text}`);
+        }
+        console.table(snap.modules.map(m => ({
+            module: m.id,
+            on: m.enabled === null ? 'n/a' : m.enabled,
+            gate: m.gate,
+            depth: m.placement ? `${m.placement.depth.value} (${m.placement.depth.source})` : '—',
+            role: m.placement ? `${m.placement.role.value} (${m.placement.role.source})` : '—',
+            // Kind matters: 'stored' is lorebook corpus, 'accessor' is only an
+            // estimate while nothing is registered this session.
+            tokens: m.tokens.kind === 'stored'
+                ? `${m.tokens.value} (stored)`
+                : (m.tokens.kind === 'accessor' ? `${m.tokens.value} (est.)` : m.tokens.value),
+            registered: m.snapshot
+                ? (m.snapshot.enabled
+                    ? `${new Date(m.snapshot.at).toLocaleTimeString()} · ${formatInjectionAge(m.snapshot.ageSec)} · ${m.snapshot.chars} chars`
+                    : `cleared ${new Date(m.snapshot.at).toLocaleTimeString()} · ${formatInjectionAge(m.snapshot.ageSec)}`)
+                : 'never',
+        })));
+        if (snap.modules.some(m => m.snapshot?.enabled && m.snapshot.role != null)) {
+            console.table(snap.modules
+                .filter(m => m.snapshot?.enabled)
+                .map(m => ({
+                    key: m.key,
+                    registeredDepth: m.snapshot.depth,
+                    registeredRole: `${ROLE_NUMBERS[m.snapshot.role] ?? '?'} (${m.snapshot.role})`,
+                })));
+        }
+        console.log(
+            `[MWT] Injection snapshot for MWT v${snap.mwtVersion} — ${snap.livePayloads} live payload(s), ~${snap.registeredTokens} registered tokens` +
+            (snap.injectionMasterOff ? '. ⛔ PANIC SWITCH IS ON — nothing new can register via setExtensionPrompt, and Knowledge lorebook entries are NOT stopped (see the warning above).' : '.') +
+            (includeContent
+                ? ' Payloads are INCLUDED but secret-scrubbed (URLs cut to scheme+host, key/bearer shapes redacted). Registration only — final-prompt placement is unverified.'
+                : ' Payload text is content-gated OUT of this return value (size markers only). For scrubbed payloads: MWT.diagnostics.injectionStatus({ includeContent: true }). For one key\u2019s EXACT recorded text — the deliberate path when you truly need it: MWT.diagnostics.injection(key).')
+        );
+        return snap;
+    },
+
+    // Phase 10 — Tab 5 Last request (design §I.5 Tab 5): the same snapshot the
+    // 📡 Last request sub-tab renders — the Phase 1 capture for the most
+    // recent call (module · mode · model/profile · HTTP status · duration ·
+    // retries · finish_reason · token usage · error class) plus the short
+    // history, newest first. Named lastRequest() because Phase 1 already took
+    // apiCalls() (raw ring) / lastApiCall() / lastApiCalls() (per-module
+    // pointers). Read-only; resolves live on every call. Synchronous.
+    //
+    // SAFE BY DEFAULT (the redaction contract): what this RETURNS is
+    // redactLastRequestSnapshot() output — telemetry by construction (the
+    // capture never held the prompt, key, headers, or body), with every
+    // string secret-scrubbed (model/profile ids are free text and could quote
+    // a secret). The raw telemetry-only copies stay on the Phase 1 paths.
+    lastRequest: () => {
+        const snap = redactLastRequestSnapshot(collectLastRequestSnapshot());
+        for (const w of snap.warnings || []) {
+            console.warn(`[MWT] ${w.level === 'fail' ? '⛔' : '⚠'} [${w.id}] ${w.text}`);
+        }
+        console.table(snap.history.map(c => ({
+            time: c.at != null ? new Date(c.at).toLocaleTimeString() : '—',
+            age: formatRequestAge(c.ageSec),
+            module: c.module,
+            mode: c.mode,
+            model: c.model,
+            status: c.status,
+            ok: c.ok,
+            durationMs: c.durationMs,
+            retries: c.retries,
+            errorClass: c.errorClass ?? null,
+            finish_reason: c.finish_reason ?? null,
+            tokens: c.usage?.total_tokens ?? null,
+        })));
+        console.log(
+            snap.count
+                ? `[MWT] Last-request snapshot for MWT v${snap.mwtVersion} — ${snap.count} captured call(s) of ${snap.capacity} (${snap.stats.ok} ok, ${snap.stats.failed} failed), newest first; the return value carries the detail card, window stats, and full usage. Telemetry by construction: model/profile id, timings, HTTP status, finish reason, token usage, error class — never the prompt, API key, custom headers, or response body. Strings are secret-scrubbed (core/redaction.js); raw telemetry-only copies: MWT.diagnostics.apiCalls().`
+                : '[MWT] No API calls captured yet — the capture is in-memory and resets on reload.'
+        );
+        return snap;
+    },
+
+    // Phase 11 — Tab 6 Log (design §I.5 Tab 6): the same snapshot the 📋 Log
+    // sub-tab renders — the Phase 0 event ring, newest first, with per-level
+    // and per-module counts, plus a warn when error-level events exist. Takes
+    // the SAME filter shapes events() accepts ({ level: 'error' | [...],
+    // module: 'api' }) — data-side filtering, unlike the tab's view toggles.
+    // Named log() because Phase 0 already took events() — the RAW ring.
+    // Read-only; resolves live on every call. Synchronous.
+    //
+    // SAFE BY DEFAULT (the redaction contract): what this RETURNS is
+    // redactLogSnapshot() output — toast message bodies (chat content, per
+    // core/notifications.js) gated to size-only markers, raw error bodies to
+    // error markers, and every string secret-scrubbed (Rule 1b: this
+    // install's live secret values, embedded URLs cut to scheme+host,
+    // key/bearer shapes) — so the return value pastes without auditing it.
+    // log({ includeContent: true }) includes the (still scrubbed) full
+    // details; the raw ring stays on the Phase 0 path, events().
+    log: ({ level, module, includeContent = false } = {}) => {
+        const snap = redactLogSnapshot(collectLogSnapshot({ level, module }), { includeContent });
+        for (const w of snap.warnings || []) {
+            console.warn(`[MWT] ${w.level === 'fail' ? '⛔' : '⚠'} [${w.id}] ${w.text}`);
+        }
+        console.table(snap.events.map(e => ({
+            time: e.ts != null ? new Date(e.ts).toLocaleTimeString() : '—',
+            level: e.level,
+            module: e.module,
+            event: e.event,
+            chat: e.epoch != null ? `#${e.epoch}` : '—',
+        })));
+        console.log(
+            snap.total
+                ? `[MWT] Log snapshot for MWT v${snap.mwtVersion} — ${snap.count} of ${snap.total} retained event(s) shown (newest first; the ring keeps ${snap.capacity}): ${logLevelCount(snap.levels, 'error')} error(s), ${logLevelCount(snap.levels, 'warn')} warn(s), ${logLevelCount(snap.levels, 'info')} info, ${logLevelCount(snap.levels, 'debug')} debug. The return value carries ageSec/scopeKey and the redacted detail for every event${includeContent ? ' (content INCLUDED, still secret-scrubbed)' : ' (toast bodies and error text gated to size markers)'}; the raw ring: MWT.diagnostics.events().`
+                : '[MWT] No diagnostics events captured yet — the ring is in-memory and resets on reload.'
+        );
+        return snap;
+    },
+
+    // Phase 12 — Tab 7 Integrity (design §I.5 Tab 7): the same snapshot the 🛡️
+    // Integrity sub-tab renders when its ▶ Run button is pressed — duplicate
+    // profile entries, dangling profileUid pointers, evidence↔profile
+    // orphans, validateSection() per store (enumerated from the METADATA_KEYS
+    // whitelist), and Interiority ledger reference integrity. ASYNC (the
+    // profile-book read loads a lorebook) and, like the tab, intended for
+    // on-demand use — it is read-only either way. Read-only; nothing is
+    // repaired here: the cleanup tools stay on MWT.profiles / MWT.evidence /
+    // MWT.interiority with their dry-run guards.
+    //
+    // SAFE BY DEFAULT (the redaction contract): what this RETURNS is
+    // redactIntegritySnapshot() output. The snapshot carries no chat prose by
+    // construction (names, uids, counts, and the backup validators' own
+    // reason strings — never previews, quotes, or quarantined records), and
+    // every string is Rule-1b secret-scrubbed besides, so the return value
+    // pastes without auditing it.
+    integrity: async () => {
+        const snap = redactIntegritySnapshot(await collectIntegritySnapshot());
+        for (const w of snap.warnings || []) {
+            console.warn(`[MWT] ${w.level === 'fail' ? '⛔' : '⚠'} [${w.id}] ${w.text}`);
+        }
+        console.table({
+            findings: snap.totals?.findings ?? 0,
+            'duplicate profile entries': snap.duplicateProfiles?.count ?? 0,
+            'dangling profileUid pointers': snap.danglingProfileUids?.count ?? 0,
+            'evidence without profile (reading)': snap.evidenceWithoutProfile?.count ?? 0,
+            'profiles without evidence': snap.profilesWithoutEvidence?.count ?? 0,
+            'store records quarantined': snap.storeValidations?.skippedTotal ?? 0,
+            'store id conflicts': snap.storeValidations?.conflictsTotal ?? 0,
+            'stores preparing': snap.storeValidations?.deferredTotal ?? 0,
+            'interiority: dup ledger ids': snap.interiority?.duplicateLedgerIds?.count ?? 0,
+            'interiority: tombstoned but live': snap.interiority?.tombstonedStillInLedger?.count ?? 0,
+            'interiority: dup tombstone ids': snap.interiority?.duplicateTombstoneIds?.count ?? 0,
+        });
+        console.table((snap.storeValidations?.sections || []).map((r) => ({
+            store: r.id,
+            present: r.present,
+            added: r.added ?? '—',
+            skipped: r.skippedCount ?? '—',
+            conflicts: r.conflicts ?? '—',
+            preparing: r.preparing ?? false,
+        })));
+        console.log(
+            `[MWT] Integrity snapshot for MWT v${snap.mwtVersion} — ${snap.totals?.findings ?? 0} finding(s) across `
+            + `${snap.totals?.profileEntries ?? 0} profile entries, ${snap.totals?.registryRecords ?? 0} registry records, `
+            + `${snap.totals?.evidenceFiles ?? 0} evidence files, ${snap.totals?.ledgerEntries ?? 0} ledger entries, `
+            + `${snap.totals?.sectionsPresent ?? 0} store section(s). READ-ONLY — repairs stay on MWT.profiles / `
+            + 'MWT.evidence / MWT.interiority (dry-run first). The return value carries the samples and per-store rows.'
+        );
+        return snap;
+    },
+
+    // Phase 13 — Copy-report finalize (design §I.6, build-order step 7): the
+    // FULL D1 report the 🩺 Diagnostics tab's 📋 Copy Report button copies —
+    // the same collectReportSections() (Phase 0–4 accessors + the health /
+    // environment / scope / injection / integrity tab accessors), the same
+    // buildReport() redaction gate, so the button, the bridge, and the tabs
+    // can never disagree. ASYNC like the button (the Integrity section's
+    // lorebook read); this call is the Phase 12 on-demand trigger, so nothing
+    // collects until you run it. Read-only, in-memory only.
+    //
+    // SAFE BY DEFAULT: content fields (payloads, toast bodies, error bodies)
+    // are gated OUT unless { includeContent: true } — and secrets are
+    // redacted in EITHER mode. The return value is the paste-ready Markdown
+    // STRING (the appendix JSON is inside it), so `copy(await
+    // MWT.diagnostics.report())` works even where the clipboard API is
+    // missing; identity strings (character/chat names in scope keys) can
+    // still appear — skim before pasting, exactly like the button's report.
+    report: async ({ includeContent = false } = {}) => {
+        const sections = await collectReportSections();
+        const { markdown } = buildReport({ includeContent, sections });
+        console.log(
+            `[MWT] Diagnostics report — ${sections.length} section(s), content ${includeContent ? 'INCLUDED (⚠ contains chat text — skim before pasting)' : 'EXCLUDED'}, secrets redacted either way. The return value is the paste-ready Markdown; the 🩺 Diagnostics tab's 📋 Copy Report button copies the same thing without devtools.`
+        );
+        return markdown;
+    },
+
+    clear: () => {
+        clearEvents();
+        clearApiCalls();
+        clearLastRuns();
+        clearInjections();
+        console.log('[MWT] Diagnostics buffer cleared (events + API calls + last runs + injection snapshots). In-memory only — nothing persisted.');
+    },
+};
+
+console.log('[MWT] Diagnostics console API ready: MWT.diagnostics.{events,apiCalls,lastApiCall,lastApiCalls,lastRuns,injections,injection,settingsProvenance,health,environment,scope,schemaStatus,injectionStatus,lastRequest,log,integrity,report,clear}; recovery tools: MWT.recovery.{status,export,clear}');
+
+console.log('[MWT] Merged World Tracker extension loaded.');

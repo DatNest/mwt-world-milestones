@@ -1,0 +1,444 @@
+/**
+ * world_state/sections.js — Per-section regeneration logic.
+ *
+ * Depends on data.js, settings.js, injection.js, refresh.js (for buildSystemPrompt).
+ */
+
+import {
+    resolveApiCall, normaliseOutput, escapeRegex,
+    captureScope, assertSameScope,
+    captureRevision, sameRevision,
+    truncateText, isCancellation,
+    validateWorldStateDocument,
+    normalizeGeneratedDocument,
+} from '../core/index.js';
+// Part 6 (§7.4) pause guard + the store id it checks. Direct import (not the
+// barrel) so the REAL pause singleton is read even under the test
+// barrel→stub alias.
+import { isStorePausedForCurrentScope } from '../core/schema_status.js';
+import { worldStateSchema } from './schema.js';
+
+import {
+    buildDefaultSystemPrompt, buildFormatChangeNote, HOOK_SECTIONS, stripHookSections, detailLevelIncludesSection,
+} from './prompts.js';
+import {
+    getSettings, hasValidSettings, getPinnedEntities, usesBuiltInPlotSeedContract, getPromptProfile,
+} from './settings.js';
+import {
+    state, SECTIONS, VARIETY_LABELS,
+    getWorldStateText, commitHistorySnapshot, setProvenance,
+    extractOnlySection, replaceSection,
+} from './data.js';
+import { applyWorldStateInjection } from './injection.js';
+import { getRecentMessagesForScan } from './refresh.js';
+import { buildProvenance, groundingGate, collectRegistryAliasGroups } from './provenance.js';
+import { getDeltaStatus, buildPartialRefreshStatus, storedDocumentFormat } from './delta.js';
+import { settleSceneAnchorSync } from './scene.js';
+
+export { extractOnlySection, replaceSection };
+
+// ─── Section prompt builders ─────────────────────────────────────────────────
+
+function buildSystemPrompt() {
+    const settings = getSettings();
+    const custom = settings.customPrompt?.trim();
+    return custom || buildDefaultSystemPrompt(settings.hookMode, settings.detailLevel);
+}
+
+function buildSectionSystemPrompt(sectionName, variety) {
+    const baseSystem = buildSystemPrompt();
+
+    let extra = '';
+    if (HOOK_SECTIONS.includes(sectionName)) {
+        if (variety >= 4) {
+            extra = `
+
+VARIETY MODE (level ${variety}/5 — ${VARIETY_LABELS[variety]}):
+- Lean toward bold, unexpected, or destabilizing seeds. Avoid the safest interpretation.
+- At least one seed should introduce a disruption, twist, or escalation that hasn't been telegraphed yet.
+- Diversify categories: try to hit at least 4 different ones from [contact, entrance, social, institutional, opportunity, pressure, threat].
+- Consider tangential connections — characters, threads, or pressures that haven't been combined before.
+- Still: every seed must be a NEW EVENT, not a restatement of established facts.`;
+        } else if (variety === 3) {
+            extra = `
+
+VARIETY MODE (level ${variety}/5 — ${VARIETY_LABELS[variety]}):
+- Cover more categories than usual: aim for at least 3 different ones from [contact, entrance, social, institutional, opportunity, pressure, threat].
+- Mix safer and bolder seeds.
+- Consider less obvious escalations of existing pressures.`;
+        }
+    }
+
+    const override = `
+
+---
+
+OVERRIDE FOR THIS GENERATION:
+- Output ONLY the "## ${sectionName}" section. No other sections.
+- Your output MUST begin with the exact header "## ${sectionName}" — nothing before it.
+- Use the formatting and rules defined above for that section.
+- The rest of the existing world state is provided as context (do NOT include it in your output).${extra}`;
+
+    return baseSystem + override;
+}
+
+// WORLD-STATE-03: Maximum character budget for the full world-state context
+// fed into a section regeneration prompt. Same rationale as the refresh
+// prompt's PREV_STATE_BUDGET.
+const SECTION_CONTEXT_BUDGET = 30000;
+
+/**
+ * @param {string} sectionName — the section being regenerated.
+ * @param {string} scanText — the scan window this generation is built from.
+ *  Frozen by the caller before the first await so the initial attempt, the
+ *  grounding retry, and the grounding gate all see the EXACT evidence the
+ *  model was given — never a re-read window that messages arriving mid-await
+ *  may have shifted (the frozen-evidence rule, same fix as the delta/full paths).
+ */
+function buildSectionUserMessage(sectionName, scanText, stored = getWorldStateText(), formatChangeNote = '') {
+    const projected = getSettings().hookMode === 'off' ? stripHookSections(stored) : stored;
+    const fullState = truncateText(projected.trim() || 'None yet.', SECTION_CONTEXT_BUDGET);
+    const recent = scanText || 'No recent messages.';
+    const lines = [
+        '### Full Current World State (for context only — do not include in output)',
+        fullState,
+        '',
+        '### Recent Chat Messages',
+        recent,
+        '',
+        '='.repeat(60),
+        `Output ONLY the regenerated "## ${sectionName}" section now.`,
+        `Begin with the header "## ${sectionName}" — nothing before it.`,
+    ];
+    // Same copy-forward risk as the full refresh: the old block is right
+    // there in the context, so a regenerated section would keep its fields.
+    if (formatChangeNote && projected.trim()) lines.push('', formatChangeNote);
+    return lines.join('\n');
+}
+
+function validateSectionOutput(text, sectionName) {
+    if (!text) return { ok: false, reason: 'empty response' };
+
+    const escaped = escapeRegex(sectionName);
+    const headerPattern = new RegExp(`^##\\s*${escaped}\\b`, 'm');
+    if (!headerPattern.test(text)) {
+        const preview = text.slice(0, 100).replace(/\n/g, ' ');
+        return { ok: false, reason: `missing "## ${sectionName}" header. First 100 chars: "${preview}"` };
+    }
+
+    const rpMarkers = [
+        { pattern: /\b(you see|you notice|you feel)\b/i, label: 'second-person narration' },
+    ];
+    for (const { pattern, label } of rpMarkers) {
+        if (pattern.test(text)) return { ok: false, reason: `RP marker detected: ${label}` };
+    }
+
+    return { ok: true };
+}
+
+/**
+ * Hold a regenerated Plot Seeds body to the built-in "- [category] <seed>"
+ * contract before it is spliced in — the same repair the full refresh and the
+ * delta patch apply to their generated bytes, so no path can write a malformed
+ * seed that the next delta would then imitate.
+ *
+ * Unsalvageable seeds are dropped. When that empties the section the regen is
+ * reported as failed rather than committed: the user asked for this section
+ * specifically, and the existing one is better than an empty one.
+ */
+function repairSectionOutput(cleaned, sectionName) {
+    if (sectionName !== 'Plot Seeds' || !usesBuiltInPlotSeedContract()) return cleaned;
+    const repaired = normalizeGeneratedDocument(cleaned, { plotSeedContract: true });
+    if (!repaired.changes.length) return cleaned;
+    for (const change of repaired.changes) {
+        console.warn(`[MWT:WorldState] Section regen ${change.kind} in "${sectionName}": "${change.line ?? ''}"`);
+    }
+    if (!repaired.text.trim()) {
+        throw new Error(`Section regen produced no usable Plot Seeds — every entry was malformed. The previous "${sectionName}" was kept.`);
+    }
+    return repaired.text.trim();
+}
+
+// ─── Section regeneration ────────────────────────────────────────────────────
+
+export async function regenerateSection(sectionName, variety = 2) {
+    if (!hasValidSettings()) {
+        throw new Error('No API connection configured. Open ⚙ Settings in the World State panel.');
+    }
+    if (!SECTIONS.includes(sectionName)) {
+        throw new Error(`Unknown section: ${sectionName}`);
+    }
+    // The section override says "use the formatting and rules defined above
+    // for that section" — with no template above, the model would improvise
+    // one. A Custom Prompt defines its own sections, so only the built-in
+    // prompt is checked.
+    const promptSettings = getSettings();
+    if (!promptSettings.customPrompt?.trim() && !detailLevelIncludesSection(promptSettings.detailLevel, sectionName)) {
+        throw new Error(`"${sectionName}" is not part of the ${promptSettings.detailLevel} detail level. Switch to a larger detail level to regenerate it.`);
+    }
+    if (state.wstIsRefreshing) {
+        throw new Error('World State is already refreshing.');
+    }
+
+    // Part 6 (§7.4): the section-regen button reaches this API-spending choke
+    // point without the event router's decline predicate. Refuse while the
+    // store is paused — before reading the unprepared store or spending the
+    // API call (the checked commit would refuse afterwards anyway).
+    if (isStorePausedForCurrentScope(worldStateSchema.id)) {
+        console.warn('[MWT:WorldState] Cannot regenerate section — the store is paused for this chat (schema preparation).');
+        throw new Error('World State is paused for this chat — its data could not be safely prepared, so nothing was generated. Use Retry in the banner after repairing the data.');
+    }
+
+    // WORLD-STATE-01: Section regeneration had NO chat guard at all — a stale
+    // section result from Chat A could overwrite Chat B's section after a
+    // chat switch during the API call.
+    const scopeBefore = captureScope();
+
+    // WORLD-STATE-02: Capture the target SECTION's revision at start so we can
+    // detect same-chat edits to that section during the API call.
+    const promptDocument = getWorldStateText();
+    const sectionRevision = captureRevision(extractOnlySection(promptDocument, sectionName) || '');
+
+    state.wstIsRefreshing = true;
+    document.dispatchEvent(new CustomEvent('mwt:busy-changed'));
+
+    try {
+        const s = getSettings();
+        const baseTemp = isNaN(Number(s.temperature)) ? 0.3 : Number(s.temperature);
+        const hookSection = HOOK_SECTIONS.includes(sectionName);
+        const effectiveVariety = hookSection ? variety : 2;
+        const tempBoost = hookSection ? ({ 1: 0, 2: 0.05, 3: 0.3, 4: 0.55, 5: 0.85 }[effectiveVariety] || 0) : 0;
+        const temperature = Math.min(1.4, baseTemp + tempBoost);
+
+        const sectionSettings = { ...s, temperature };
+
+        // Frozen-evidence rule (follow-up): freeze the scan window BEFORE the first
+        // await. The generation prompt, the grounding retry, and the grounding
+        // gate must all work from the exact same evidence — a re-read after
+        // the API await could lose the oldest part of this window to messages
+        // that arrived meanwhile, stripping names the model legitimately used.
+        const scanWindowText = getRecentMessagesForScan();
+        const formatChangeNote = buildFormatChangeNote(storedDocumentFormat(undefined, promptDocument), getPromptProfile());
+
+        // TODO §1: the grounding gate's alias consultation (same as the full
+        // refresh path), collected with the other pre-flight captures — ABOVE
+        // every guard. Collecting it inside the gate block below put an await
+        // between the section-revision guard and the write, so a target-section
+        // edit landing in that window would be overwritten (WORLD-STATE-02).
+        // Frozen here alongside scanWindowText so the whole gate pass — first
+        // try, retry, soft fallback — works from one evidence set.
+        const aliasGroups = s.groundingEnabled ? await collectRegistryAliasGroups() : [];
+
+        // Alias lookup can yield while the user edits the target section.
+        // Check before spending a model call, not only before committing it.
+        if (!assertSameScope(scopeBefore).ok) return null;
+        if (!sameRevision(sectionRevision, extractOnlySection(getWorldStateText(), sectionName) || '')) return null;
+
+        const _wsApi3 = resolveApiCall({ moduleSettings: sectionSettings });
+        const raw = await _wsApi3.fetchFn({
+            systemPrompt: buildSectionSystemPrompt(sectionName, effectiveVariety),
+            userContent: buildSectionUserMessage(sectionName, scanWindowText, promptDocument, formatChangeNote),
+            settings: _wsApi3.settings,
+            retries: 1,
+        });
+
+        const text = normaliseOutput(raw);
+        const check = validateSectionOutput(text, sectionName);
+        if (!check.ok) {
+            throw new Error(`Section regen validation failed: ${check.reason}`);
+        }
+
+        // WORLD-STATE-01: Assert scope before any writes. A chat switch during
+        // the API call must discard the result to prevent cross-chat
+        // contamination — same guard as full refresh.
+        const scopeResult = assertSameScope(scopeBefore);
+        if (!scopeResult.ok) {
+            console.warn(
+                `[MWT:WorldState] Chat switched during section regeneration (${scopeResult.reason}) — ` +
+                `discarding result to avoid cross-chat contamination.`
+            );
+            return null;
+        }
+
+        // WORLD-STATE-02: Verify the target section wasn't edited during the
+        // API call. If the user changed this section while regen was in flight,
+        // discard the result rather than clobbering their edit.
+        const sectionNow = extractOnlySection(getWorldStateText(), sectionName) || '';
+        if (!sameRevision(sectionRevision, sectionNow)) {
+            console.warn(`[MWT:WorldState] Section "${sectionName}" was edited during regeneration — discarding result to preserve user changes.`);
+            return null;
+        }
+
+        let cleaned = repairSectionOutput(extractOnlySection(text, sectionName) || text.trim(), sectionName);
+
+        // The grounding gate's `priorText` is the pre-operation document — it
+        // answers "was this name already known before this regen?", so it must
+        // NOT be re-read after the retry. The document used for the actual
+        // WRITE is re-read separately below (see WORLD-STATE-02 note).
+        const priorText = getWorldStateText();
+
+        // Grounding gate only (§7) — expiry is a whole-document concern and
+        // does not run on a single-section regen.
+        // WORLD-STATE-04: Both retry and strict/soft policy mirror the full
+        // refresh path so the two agree.
+        if (s.groundingEnabled) {
+            // aliasGroups was captured pre-flight (above the guards) and is
+            // shared by every gate call below — there is no await left between
+            // the section guard and the write on the first-try path.
+            let grounding = groundingGate(cleaned, {
+                scanText: scanWindowText,
+                priorText,
+                pinned: getPinnedEntities(s),
+                aliasGroups,
+                mode: s.groundingMode,
+            });
+            if (!grounding.ok) {
+                console.warn(`[MWT:WorldState] Grounding gate rejected section "${sectionName}": ${grounding.reason} — retrying once`);
+                const _wsApiRetry = resolveApiCall({ moduleSettings: sectionSettings });
+                const rawRetry = await _wsApiRetry.fetchFn({
+                    systemPrompt: buildSectionSystemPrompt(sectionName, effectiveVariety),
+                    userContent: buildSectionUserMessage(sectionName, scanWindowText, promptDocument, formatChangeNote) + `\n\n[REMINDER: ${grounding.reason}. Output ONLY the section with grounded names.]`,
+                    settings: _wsApiRetry.settings,
+                    retries: 1,
+                });
+                const textRetry = normaliseOutput(rawRetry);
+                const checkRetry = validateSectionOutput(textRetry, sectionName);
+                if (!checkRetry.ok) throw new Error(`Section regen validation failed after grounding retry: ${checkRetry.reason}`);
+                // WORLD-STATE-01/02: Re-assert scope AND section revision after
+                // the grounding retry await. A chat switch or same-chat edit
+                // during the retry must discard the result before any write.
+                const scopeAfterRetry = assertSameScope(scopeBefore);
+                if (!scopeAfterRetry.ok) {
+                    console.warn(
+                        `[MWT:WorldState] Chat switched during section grounding retry (${scopeAfterRetry.reason}) — ` +
+                        `discarding result to avoid cross-chat contamination.`
+                    );
+                    return null;
+                }
+                const sectionAfterRetry = extractOnlySection(getWorldStateText(), sectionName) || '';
+                if (!sameRevision(sectionRevision, sectionAfterRetry)) {
+                    console.warn(`[MWT:WorldState] Section "${sectionName}" was edited during grounding retry — discarding result to preserve user changes.`);
+                    return null;
+                }
+                cleaned = repairSectionOutput(extractOnlySection(textRetry, sectionName) || textRetry.trim(), sectionName);
+                grounding = groundingGate(cleaned, {
+                    scanText: scanWindowText,
+                    priorText,
+                    pinned: getPinnedEntities(s),
+                    aliasGroups,
+                    mode: s.groundingMode,
+                });
+                if (!grounding.ok) {
+                    // WORLD-STATE-04: Strict mode fails closed with a visible
+                    // status. Soft mode strips and commits.
+                    if (s.groundingMode === 'strict') {
+                        console.warn(`[MWT:WorldState] Grounding gate still rejected section after retry (${grounding.reason}) — strict mode, discarding.`);
+                        return null;
+                    }
+                    console.warn(`[MWT:WorldState] Grounding gate still rejected section after retry (${grounding.reason}) — soft mode, stripping.`);
+                    grounding = groundingGate(cleaned, {
+                        scanText: scanWindowText,
+                        priorText,
+                        pinned: getPinnedEntities(s),
+                        aliasGroups,
+                        mode: 'soft',
+                    });
+                }
+            }
+            for (const { label } of grounding.stripped) {
+                console.warn(`[MWT:WorldState] Grounding gate stripped ungrounded name from "${sectionName}": "${label}"`);
+            }
+            cleaned = grounding.cleanedText;
+        }
+
+        // WORLD-STATE-02: Re-read the document immediately before the write.
+        // The grounding-retry branch above contains an `await`, so a document
+        // captured before it is stale by the time we get here — splicing the
+        // new section into that stale copy would silently revert any edit the
+        // user made to a DIFFERENT section during the retry. The revision guard
+        // deliberately only protects the target section, so it cannot catch
+        // this; re-reading is what makes the write surgical.
+        const docNow = getWorldStateText();
+        let updated = replaceSection(docNow, sectionName, cleaned);
+
+        // Keep Hook Mode Off at the final write boundary. This covers both a
+        // direct regeneration of a hook section and legacy hook sections that
+        // may still be present elsewhere in the document.
+        if (getSettings().hookMode === 'off') updated = stripHookSections(updated);
+
+        // A section protocol response is not sufficient proof that a generated
+        // Current Scene is valid. Validate the complete replacement document
+        // before the checked write; generated Present values are normalized by
+        // patching only the generated section, never editor/import content.
+        if (sectionName === 'Current Scene') {
+            const sceneValidation = validateWorldStateDocument(updated, { mode: 'structural' });
+            if (!sceneValidation.ok) {
+                throw new Error(`Section regen validation failed: ${sceneValidation.errors.map(entry => entry.message).join(' ')}`);
+            }
+            if (sceneValidation.normalizedText !== updated) {
+                updated = sceneValidation.normalizedText;
+            }
+        }
+
+        // Checked write (design §8): ONE commit carries BOTH the outgoing
+        // document's history snapshot and the regenerated document. A refused
+        // store write (unsafe current value, quarantine container refusing the
+        // rejected records) must not apply injection/provenance or report
+        // success — discard the generated text and return null so the caller
+        // keeps the previous document, exactly like the guards above. (A blank
+        // outgoing document skips the history snapshot, preserving the old
+        // `if (docNow?.trim())` no-op.)
+        //
+        // Delta-status bookkeeping (TODO §3-F) rides the same patch, but a
+        // section regen may stamp a fresh digest ONLY when the incoming
+        // document was still reconciled (its digest matched the last
+        // refresh's). When other sections carry manual edits,
+        // buildPartialRefreshStatus keeps the OLD digest so the document keeps
+        // reporting as manually edited — one model-reconciled section must not
+        // clear that signal — while the kind and reconciliation cadence still
+        // advance.
+        //
+        // The watermark deliberately does NOT advance (watermark-preservation
+        // rule): this
+        // run reconciled exactly ONE section from the sliding scan window, so
+        // stamping the stable-history end here would let the next delta start
+        // AFTER it and permanently skip messages that changed OTHER sections.
+        // Re-stamping the previous watermark keeps the unseen interval
+        // scannable; the next delta re-reads it cheaply (at worst answering
+        // "### NO CHANGES" for this already-regenerated section), and a full
+        // refresh or catch-up advances the watermark as usual.
+        const prevStatus = getDeltaStatus();
+        const written = commitHistorySnapshot(docNow, {
+            text: updated,
+            deltaStatus: buildPartialRefreshStatus(prevStatus, docNow, updated, prevStatus.lastRefreshAtMsg),
+        });
+        if (!written.ok) {
+            console.warn(`[MWT:WorldState] Section "${sectionName}" regeneration refused at the store write (${written.reason ?? 'unknown reason'}) — the previous world state was kept.`);
+            return null;
+        }
+        applyWorldStateInjection();
+        try { setProvenance(buildProvenance()); } catch (err) {
+            console.warn('[MWT:WorldState] Provenance build failed (non-fatal):', err.message);
+        }
+
+        console.log(`[MWT:WorldState] Section "${sectionName}" regenerated (variety ${variety}).`);
+        return updated;
+    } catch (err) {
+        // Coordinator cancellation (TODO §1): the chat changed mid-regen and
+        // the coordinator aborted the call, or the queued job was retired
+        // before it started. The scope guard above would have discarded the
+        // result anyway — discard quietly instead of surfacing an intentional
+        // stop as a user-facing failure, matching refreshWorldState() /
+        // refreshWorldStateDelta(). isCancellation() covers both the marked
+        // JobCancelledError and the native AbortError of a mid-wire abort.
+        if (isCancellation(err)) {
+            console.log('[MWT:WorldState] Section regeneration cancelled (coordinator) — discarded.');
+            return null;
+        }
+        throw err;
+    } finally {
+        state.wstIsRefreshing = false;
+        settleSceneAnchorSync();
+        document.dispatchEvent(new CustomEvent('mwt:busy-changed'));
+    }
+}
