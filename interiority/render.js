@@ -1,0 +1,1472 @@
+/**
+ * interiority/render.js — Settings UI, ledger display, and per-message
+ * thought display.
+ *
+ * Renders into the Interiority tab content area and into message DOM
+ * (never into msg.mes — thoughts are display-only, rendered from
+ * perMessage metadata on top of the message element).
+ */
+
+import {
+    escapeHtml,
+    renderApiSettingsFields, readApiSettingsValues, wireApiSettingsFields,
+    renderConnectionProfileSelect,
+} from '../core/index.js';
+// Direct import (not the barrel) so the real helper runs under the test
+// barrel→stub alias — the wireTablist precedent (accessibility Slice 2).
+// setControlBusy keeps `disabled` and `aria-busy` in step on async handlers
+// (a11y plan §4.4).
+import { setControlBusy } from '../core/ui.js';
+import { isStorePausedForCurrentScope } from '../core/schema_status.js';
+
+import {
+    state, getSettings, saveSettings,
+    getLedger, getDeletedIntentions, getPerMessage, getPerMessageKeys, getInteriorityData,
+    getMsgKeyForIndex, buildKeyToIndexMap,
+    removeLedgerEntries, updateLedgerEntry, setLedgerEntryDormant,
+    addManualLedgerEntry, hasDuplicateIntention,
+    getInnerStates, setInnerState, MAX_INNER_STATE_LENGTH,
+    DORMANT_POLL_INTERVAL, getDormantPollInterval,
+} from './data.js';
+import { INTENTION_PRIORITIES } from './schema.js';
+import { MAX_INJECTED_INTENTIONS, selectInjectedIntentions } from './prompts.js';
+
+/**
+ * M5-6: when more intentions are active than the narrator block carries, say
+ * which ones are left out and how to change that — here, where the user can
+ * act on it, never inside the prompt.
+ */
+function renderInjectionCapNote(ledger) {
+    const { kept, omitted } = selectInjectedIntentions(ledger);
+    if (omitted === 0) return '';
+    return `<p class="mwt-int-cap-note" role="note" style="color:var(--mwt-warning);font-size:12px;margin-bottom:8px">
+                    Only ${kept.length} of ${kept.length + omitted} active intentions reach the narrator (limit ${MAX_INJECTED_INTENTIONS}): the highest priority first, then the most recent. Raise an intention's priority to keep it in, or sleep or finish ones that can wait.
+                </p>`;
+}
+// Deferred lifecycle work (spec §2–§5): user lifecycle actions, audit history,
+// conflicts, and per-NPC controls.
+import {
+    getLifecycleHistory, clearLifecycleHistory,
+    markLedgerEntryDone, dismissLedgerEntry, mergeLedgerEntries,
+    reopenFromLifecycle, sleepLedgerEntryTracked, wakeLedgerEntryTracked,
+    findLifecycleConflicts, getEvidenceBoundary,
+    setNpcControl, removeNpcControl,
+    MAX_LIFECYCLE_EVENTS,
+} from './lifecycle.js';
+
+// ─── Main render ─────────────────────────────────────────────────────────────
+
+/**
+ * Render the Interiority tab content.
+ * Shows: settings panel toggle, current ledger, and recent thoughts.
+ */
+export function renderContent() {
+    const el = getContentEl();
+    if (!el) return;
+
+    // Reads return a safe working view now (the store itself is created only
+    // by a committed write), so getLedger()/getPerMessageKeys() below always
+    // see canonical containers — including on a chat whose store is absent or
+    // still holds invalid data the write seam will quarantine.
+    const ledger = getLedger();
+    const msgKeys = getPerMessageKeys();
+
+    // Nearly every panel action ends in renderContent(), which rebuilds the
+    // whole tab. Carry the user's open/closed choices across the rebuild (the
+    // story_planner renderArcs() precedent), or a section snaps shut on every
+    // click inside it. A fresh tab (modal open, chat change) has no sections
+    // yet and gets the markup defaults.
+    const openSections = new Map(
+        [...el.querySelectorAll('details.mwt-int-disclosure[id]')].map((d) => [d.id, d.open]),
+    );
+
+    el.innerHTML = `
+        <div class="mwt-interiority-tab">
+            <div class="mwt-flex mwt-gap-4" style="margin-bottom:12px;flex-wrap:wrap">
+                <button id="mwt-int-show-settings" class="mwt-btn"><span aria-hidden="true">⚙</span> Settings</button>
+                <button id="mwt-int-generate" class="mwt-btn mwt-btn-primary"${state.isGenerating ? ' disabled aria-busy="true"' : ''}><span aria-hidden="true">💭</span> Generate Now</button>
+                <button id="mwt-int-clear-ledger" class="mwt-btn" title="Remove all ledger entries"><span aria-hidden="true">🗑</span> Clear Ledger</button>
+            </div>
+            <div id="mwt-int-status" class="mwt-int-status" role="status" aria-live="polite" aria-atomic="true"></div>
+
+            <div id="mwt-int-settings-panel" style="display:none;margin-bottom:16px"></div>
+
+            <details id="mwt-int-active-intentions" class="mwt-int-disclosure" open>
+                <summary><span aria-hidden="true">📋</span> Active Intentions (${ledger.filter(e => e.status !== 'dormant').length})</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Persistent NPC intentions injected into the narrator prompt. These are hidden plans that surface only as NPC actions when their trigger condition is met. Click ✎ to edit an intention if the story changes its context.
+                </p>
+                ${renderInjectionCapNote(ledger)}
+                <div id="mwt-int-ledger-list" class="mwt-int-ledger-list">
+                    ${renderLedgerList(ledger.filter(e => e.status !== 'dormant'))}
+                </div>
+                <div id="mwt-int-add-form-container" style="margin-top:8px"></div>
+                <button id="mwt-int-add-btn" class="mwt-btn" style="margin-top:8px"><span aria-hidden="true">➕</span> Add Intention</button>
+            </details>
+
+            <details id="mwt-int-deleted-intentions" class="mwt-int-disclosure">
+                <summary><span aria-hidden="true">🗑️</span> Deleted Intentions (${getDeletedIntentions().length})</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Permanent user deletions. These entries are kept as tombstones so the engine will not propose the same intention again. Use the Overview Tools action to clear them deliberately.
+                </p>
+                ${getDeletedIntentions().length
+                    ? `<div class="mwt-int-deleted-list">${getDeletedIntentions().map((entry) => {
+                        // Imported tombstones may contain unknown display fields.
+                        // Keep malformed presentation data from taking down the
+                        // entire modal, while retaining the canonical actions.
+                        const actions = Array.isArray(entry.displayActions)
+                            ? entry.displayActions
+                            : (Array.isArray(entry.actions) ? entry.actions : []);
+                        return `<div class="mwt-int-deleted-entry"><strong>${escapeHtml(entry.displayNpc || entry.npc || 'Unknown NPC')}</strong> → ${escapeHtml(actions.join(', '))}</div>`;
+                    }).join('')}</div>`
+                    : '<p style="color:var(--mwt-text-dim);font-size:12px">No deleted intentions.</p>'}
+            </details>
+
+            <details id="mwt-int-scheduled-intentions" class="mwt-int-disclosure">
+                <summary><span aria-hidden="true">📅</span> Scheduled Intentions (${ledger.filter(e => e.status === 'dormant').length})</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Dormant plans anchored to future events. Excluded from the narrator prompt and per-turn evaluation until their trigger is near — checked automatically every ${getDormantPollInterval()} turns, or click ⏰ to wake manually.
+                </p>
+                <div id="mwt-int-dormant-list" class="mwt-int-ledger-list">
+                    ${renderDormantList(ledger.filter(e => e.status === 'dormant'))}
+                </div>
+            </details>
+
+            <details id="mwt-int-inner-states" class="mwt-int-disclosure">
+                <summary><span aria-hidden="true">🎭</span> Inner States</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Persistent one-line mood/disposition per NPC. Generated by the thoughts call and fed back next turn. Never injected into the narrator prompt. Click ✎ to correct a stale or wrong line.
+                </p>
+                <div id="mwt-int-inner-states-list" class="mwt-int-inner-states-list">
+                    ${renderInnerStatesList()}
+                </div>
+            </details>
+
+            <details id="mwt-int-npc-controls" class="mwt-int-disclosure">
+                <summary><span aria-hidden="true">🎛</span> Per-NPC Controls</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Privacy exclusion (never send this NPC's dossier in interiority calls) and creation-only cost controls (pause new proposals, cooldown, active cap). Existing intentions are always evaluated, and nothing is ever auto-evicted to meet a cap.
+                </p>
+                <div id="mwt-int-npc-controls-list" class="mwt-int-controls-list">
+                    ${renderNpcControlsList()}
+                </div>
+                <div class="mwt-flex mwt-gap-4" style="margin-top:8px;flex-wrap:wrap">
+                    <input type="text" id="mwt-int-controls-add-name" class="mwt-input" style="width:160px" placeholder="NPC name" aria-label="NPC name">
+                    <button id="mwt-int-controls-add-btn" class="mwt-btn mwt-btn-sm"><span aria-hidden="true">➕</span> Add control</button>
+                </div>
+            </details>
+
+            <details id="mwt-int-lifecycle-history" class="mwt-int-disclosure">
+                <summary><span aria-hidden="true">🗂</span> Lifecycle History (last ${getLifecycleHistory().length}${getLifecycleHistory().length >= MAX_LIFECYCLE_EVENTS ? ', capped' : ''})</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Occurrence-specific audit trail of completions, drops, expiries, merges, sleeps, wakes, and reopens — with reasons. Repeated near-identical proposals for a recently closed plan are suppressed within the dedup window; click 🔁 to reopen a closed plan.
+                </p>
+                <div id="mwt-int-lifecycle-list" class="mwt-int-lifecycle-list">
+                    ${renderLifecycleHistoryList()}
+                </div>
+            </details>
+
+            <details id="mwt-int-recent-thoughts" class="mwt-int-disclosure">
+                <summary><span aria-hidden="true">💭</span> Recent Thoughts</summary>
+                <p style="color:var(--mwt-text-dim);font-size:12px;margin-bottom:8px">
+                    Display-only NPC reactions from recent turns. These are never injected into the narrator prompt.
+                </p>
+                <div id="mwt-int-thoughts-list" class="mwt-int-thoughts-list">
+                    ${renderThoughtsList(msgKeys)}
+                </div>
+            </details>
+        </div>
+    `;
+
+    for (const [id, open] of openSections) {
+        const section = el.querySelector(`#${id}`);
+        if (section) section.open = open;
+    }
+
+    wireEvents(el);
+}
+
+/**
+ * Lifecycle v2: the priority badge for an entry (empty for 'normal'/absent).
+ * @param {object} entry
+ * @returns {string}
+ */
+function priorityBadge(entry) {
+    const priority = String(entry?.priority ?? '').trim().toLowerCase();
+    if (!priority || !INTENTION_PRIORITIES.includes(priority) || priority === 'normal') return '';
+    return `<span class="mwt-int-priority-badge mwt-int-priority--${escapeHtml(priority)}" title="Priority (user-set)"><span aria-hidden="true">${priority === 'urgent' ? '‼' : priority === 'high' ? '⬆' : '⬇'}</span> ${escapeHtml(priority)}</span>`;
+}
+
+/**
+ * Lifecycle v2: conflict warning badges for an entry, from this render's
+ * deterministic conflict pass. 'duplicate' pairs get a merge offer;
+ * 'occasion' pairs (two plans, same moment) are informational.
+ * @param {string} id
+ * @param {Array<object>} conflicts
+ * @returns {string}
+ */
+function conflictBadges(id, conflicts) {
+    const mine = conflicts.filter(c => c.keepId === id || c.dropId === id);
+    if (mine.length === 0) return '';
+    return mine.map((c) => {
+        if (c.type === 'duplicate') {
+            const other = c.keepId === id ? c.dropId : c.keepId;
+            return `<button class="mwt-int-conflict-badge mwt-int-merge-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(id)}" data-other="${escapeHtml(other)}" title="Looks like a duplicate of another active intention — click to keep THIS one and merge the other away"><span aria-hidden="true">⚠</span> dup — merge</button>`;
+        }
+        return '<span class="mwt-int-conflict-badge mwt-int-conflict-badge--occasion" title="Two different plans compete for the same trigger occasion — consider dropping or rescheduling one"><span aria-hidden="true">⚠</span> same occasion</span>';
+    }).join(' ');
+}
+
+/**
+ * Render the ledger list HTML.
+ */
+function renderLedgerList(ledger) {
+    if (!ledger || ledger.length === 0) {
+        return '<p style="color:var(--mwt-text-dim);font-size:12px">No active intentions.</p>';
+    }
+    // Lifecycle v2 (spec §2): priority first (urgent → high → normal → low),
+    // then age — the panel reads as the narrator's demand order.
+    const order = { urgent: 0, high: 1, normal: 2, low: 3 };
+    const sorted = [...ledger].sort((a, b) => {
+        const pa = order[String(a.priority ?? 'normal')] ?? 2;
+        const pb = order[String(b.priority ?? 'normal')] ?? 2;
+        if (pa !== pb) return pa - pb;
+        return (b.turnsOpen || 0) - (a.turnsOpen || 0);
+    });
+    const conflicts = findLifecycleConflicts(ledger);
+    return sorted.map((entry) => `
+        <div class="mwt-int-ledger-entry${entry.manual ? ' mwt-int-ledger-entry--manual' : ''}" data-id="${escapeHtml(entry.id)}">
+            <div class="mwt-int-ledger-entry-main">
+                <span class="mwt-int-ledger-npc">${escapeHtml(entry.npc)}</span>
+                <span class="mwt-int-arrow">→</span>
+                <span class="mwt-int-ledger-action">${escapeHtml(entry.action)}</span>
+                <span class="mwt-int-arrow">→</span>
+                <span class="mwt-int-ledger-trigger">${escapeHtml(entry.trigger)}</span>
+                ${entry.manual ? '<span class="mwt-int-manual-badge" title="User-authored intention"><span aria-hidden="true">✋</span><span class="mwt-sr-only">user-authored</span></span>' : ''}
+                ${priorityBadge(entry)}
+                ${conflictBadges(entry.id, conflicts)}
+            </div>
+            <div class="mwt-int-ledger-meta">
+                ${entry.since ? `<span style="color:var(--mwt-text-dim)">since ${escapeHtml(entry.since)}</span>` : ''}
+                ${entry.turnsOpen != null ? `<span style="color:var(--mwt-text-dim);font-size:11px" title="Turns this intention has survived${entry.expiresTurn ? ` — expires after ${entry.expiresTurn}` : ''}">${entry.turnsOpen} turn${entry.turnsOpen === 1 ? '' : 's'}${entry.expiresTurn ? ` / ${entry.expiresTurn}` : ''}</span>` : ''}
+                ${entry.expiresOn ? `<span class="mwt-int-expiry-note" title="In-world expiry — the plan is no longer plausible after this event"><span aria-hidden="true">⌛</span> ${escapeHtml(entry.expiresOn)}</span>` : ''}
+                <button class="mwt-int-done-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Mark this intention completed — closes it and records the completion in the lifecycle history" aria-label="Mark intention completed">✔</button>
+                <button class="mwt-int-dismiss-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Dismiss as no longer plausible — closes it without a permanent block" aria-label="Dismiss intention">🚫</button>
+                <button class="mwt-int-sleep-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Schedule this intention — stops per-turn narrator demands until its trigger is near" aria-label="Schedule intention (sleep)">💤</button>
+                <button class="mwt-int-edit-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Edit this intention" aria-label="Edit intention">✎</button>
+                <button class="mwt-int-remove-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Remove this intention and never re-propose it" aria-label="Remove intention">✕</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+// ─── Dormant intentions list (v2 §20 — scheduling) ───────────────────────────
+
+/**
+ * Render the dormant (scheduled) intentions list HTML.
+ *
+ * Dormant entries show their wakeHint (the event/date to watch for) and have
+ * a ⏰ wake button (manual wake) alongside the usual ✎ edit and ✕ remove.
+ *
+ * @param {Array<object>} dormant - ledger entries with status 'dormant'
+ * @returns {string}
+ */
+function renderDormantList(dormant) {
+    if (!dormant || dormant.length === 0) {
+        return '<p style="color:var(--mwt-text-dim);font-size:12px">No scheduled intentions.</p>';
+    }
+    return dormant.map((entry) => `
+        <div class="mwt-int-ledger-entry mwt-int-ledger-entry--dormant" data-id="${escapeHtml(entry.id)}">
+            <div class="mwt-int-ledger-entry-main">
+                <span class="mwt-int-ledger-npc">${escapeHtml(entry.npc)}</span>
+                <span class="mwt-int-arrow">→</span>
+                <span class="mwt-int-ledger-action">${escapeHtml(entry.action)}</span>
+                <span class="mwt-int-arrow">→</span>
+                <span class="mwt-int-ledger-trigger">${escapeHtml(entry.trigger)}</span>
+                ${entry.wakeHint ? `<span class="mwt-int-dormant-hint" title="Wake condition"><span aria-hidden="true">📅</span> ${escapeHtml(entry.wakeHint)}</span>` : ''}
+                ${priorityBadge(entry)}
+            </div>
+            <div class="mwt-int-ledger-meta">
+                ${entry.since ? `<span style="color:var(--mwt-text-dim)">since ${escapeHtml(entry.since)}</span>` : ''}
+                <button class="mwt-int-wake-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Wake this intention now" aria-label="Wake intention now">⏰</button>
+                <button class="mwt-int-done-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Mark this intention completed — closes it and records the completion in the lifecycle history" aria-label="Mark intention completed">✔</button>
+                <button class="mwt-int-dismiss-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Dismiss as no longer plausible — closes it without a permanent block" aria-label="Dismiss intention">🚫</button>
+                <button class="mwt-int-edit-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Edit this intention" aria-label="Edit intention">✎</button>
+                <button class="mwt-int-remove-btn mwt-btn mwt-btn-sm" data-id="${escapeHtml(entry.id)}" title="Remove this intention" aria-label="Remove intention">✕</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+// ─── Lifecycle history + per-NPC controls (lifecycle v2, spec §2/§5) ─────────
+
+/** Human label for a lifecycle outcome, with its source distinction. */
+const OUTCOME_LABELS = {
+    completed: '✔ completed',
+    dropped: '✕ dropped',
+    expired: '⌛ expired',
+    merged: '⧉ merged',
+    reopened: '🔁 reopened',
+    slept: '💤 slept',
+    woken: '⏰ woken',
+};
+
+/**
+ * Render the lifecycle history list (newest first). Only closure outcomes get
+ * the 🔁 reopen control — slept/woken are transitions of live entries.
+ * @returns {string}
+ */
+function renderLifecycleHistoryList() {
+    const history = getLifecycleHistory();
+    if (history.length === 0) {
+        return '<p style="color:var(--mwt-text-dim);font-size:12px">No lifecycle events yet. Completions, drops, expiries, merges, sleeps, wakes, and reopens appear here with their reasons.</p>';
+    }
+    const reopenable = new Set(['completed', 'dropped', 'expired', 'merged']);
+    const rows = [...history].reverse().slice(0, 50).map((evt) => `
+        <div class="mwt-int-lifecycle-entry mwt-int-lifecycle--${escapeHtml(evt.outcome)}" data-hid="${escapeHtml(evt.id)}">
+            <div class="mwt-int-ledger-entry-main">
+                <span class="mwt-int-lifecycle-outcome">${OUTCOME_LABELS[evt.outcome] || escapeHtml(evt.outcome)}</span>
+                <span class="mwt-int-arrow">·</span>
+                <span class="mwt-int-ledger-npc">${escapeHtml(evt.npc)}</span>
+                <span class="mwt-int-arrow">→</span>
+                <span class="mwt-int-ledger-action">${escapeHtml(evt.action)}</span>
+                <span class="mwt-int-lifecycle-source">${evt.source === 'user' ? '(user)' : '(engine)'}</span>
+            </div>
+            <div class="mwt-int-ledger-meta">
+                ${evt.reason ? `<span class="mwt-int-lifecycle-reason" title="Recorded reason">${escapeHtml(evt.reason.slice(0, 160))}</span>` : ''}
+                <span style="color:var(--mwt-text-dim);font-size:11px">turn ${evt.turn}${evt.supersededBy ? ` · superseded by ${escapeHtml(evt.supersededBy)}` : ''}</span>
+                ${reopenable.has(evt.outcome) ? `<button class="mwt-int-reopen-btn mwt-btn mwt-btn-sm" data-hid="${escapeHtml(evt.id)}" title="Reopen this plan — adds it back as an active, user-owned intention" aria-label="Reopen plan">🔁</button>` : ''}
+            </div>
+        </div>
+    `);
+    const more = history.length > 50 ? `<p style="color:var(--mwt-text-dim);font-size:11px">… ${history.length - 50} older event(s) retained (cap ${MAX_LIFECYCLE_EVENTS}).</p>` : '';
+    const clearBtn = history.length > 0
+        ? '<button id="mwt-int-clear-history" class="mwt-btn mwt-btn-sm" style="margin-top:8px" title="Empty the lifecycle history. Deletion tombstones are untouched."><span aria-hidden="true">🗑</span> Clear history</button>'
+        : '';
+    return rows.join('') + more + clearBtn;
+}
+
+/**
+ * Render the per-NPC controls list: explicit control records plus read-only
+ * evidence-boundary lines for NPCs that have one but no control record.
+ * @returns {string}
+ */
+function renderNpcControlsList() {
+    const rows = [];
+    const seen = new Set();
+    let rowIdx = 0;
+    let hasControlRows = false;
+    // Explicit control records first (insertion order = the store map's).
+    for (const [npcKey, control] of Object.entries(getInteriorityData().npcControls)) {
+        const boundary = getEvidenceBoundary(npcKey);
+        seen.add(npcKey.toLowerCase());
+        hasControlRows = true;
+        // Row-suffixed ids (index is unique per render and always id-safe —
+        // NPC names can contain spaces), so each control gets an explicit
+        // label[for] association (a11y plan §5 Slice 4 items 3–4). The
+        // dial explanations live in four STATIC snippets rendered once
+        // after the list (see the return below) and each control references
+        // only its own snippet — the first Slice 4 pass repeated the whole
+        // four-part paragraph per row and pointed every control's
+        // aria-describedby at all of it, so each dial announced all four
+        // explanations, once per NPC. The fieldset carries the NPC's name as
+        // the row context instead of repeating it in labels.
+        //
+        // The name rides in the ordinary name line, with the fieldset pointed
+        // at it by aria-labelledby, rather than in a <legend>: a rendered
+        // legend is excluded from the fieldset's anonymous content box, so it
+        // never becomes a flex item — it stacked above the dials (measured:
+        // 34px → 50px per row, and `flex: 1 1 240px` on it was inert) instead
+        // of sitting opposite them under `justify-content: space-between`.
+        // aria-labelledby takes precedence over a legend for the group name
+        // anyway, so the grouping is unchanged and the layout is the one the
+        // plain div had.
+        const uid = `-${rowIdx++}`;
+        rows.push(`
+        <fieldset class="mwt-int-controls-row" data-npc="${escapeHtml(npcKey)}" aria-labelledby="mwt-int-ctl-npc${uid}">
+            <div class="mwt-int-ledger-entry-main" id="mwt-int-ctl-npc${uid}">
+                <span class="mwt-int-ledger-npc">${escapeHtml(npcKey)}</span>
+                ${boundary ? `<span style="color:var(--mwt-text-dim);font-size:11px" title="Generation turn this NPC's intentions were last successfully evaluated">· last evaluated turn ${boundary.turn}</span>` : ''}
+            </div>
+            <div class="mwt-int-controls-fields">
+                <label for="mwt-int-ctl-privacy${uid}">
+                    <input type="checkbox" id="mwt-int-ctl-privacy${uid}" class="mwt-int-ctl-privacy" data-npc="${escapeHtml(npcKey)}" aria-describedby="mwt-int-ctl-help-privacy" ${control.privacyExcluded ? 'checked' : ''}> privacy
+                </label>
+                <label for="mwt-int-ctl-pause${uid}">
+                    <input type="checkbox" id="mwt-int-ctl-pause${uid}" class="mwt-int-ctl-pause" data-npc="${escapeHtml(npcKey)}" aria-describedby="mwt-int-ctl-help-pause" ${control.pauseNewProposals ? 'checked' : ''}> pause new
+                </label>
+                <label for="mwt-int-ctl-cooldown${uid}">
+                    cooldown <input type="number" min="0" max="200" style="width:52px" class="mwt-input mwt-int-ctl-cooldown" id="mwt-int-ctl-cooldown${uid}" data-npc="${escapeHtml(npcKey)}" aria-describedby="mwt-int-ctl-help-cooldown" value="${control.cooldownTurns || 0}">
+                </label>
+                <label for="mwt-int-ctl-cap${uid}">
+                    cap <input type="number" min="0" max="20" style="width:44px" class="mwt-input mwt-int-ctl-cap" id="mwt-int-ctl-cap${uid}" data-npc="${escapeHtml(npcKey)}" aria-describedby="mwt-int-ctl-help-cap" value="${control.activeCap || 0}">
+                </label>
+                <button class="mwt-int-ctl-remove-btn mwt-btn mwt-btn-sm" data-npc="${escapeHtml(npcKey)}" title="Remove this control record" aria-label="Remove control record">✕</button>
+            </div>
+        </fieldset>`);
+    }
+    // NPCs with an evidence boundary but no control record (informational).
+    for (const entry of getLedger()) {
+        const npc = String(entry.npc || '').trim();
+        const key = npc.toLowerCase();
+        if (!npc || seen.has(key)) continue;
+        const boundary = getEvidenceBoundary(npc);
+        if (!boundary) continue;
+        seen.add(key);
+        rows.push(`
+        <div class="mwt-int-controls-row mwt-int-controls-row--readonly" data-npc="${escapeHtml(npc)}">
+            <div class="mwt-int-ledger-entry-main">
+                <span class="mwt-int-ledger-npc">${escapeHtml(npc)}</span>
+                <span style="color:var(--mwt-text-dim);font-size:11px" title="Generation turn this NPC's intentions were last successfully evaluated">· last evaluated turn ${boundary.turn}</span>
+            </div>
+            <div class="mwt-int-controls-fields"><span style="color:var(--mwt-text-dim);font-size:11px">no controls set</span></div>
+        </div>`);
+    }
+    if (rows.length === 0) {
+        return '<p style="color:var(--mwt-text-dim);font-size:12px">No per-NPC controls. Add one by NPC name — privacy exclusion withholds the dossier; the cost dials pause only NEW proposals.</p>';
+    }
+    // The four dial explanations, rendered ONCE for the whole list: each
+    // control's aria-describedby points at exactly its own snippet, so
+    // focusing a dial announces only that dial's explanation no matter how
+    // many NPC rows exist.
+    const helpSnippets = hasControlRows
+        ? `
+        <div class="mwt-int-ctl-help-group">
+            <p id="mwt-int-ctl-help-privacy" class="mwt-int-ctl-help">privacy: never send this NPC's dossier (knowledge entry, character core, relationships) in any interiority call</p>
+            <p id="mwt-int-ctl-help-pause" class="mwt-int-ctl-help">pause new: block NEW engine proposals — existing intentions are still evaluated every turn</p>
+            <p id="mwt-int-ctl-help-cooldown" class="mwt-int-ctl-help">cooldown: after an accepted proposal, block further proposals for this many turns (0 = off)</p>
+            <p id="mwt-int-ctl-help-cap" class="mwt-int-ctl-help">cap: max ACTIVE engine-authored intentions (0 = unlimited; nothing is auto-evicted)</p>
+        </div>`
+        : '';
+    return rows.join('') + helpSnippets;
+}
+
+// ─── Inner states (v2 §18 — persistent affective line) ───────────────────────
+
+/**
+ * Render the inner states list HTML.
+ *
+ * Each NPC's persistent one-line mood is shown with an inline ✎ edit button
+ * (the recovery path if a line goes stale or wrong). Empty states are hidden
+ * to keep the panel uncluttered for new chats.
+ *
+ * @returns {string}
+ */
+function renderInnerStatesList() {
+    const states = getInnerStates();
+    const entries = Object.entries(states).filter(([, v]) => v && typeof v.line === 'string' && v.line.trim());
+    if (entries.length === 0) {
+        return '<p style="color:var(--mwt-text-dim);font-size:12px">No inner states yet. They appear after the first thoughts generation.</p>';
+    }
+    return entries.map(([npc, entry]) => `
+        <div class="mwt-int-inner-state-entry" data-npc="${escapeHtml(npc)}">
+            <div class="mwt-int-inner-state-main">
+                <span class="mwt-int-inner-state-npc">${escapeHtml(npc)}</span>
+                <span class="mwt-int-arrow">⟶</span>
+                <span class="mwt-int-inner-state-line">${escapeHtml(entry.line)}</span>
+            </div>
+            <div class="mwt-int-ledger-meta">
+                <button class="mwt-int-state-edit-btn mwt-btn mwt-btn-sm" data-npc="${escapeHtml(npc)}" title="Edit this inner state" aria-label="Edit inner state">✎</button>
+                <button class="mwt-int-state-remove-btn mwt-btn mwt-btn-sm" data-npc="${escapeHtml(npc)}" title="Clear this inner state" aria-label="Clear inner state">✕</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+/**
+ * Monotonic suffix for the inner-state edit form's field id.
+ *
+ * Like the ledger's edit form, opening a second inner-state editor does not
+ * close the first, so a fixed id would put two `id="…-line"` inputs in the
+ * DOM and point the second NPC's label[for] at the first NPC's field. The
+ * ledger form gets uniqueness from the entry id; inner states are keyed by
+ * NPC name, which is not id-safe, so count instead.
+ */
+let innerStateEditSeq = 0;
+
+/**
+ * Transform an inner-state entry into an inline edit form.
+ * @param {string} npc - NPC name (the key)
+ */
+function showInnerStateEditForm(npc) {
+    const listEl = getContentEl()?.querySelector('#mwt-int-inner-states-list');
+    if (!listEl) return;
+
+    const entryEl = listEl.querySelector(`.mwt-int-inner-state-entry[data-npc="${CSS.escape(npc)}"]`);
+    if (!entryEl) return;
+
+    const states = getInnerStates();
+    const current = states[npc]?.line || '';
+    const lineId = `mwt-int-state-edit-line-${innerStateEditSeq++}`;
+
+    entryEl.classList.add('mwt-int-ledger-entry--editing');
+    entryEl.innerHTML = `
+        <div class="mwt-int-edit-form">
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="${lineId}">${escapeHtml(npc)}</label>
+                <input type="text" id="${lineId}" class="mwt-input mwt-int-state-edit-line" value="${escapeHtml(current)}" placeholder="One-line mood/disposition (max ${MAX_INNER_STATE_LENGTH} chars)" maxlength="${MAX_INNER_STATE_LENGTH}">
+            </div>
+            <div class="mwt-int-edit-actions">
+                <button class="mwt-btn mwt-btn-primary mwt-int-state-edit-save-btn" data-npc="${escapeHtml(npc)}"><span aria-hidden="true">💾</span> Save</button>
+                <button class="mwt-btn mwt-int-state-edit-cancel-btn" data-npc="${escapeHtml(npc)}"><span aria-hidden="true">✕</span> Cancel</button>
+            </div>
+        </div>
+    `;
+
+    const input = entryEl.querySelector('.mwt-int-state-edit-line');
+    if (input) {
+        input.focus();
+        input.select();
+    }
+
+    if (input) {
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleInnerStateEditSave(npc);
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                renderContent();
+            }
+        });
+    }
+}
+
+/**
+ * Handle Save from the inner-state inline edit form.
+ * Uses setInnerState (bypasses the drift backstop — manual edits are authoritative).
+ * @param {string} npc
+ */
+function handleInnerStateEditSave(npc) {
+    const listEl = getContentEl()?.querySelector('#mwt-int-inner-states-list');
+    if (!listEl) return;
+    const entryEl = listEl.querySelector(`.mwt-int-inner-state-entry[data-npc="${CSS.escape(npc)}"]`);
+    if (!entryEl) return;
+    const line = entryEl.querySelector('.mwt-int-state-edit-line')?.value?.trim() || '';
+    // setInnerState with empty string clears the state (deletes the key).
+    // `manual` marks this as user-authored so a later rollback to a snapshot
+    // taken BEFORE this edit doesn't silently revert it.
+    const saved = setInnerState(npc, line, { manual: true });
+    renderContent();
+    setIntStatus(saved ? (line ? 'Inner state updated.' : 'Inner state cleared.') : 'Inner state could not be saved.', saved ? 'success' : 'error');
+}
+
+/**
+ * Render the recent thoughts list HTML.
+ *
+ * @param {string[]} msgKeys - stable perMessage keys (mu-* or sd-* format)
+ */
+function renderThoughtsList(msgKeys) {
+    if (!msgKeys || msgKeys.length === 0) {
+        return '<p style="color:var(--mwt-text-dim);font-size:12px">No thoughts generated yet.</p>';
+    }
+
+    // Build a key→index map so we can display the current message number.
+    // After Inline Summary shrinks the chat, the index may differ from when
+    // the thought was generated — but it correctly points to where the
+    // message lives *now*.
+    const keyToIndex = buildKeyToIndexMap();
+
+    const shown = msgKeys.slice(0, 20); // Show last 20
+    const parts = [];
+    for (const key of shown) {
+        const pm = getPerMessage(key);
+        if (!pm || !pm.reactions || pm.reactions.length === 0) continue;
+        const currentIdx = keyToIndex.get(key);
+        const msgLabel = currentIdx != null ? `msg #${currentIdx}` : '';
+        for (const r of pm.reactions) {
+            const typeLabel = r.type && r.type !== 'reaction'
+                ? `<span class="mwt-int-thought-type" title="Thought type">${escapeHtml(r.type)}</span>`
+                : '';
+            const reLine = r.re
+                ? `<div class="mwt-int-thought-re">${escapeHtml(r.re)}</div>`
+                : '';
+            const stateLine = r.innerState
+                ? `<div class="mwt-int-thought-state" title="Inner state"><span aria-hidden="true">⟶</span> ${escapeHtml(r.innerState)}</div>`
+                : '';
+            parts.push(`
+                <div class="mwt-int-thought-entry">
+                    <div class="mwt-int-thought-header">
+                        <span class="mwt-int-thought-npc">${escapeHtml(r.npc)}</span>
+                        ${typeLabel}
+                        ${msgLabel ? `<span class="mwt-int-thought-msg">${msgLabel}</span>` : ''}
+                    </div>
+                    ${reLine}
+                    <div class="mwt-int-thought-text">"${escapeHtml(r.thought)}"</div>
+                    ${stateLine}
+                </div>
+            `);
+        }
+    }
+    return parts.length > 0 ? parts.join('') : '<p style="color:var(--mwt-text-dim);font-size:12px">No thoughts generated yet.</p>';
+}
+
+// ─── Settings panel ──────────────────────────────────────────────────────────
+
+/**
+ * Render the settings panel inside the Interiority tab.
+ */
+export function renderSettingsPanel() {
+    const panel = getContentEl()?.querySelector('#mwt-int-settings-panel');
+    if (!panel) return;
+
+    const s = getSettings();
+    const apiFieldOpts = {
+        profileId: 'mwt-int-connection-profile',
+        urlId: 'mwt-int-api-url', keyId: 'mwt-int-api-key', modelId: 'mwt-int-model',
+        maxTokensId: 'mwt-int-max-tokens', tempId: 'mwt-int-temp', topPId: 'mwt-int-top-p',
+        freqId: 'mwt-int-freq-pen', presId: 'mwt-int-pres-pen', headersId: 'mwt-int-headers',
+        maxTokensDefault: 4000, tempDefault: 0.4,
+    };
+
+    panel.innerHTML = `
+        <div class="mwt-settings-form">
+            <h3>Interiority Settings</h3>
+            <div class="mwt-settings-grid">
+                ${renderApiSettingsFields(s, apiFieldOpts)}
+            </div>
+
+            <div style="margin-top:12px">
+                <label for="mwt-int-auto-mode"><input type="checkbox" id="mwt-int-auto-mode" ${s.autoMode ? 'checked' : ''}> Auto-generate on each AI message</label>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">When ON, thoughts are generated automatically when an AI message lands. When OFF, use the 💭 Generate button per message.</p>
+            </div>
+
+            <div style="margin-top:12px;display:flex;flex-direction:column;gap:6px">
+                <label for="mwt-int-gen-thoughts"><input type="checkbox" id="mwt-int-gen-thoughts" ${s.generateThoughts !== false ? 'checked' : ''}> Generate thoughts (private NPC reactions)</label>
+                <label for="mwt-int-gen-intentions"><input type="checkbox" id="mwt-int-gen-intentions" ${s.generateIntentions !== false ? 'checked' : ''}> Generate intentions (persistent NPC plans injected into the narrator prompt)</label>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Toggle either feature off if you only want one. When both are off, no API call is made.</p>
+            </div>
+
+            <div style="margin-top:12px">
+                <label for="mwt-int-split-thoughts"><input type="checkbox" id="mwt-int-split-thoughts" ${s.splitThoughts === true ? 'checked' : ''}> Rich thoughts (separate call) — <span style="color:var(--mwt-text-dim)">uses two separate API calls per turn</span></label>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">When ON and both features are enabled, intentions and thoughts run as two separate calls — issued together but sent one at a time (the coordinator allows one outbound call per module at a time) — enabling a dedicated craft prompt and richer context for thoughts (v2 groundwork). Roughly doubles interiority's per-turn token cost. OFF = the original single unified call.</p>
+            </div>
+
+            <div id="mwt-int-v2-dials" style="margin-top:12px;padding:8px 12px;border:1px solid var(--mwt-border);border-radius:4px;${s.splitThoughts === true ? '' : 'display:none'}">
+                <h4 style="margin:4px 0 8px;font-size:13px">Rich thoughts — cost dials</h4>
+
+                <label class="mwt-label" for="mwt-int-thoughts-profile">Thoughts Connection Profile</label>
+                ${renderConnectionProfileSelect('mwt-int-thoughts-profile', s.thoughtsConnectionProfileId || '', '— Use module connection —')}
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Optional. Route the (expensive) thoughts call through a separate connection profile so a better model can be pointed at voice without paying for it on bookkeeping. Leave empty to use the module's own connection.</p>
+
+                <div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                    <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-thoughts-interval">Thoughts every <input type="number" id="mwt-int-thoughts-interval" class="mwt-input" style="width:60px;display:inline-block" value="${s.thoughtsInterval ?? 1}" min="1" max="20"> turns</label>
+                </div>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Set to 1 for every turn. Higher values run the expensive thoughts call less often (intentions still run every turn).</p>
+
+                <div style="margin-top:8px">
+                    <label for="mwt-int-thoughts-profiled-only"><input type="checkbox" id="mwt-int-thoughts-profiled-only" ${s.thoughtsProfiledOnly === true ? 'checked' : ''}> Profiled NPCs only</label>
+                    <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Restrict the rich thoughts call to NPCs that have a growth profile. Unprofiled NPCs get no thought on a given turn (intentions are unaffected).</p>
+                </div>
+            </div>
+
+            <div style="margin-top:12px">
+                <label class="mwt-label" for="mwt-int-mode">Mode</label>
+                <select id="mwt-int-mode" class="mwt-input">
+                    <option value="batched" ${s.mode !== 'strict' ? 'selected' : ''}>Batched (one call/turn — recommended)</option>
+                    <option value="strict" ${s.mode === 'strict' ? 'selected' : ''}>Strict (one call per NPC — true partition at N× cost)</option>
+                </select>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Batched mode makes one API call per turn containing all NPCs. Strict mode makes one call per NPC for true information partition.${s.splitThoughts === true && s.mode === 'strict' ? '</p><p style="font-size:11px;color:#c77">⚠ Rich thoughts (split) is ON, which overrides Strict — the unified call strict partitions is bypassed in favor of the split pair. Turn Rich thoughts OFF to use Strict mode.' : ''}</p>
+            </div>
+
+            <div style="margin-top:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-max-npcs">Max NPCs <input type="number" id="mwt-int-max-npcs" class="mwt-input" style="width:60px;display:inline-block" value="${s.maxNpcs || 4}" min="1" max="20"></label>
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-window">Message Window <input type="number" id="mwt-int-window" class="mwt-input" style="width:60px;display:inline-block" value="${s.messageWindow || 8}" min="1" max="50"></label>
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-grace">Grace Period <input type="number" id="mwt-int-grace" class="mwt-input" style="width:60px;display:inline-block" value="${s.intentionGracePeriod ?? 2}" min="0" max="20"></label>
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-max-new">Max New/NPC <input type="number" id="mwt-int-max-new" class="mwt-input" style="width:60px;display:inline-block" value="${s.maxNewIntentionsPerNpc ?? 2}" min="0" max="20"></label>
+            </div>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Grace Period: minimum turns an intention must survive before it can be executed or dropped. Higher values make intentions more persistent. Set to 0 to disable.</p>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Max New/NPC: at most this many new intentions are accepted per NPC per generation call (default 2). Completion/drop evaluation is unaffected; malformed or duplicate proposals never consume the cap. Set to 0 to stop new proposals entirely. Temporary diagnostic setting.</p>
+
+            <div style="margin-top:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-dormant-poll">Dormant Poll <input type="number" id="mwt-int-dormant-poll" class="mwt-input" style="width:60px;display:inline-block" value="${s.dormantPollInterval ?? 10}" min="1" max="200"> turns</label>
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-dedup-turns">Closure Dedup <input type="number" id="mwt-int-dedup-turns" class="mwt-input" style="width:60px;display:inline-block" value="${s.lifecycleDedupTurns ?? 8}" min="0" max="100"> turns</label>
+                <label style="font-size:12px;color:var(--mwt-text-dim)" for="mwt-int-max-turns">Max Turns Open <input type="number" id="mwt-int-max-turns" class="mwt-input" style="width:60px;display:inline-block" value="${s.intentionMaxTurnsOpen ?? 0}" min="0" max="500"> turns</label>
+            </div>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">How often scheduled intentions are checked to see if their trigger is near. Lower = sooner wake, higher = fewer API checks. Default: ${DORMANT_POLL_INTERVAL}.</p>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Closure Dedup: how recent (in turns) a completed/dropped/expired closure still suppresses near-identical re-proposals for the same NPC. Occurrence-specific: an independently motivated repetition after the window stays legal. 0 disables the guard.</p>
+            <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">Max Turns Open: engine-authored intentions older than this close automatically as expired. NEVER applies to user-authored (<span aria-hidden="true">✋</span>) intentions, and per-entry overrides win. 0 = never.</p>
+
+            <div style="margin-top:12px">
+                <label for="mwt-int-require-evidence"><input type="checkbox" id="mwt-int-require-evidence" ${s.requireIntentionEvidence === true ? 'checked' : ''}> Require a quoted line for every new intention</label>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">New intentions are always asked to quote the line from the recent messages that motivates them, and a quote that can't be found in those messages is rejected. Turn this ON to also reject intentions that carry no quote. Recommended for small local models, which tend to turn dossier lines into plans; leave OFF for large models that may omit the quote.</p>
+            </div>
+
+            <div style="margin-top:12px">
+                <label for="mwt-int-capture-diagnostics"><input type="checkbox" id="mwt-int-capture-diagnostics" ${s.captureIntentionsDiagnostics === true ? 'checked' : ''}> Capture intentions generation diagnostics (temporary reporter tool)</label>
+                <p style="font-size:11px;color:var(--mwt-text-dim);margin-top:4px">When ON, the latest intentions generation — every constituent call's prompt and raw model response, the ledger before/after, and each accept/reject reason — is kept in memory ONLY (never saved to the chat or settings) and is cleared on chat switch and reload. It appears in the Diagnostics 📋 Copy Report only while that report's "include content" opt-in is checked. Leave OFF unless actively reporting an intentions issue.</p>
+            </div>
+
+            <div class="mwt-flex mwt-gap-4" style="margin-top:12px">
+                <button id="mwt-int-save-settings" class="mwt-btn mwt-btn-primary">Save Settings</button>
+            </div>
+        </div>
+    `;
+
+    // Show/hide the v2 cost dials based on the splitThoughts checkbox.
+    const splitCheckbox = panel.querySelector('#mwt-int-split-thoughts');
+    const v2Dials = panel.querySelector('#mwt-int-v2-dials');
+    splitCheckbox?.addEventListener('change', () => {
+        if (v2Dials) v2Dials.style.display = splitCheckbox.checked ? '' : 'none';
+    });
+
+    wireApiSettingsFields(panel, apiFieldOpts);
+    panel.querySelector('#mwt-int-save-settings')?.addEventListener('click', () => {
+        const apiValues = readApiSettingsValues(panel, apiFieldOpts);
+        const saved = saveSettings({
+            ...apiValues,
+            autoMode: panel.querySelector('#mwt-int-auto-mode')?.checked ?? true,
+            generateThoughts: panel.querySelector('#mwt-int-gen-thoughts')?.checked ?? true,
+            generateIntentions: panel.querySelector('#mwt-int-gen-intentions')?.checked ?? true,
+            splitThoughts: panel.querySelector('#mwt-int-split-thoughts')?.checked ?? false,
+            thoughtsConnectionProfileId: panel.querySelector('#mwt-int-thoughts-profile')?.value || '',
+            thoughtsInterval: Math.max(1, Number(panel.querySelector('#mwt-int-thoughts-interval')?.value) || 1),
+            thoughtsProfiledOnly: panel.querySelector('#mwt-int-thoughts-profiled-only')?.checked ?? false,
+            mode: panel.querySelector('#mwt-int-mode')?.value || 'batched',
+            maxNpcs: Number(panel.querySelector('#mwt-int-max-npcs')?.value) || 4,
+            messageWindow: Number(panel.querySelector('#mwt-int-window')?.value) || 8,
+            intentionGracePeriod: Math.max(0, Number(panel.querySelector('#mwt-int-grace')?.value) || 0),
+            maxNewIntentionsPerNpc: Math.max(0, Number(panel.querySelector('#mwt-int-max-new')?.value ?? 2) || 0),
+            dormantPollInterval: Math.max(1, Number(panel.querySelector('#mwt-int-dormant-poll')?.value) || 10),
+            lifecycleDedupTurns: Math.max(0, Number(panel.querySelector('#mwt-int-dedup-turns')?.value ?? 8) || 0),
+            intentionMaxTurnsOpen: Math.max(0, Number(panel.querySelector('#mwt-int-max-turns')?.value) || 0),
+            requireIntentionEvidence: panel.querySelector('#mwt-int-require-evidence')?.checked ?? false,
+            captureIntentionsDiagnostics: panel.querySelector('#mwt-int-capture-diagnostics')?.checked ?? false,
+        });
+        setIntStatus(saved ? 'Settings saved.' : 'Settings could not be saved.', saved ? 'success' : 'error');
+        renderContent();
+    });
+}
+
+// ─── Event wiring ────────────────────────────────────────────────────────────
+
+function wireEvents(el) {
+    // Settings toggle
+    el.querySelector('#mwt-int-show-settings')?.addEventListener('click', () => {
+        const panel = el.querySelector('#mwt-int-settings-panel');
+        if (panel) {
+            const isHidden = panel.style.display === 'none';
+            panel.style.display = isHidden ? 'block' : 'none';
+            if (isHidden) renderSettingsPanel();
+        }
+    });
+
+    // Generate now button
+    // A11Y-S3-03: the actual work lives in index.js (reached via the custom
+    // event below). That listener publishes triggerGenerate()'s promise on the
+    // shared detail object, so THIS handler still owns the button's busy pair —
+    // including the failure paths triggerGenerate reports through status.
+    const generateBtn = el.querySelector('#mwt-int-generate');
+    generateBtn?.addEventListener('click', async () => {
+        // Gate (world_state refresh pattern): a mid-generation renderContent()
+        // swaps in a fresh ENABLED twin — refuse the second concurrent start.
+        if (state.isGenerating) { setIntStatus('Already generating.', 'info'); return; }
+        setControlBusy(generateBtn, true);
+        try {
+            setIntStatus('Generating...', 'info');
+            const detail = { manual: true, promise: null };
+            document.dispatchEvent(new CustomEvent('mwt:interiority-generate', { detail }));
+            await detail.promise;
+        } catch (err) {
+            setIntStatus(`Error: ${err.message}`, 'error');
+        } finally {
+            // The tab can re-render mid-generation (the busy-changed listener
+            // repaints status); only restore a control that still exists.
+            if (generateBtn.isConnected) setControlBusy(generateBtn, false);
+        }
+    });
+
+    // Clear the "Generating..." status once the generation finishes.
+    // The generation path dispatches mwt:busy-changed when isGenerating flips
+    // false; we update the status pill so it doesn't read "Generating..." forever.
+    if (!state._busyListenerWired) {
+        state._busyListenerWired = true;
+        document.addEventListener('mwt:busy-changed', () => {
+            // Keep the LIVE Generate button in step across mid-generation
+            // re-renders: a fresh twin renders enabled while state.isGenerating
+            // is true (the markup now disables it at render time, and this
+            // re-enables whichever button is in the DOM when the run ends).
+            const liveBtn = getContentEl()?.querySelector('#mwt-int-generate');
+            if (liveBtn?.isConnected) setControlBusy(liveBtn, state.isGenerating);
+            if (!state.isGenerating) {
+                // Only clear if the status element still shows "Generating..."
+                const statusEl = getContentEl()?.querySelector('#mwt-int-status');
+                if (statusEl && statusEl.textContent === 'Generating...') {
+                    setIntStatus('Ready.', 'info');
+                }
+            }
+        });
+    }
+
+    // Clear ledger button
+    el.querySelector('#mwt-int-clear-ledger')?.addEventListener('click', () => {
+        if (isStorePausedForCurrentScope('interiority')) { setIntStatus('Interiority is paused for this chat.', 'error'); return; }
+        if (!confirm('Remove all ledger entries? This cannot be undone.')) return;
+        // Same tombstoning as the per-entry ✕ — a bulk clear that the next
+        // generation immediately undoes is worse than no button at all.
+        if (!removeLedgerEntries(getLedger().map(e => e.id), { tombstone: true })) {
+            setIntStatus('Ledger could not be cleared.', 'error');
+            return;
+        }
+        renderContent();
+        document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+    });
+
+    // Add intention button — show inline add form
+    el.querySelector('#mwt-int-add-btn')?.addEventListener('click', () => {
+        showInlineAddForm();
+    });
+
+    // Add form container event delegation (save / cancel)
+    el.querySelector('#mwt-int-add-form-container')?.addEventListener('click', (e) => {
+        const saveBtn = e.target.closest('.mwt-int-add-save-btn');
+        if (saveBtn) {
+            handleInlineAddSave();
+            return;
+        }
+        const cancelBtn = e.target.closest('.mwt-int-add-cancel-btn');
+        if (cancelBtn) {
+            cancelInlineAdd();
+            return;
+        }
+    });
+
+    // Inner-states list: edit / remove / save / cancel (event delegation)
+    el.querySelector('#mwt-int-inner-states-list')?.addEventListener('click', (e) => {
+        // Remove (clear) button
+        const removeBtn = e.target.closest('.mwt-int-state-remove-btn');
+        if (removeBtn) {
+            const npc = removeBtn.dataset.npc;
+            if (npc) {
+                const saved = setInnerState(npc, ''); // empty string clears the state
+                renderContent();
+                setIntStatus(saved ? 'Inner state cleared.' : 'Inner state could not be cleared.', saved ? 'success' : 'error');
+            }
+            return;
+        }
+
+        // Edit button — transform the entry into an inline edit form
+        const editBtn = e.target.closest('.mwt-int-state-edit-btn');
+        if (editBtn) {
+            const npc = editBtn.dataset.npc;
+            if (npc) {
+                showInnerStateEditForm(npc);
+            }
+            return;
+        }
+
+        // Save button (inside inline edit form)
+        const saveBtn = e.target.closest('.mwt-int-state-edit-save-btn');
+        if (saveBtn) {
+            const npc = saveBtn.dataset.npc;
+            if (npc) {
+                handleInnerStateEditSave(npc);
+            }
+            return;
+        }
+
+        // Cancel button (inside inline edit form)
+        const cancelBtn = e.target.closest('.mwt-int-state-edit-cancel-btn');
+        if (cancelBtn) {
+            renderContent();
+            return;
+        }
+    });
+
+    // Per-entry buttons for BOTH ledger lists (event delegation).
+    //
+    // The active and scheduled lists render the same entry shape and share
+    // every control except ⏰ (dormant only) and 💤 (active only) — those
+    // simply never appear in the other list, so one handler serves both.
+    // Keeping them on a single function stops the two lists from drifting
+    // apart (the scheduled list previously rendered an ✎ with no handler).
+    el.querySelector('#mwt-int-ledger-list')?.addEventListener('click', handleLedgerListClick);
+    el.querySelector('#mwt-int-dormant-list')?.addEventListener('click', handleLedgerListClick);
+
+    // Lifecycle v2: lifecycle-history actions (event delegation) — reopen a
+    // closure, or clear the whole audit trail.
+    el.querySelector('#mwt-int-lifecycle-list')?.addEventListener('click', (e) => {
+        if (isStorePausedForCurrentScope('interiority')) { setIntStatus('Interiority is paused for this chat.', 'error'); return; }
+        const reopenBtn = e.target.closest('.mwt-int-reopen-btn');
+        if (reopenBtn) {
+            const historyId = reopenBtn.dataset.hid;
+            if (historyId && reopenFromLifecycle(historyId)) {
+                setIntStatus('Plan reopened — active again as a user-owned intention.', 'success');
+                renderContent();
+                document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+            }
+            return;
+        }
+        if (e.target.closest('#mwt-int-clear-history')) {
+            if (!confirm('Clear the lifecycle history? Deletion tombstones are untouched. This cannot be undone.')) return;
+            const removed = clearLifecycleHistory();
+            if (removed === null) { setIntStatus('Lifecycle history could not be cleared.', 'error'); return; }
+            setIntStatus(`Cleared ${removed} lifecycle record(s).`, 'success');
+            renderContent();
+        }
+    });
+
+    // Lifecycle v2: per-NPC controls — privacy/pause toggles, cooldown/cap
+    // numbers, remove, and add-by-name. Changes commit immediately (the row
+    // reads back from the store, so an invalid number simply normalizes).
+    const controlsList = el.querySelector('#mwt-int-npc-controls-list');
+    if (controlsList) {
+        controlsList.addEventListener('change', (e) => {
+            if (isStorePausedForCurrentScope('interiority')) { setIntStatus('Interiority is paused for this chat.', 'error'); renderContent(); return; }
+            const target = e.target;
+            const npc = target.dataset?.npc;
+            if (!npc) return;
+            if (target.classList.contains('mwt-int-ctl-privacy')) {
+                if (!setNpcControl(npc, { privacyExcluded: target.checked })) { setIntStatus('Controls could not be saved.', 'error'); renderContent(); return; }
+                setIntStatus(`Privacy ${target.checked ? 'enabled' : 'disabled'} for ${npc}.`, 'success');
+            } else if (target.classList.contains('mwt-int-ctl-pause')) {
+                if (!setNpcControl(npc, { pauseNewProposals: target.checked })) { setIntStatus('Controls could not be saved.', 'error'); renderContent(); return; }
+                setIntStatus(`New proposals ${target.checked ? 'paused' : 'resumed'} for ${npc}.`, 'success');
+            } else if (target.classList.contains('mwt-int-ctl-cooldown')) {
+                if (!setNpcControl(npc, { cooldownTurns: Math.max(0, Number(target.value) || 0) })) { setIntStatus('Controls could not be saved.', 'error'); renderContent(); return; }
+            } else if (target.classList.contains('mwt-int-ctl-cap')) {
+                if (!setNpcControl(npc, { activeCap: Math.max(0, Number(target.value) || 0) })) { setIntStatus('Controls could not be saved.', 'error'); renderContent(); return; }
+            } else {
+                return;
+            }
+            renderContent();
+        });
+        controlsList.addEventListener('click', (e) => {
+            if (isStorePausedForCurrentScope('interiority')) { setIntStatus('Interiority is paused for this chat.', 'error'); return; }
+            const removeBtn = e.target.closest('.mwt-int-ctl-remove-btn');
+            if (removeBtn) {
+                const npc = removeBtn.dataset.npc;
+                if (npc) {
+                    if (!removeNpcControl(npc)) { setIntStatus('Controls could not be removed.', 'error'); return; }
+                    setIntStatus(`Controls removed for ${npc}.`, 'info');
+                    renderContent();
+                }
+            }
+        });
+    }
+
+    el.querySelector('#mwt-int-controls-add-btn')?.addEventListener('click', () => {
+        if (isStorePausedForCurrentScope('interiority')) { setIntStatus('Interiority is paused for this chat.', 'error'); return; }
+        const input = el.querySelector('#mwt-int-controls-add-name');
+        const npc = String(input?.value || '').trim();
+        if (!npc) {
+            setIntStatus('Enter an NPC name to add controls for.', 'error');
+            return;
+        }
+        if (!setNpcControl(npc, {})) { setIntStatus('Controls could not be saved.', 'error'); return; }
+        setIntStatus(`Controls added for ${npc}.`, 'success');
+        renderContent();
+    });
+}
+
+/**
+ * Shared click handler for the active and scheduled intention lists.
+ * @param {MouseEvent} e
+ */
+function handleLedgerListClick(e) {
+    if (isStorePausedForCurrentScope('interiority')) {
+        setIntStatus('Interiority is paused for this chat — no changes were saved.', 'error');
+        return;
+    }
+    // §20: Wake button (scheduled list) — flip a dormant intention to active.
+    // Lifecycle v2: routed through the tracked wrapper so the wake is audited.
+    const wakeBtn = e.target.closest('.mwt-int-wake-btn');
+    if (wakeBtn) {
+        const id = wakeBtn.dataset.id;
+        if (id) {
+            const grace = getSettings().intentionGracePeriod || 0;
+            if (!wakeLedgerEntryTracked(id, grace)) return;
+            setIntStatus('Intention woken — now active.', 'success');
+            renderContent();
+            document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+        }
+        return;
+    }
+
+    // Lifecycle v2 (spec §2): Mark done — the user asserts completion. Closes
+    // the occurrence and records it; a later re-proposal is only suppressed
+    // inside the dedup window (the permanent refusal remains the ✕ delete).
+    const doneBtn = e.target.closest('.mwt-int-done-btn');
+    if (doneBtn) {
+        const id = doneBtn.dataset.id;
+        if (id && markLedgerEntryDone(id)) {
+            setIntStatus('Intention marked done — recorded in the lifecycle history.', 'success');
+            renderContent();
+            document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+        }
+        return;
+    }
+
+    // Lifecycle v2 (spec §4): Dismiss — the in-world "no longer plausible" close.
+    const dismissBtn = e.target.closest('.mwt-int-dismiss-btn');
+    if (dismissBtn) {
+        const id = dismissBtn.dataset.id;
+        if (id && dismissLedgerEntry(id)) {
+            setIntStatus('Intention dismissed as no longer plausible.', 'success');
+            renderContent();
+            document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+        }
+        return;
+    }
+
+    // Lifecycle v2 (spec §2): Merge — keep this entry, close the flagged
+    // duplicate with a supersession link.
+    const mergeBtn = e.target.closest('.mwt-int-merge-btn');
+    if (mergeBtn) {
+        const keepId = mergeBtn.dataset.id;
+        const dropId = mergeBtn.dataset.other;
+        if (keepId && dropId && mergeLedgerEntries(keepId, dropId)) {
+            setIntStatus('Duplicate merged away — the kept intention is unchanged.', 'success');
+            renderContent();
+            document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+        }
+        return;
+    }
+
+    // §20: Sleep button (active list) — schedule a far-future intention.
+    // The scan classifies horizon at declaration and defaults to "immediate"
+    // when unsure, so a plan anchored days out often lands active. This is
+    // the manual correction: dormant entries leave the injection and the
+    // per-turn evaluation until their trigger is near.
+    // Lifecycle v2: routed through the tracked wrapper so the sleep is audited.
+    const sleepBtn = e.target.closest('.mwt-int-sleep-btn');
+    if (sleepBtn) {
+        const id = sleepBtn.dataset.id;
+        if (id) {
+            if (!sleepLedgerEntryTracked(id)) return;
+            setIntStatus('Intention scheduled — click ✎ to add a wake hint (the event to watch for).', 'success');
+            renderContent();
+            document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+        }
+        return;
+    }
+
+    // Remove button
+    const removeBtn = e.target.closest('.mwt-int-remove-btn');
+    if (removeBtn) {
+        const id = removeBtn.dataset.id;
+        if (id) {
+            // tombstone: this is the USER saying no. Without it the engine
+            // re-proposes the same intention next turn from unchanged story
+            // context, and a swipe restores it outright from the snapshot.
+            if (!removeLedgerEntries([id], { tombstone: true })) {
+                setIntStatus('Intention could not be removed.', 'error');
+                return;
+            }
+            renderContent();
+            document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+        }
+        return;
+    }
+
+    // Edit button — transform the entry into an inline edit form
+    const editBtn = e.target.closest('.mwt-int-edit-btn');
+    if (editBtn) {
+        const id = editBtn.dataset.id;
+        if (id) {
+            showInlineEditForm(id);
+        }
+        return;
+    }
+
+    // Save button (inside inline edit form)
+    const saveBtn = e.target.closest('.mwt-int-edit-save-btn');
+    if (saveBtn) {
+        const id = saveBtn.dataset.id;
+        if (id) {
+            handleInlineEditSave(id);
+        }
+        return;
+    }
+
+    // Cancel button (inside inline edit form)
+    const cancelBtn = e.target.closest('.mwt-int-edit-cancel-btn');
+    if (cancelBtn) {
+        const id = cancelBtn.dataset.id;
+        if (id) {
+            cancelInlineEdit(id);
+        }
+        return;
+    }
+}
+
+// ─── Inline edit form ────────────────────────────────────────────────────────
+
+/**
+ * Transform a ledger entry's display into an inline edit form.
+ * Replaces the entry-main + entry-meta with editable inputs.
+ * @param {string} id - ledger entry id
+ */
+function showInlineEditForm(id) {
+    const entryEl = findLedgerEntryEl(id);
+    if (!entryEl) return;
+
+    const ledger = getLedger();
+    const entry = ledger.find(e => e.id === id);
+    if (!entry) return;
+
+    const isDormant = entry.status === 'dormant';
+
+    entryEl.classList.add('mwt-int-ledger-entry--editing');
+    entryEl.innerHTML = `
+        <div class="mwt-int-edit-form">
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-npc-${escapeHtml(entry.id)}">NPC</label>
+                <input type="text" id="mwt-int-edit-npc-${escapeHtml(entry.id)}" class="mwt-input mwt-int-edit-npc" value="${escapeHtml(entry.npc)}" placeholder="NPC name">
+            </div>
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-action-${escapeHtml(entry.id)}">Action</label>
+                <input type="text" id="mwt-int-edit-action-${escapeHtml(entry.id)}" class="mwt-input mwt-int-edit-action" value="${escapeHtml(entry.action)}" placeholder="What the NPC plans to do">
+            </div>
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-trigger-${escapeHtml(entry.id)}">Trigger</label>
+                <input type="text" id="mwt-int-edit-trigger-${escapeHtml(entry.id)}" class="mwt-input mwt-int-edit-trigger" value="${escapeHtml(entry.trigger)}" placeholder="When/where the NPC will act">
+            </div>
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-priority-${escapeHtml(entry.id)}">Priority</label>
+                <select class="mwt-input mwt-int-edit-priority" id="mwt-int-edit-priority-${escapeHtml(entry.id)}">
+                    ${INTENTION_PRIORITIES.map(p => `<option value="${p}"${(entry.priority || 'normal') === p ? ' selected' : ''}>${p}</option>`).join('')}
+                </select>
+                <p class="mwt-int-edit-help">User-set urgency. Shown in the panel and in the narrator injection; never asked of the model.</p>
+            </div>
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-expireson-${escapeHtml(entry.id)}">No longer plausible once</label>
+                <input type="text" id="mwt-int-edit-expireson-${escapeHtml(entry.id)}" class="mwt-input mwt-int-edit-expireson" value="${escapeHtml(entry.expiresOn || '')}" placeholder="e.g. the harvest festival ends (blank = none)">
+                <p class="mwt-int-edit-help">In-world expiry: after this event/date the plan is no longer plausible. Surfaced to the intentions call so it can drop the plan with this recorded reason.</p>
+            </div>
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-expiresturn-${escapeHtml(entry.id)}">Expires after turns</label>
+                <input type="number" min="0" max="500" id="mwt-int-edit-expiresturn-${escapeHtml(entry.id)}" class="mwt-input mwt-int-edit-expiresturn" value="${entry.expiresTurn || ''}" placeholder="e.g. 12">
+                <p class="mwt-int-edit-help">Generation-turn expiry override for THIS entry. Blank/0 = none (the global max-turns setting still applies to engine entries).</p>
+            </div>
+            ${isDormant ? `
+            <div class="mwt-int-edit-row">
+                <label class="mwt-label" for="mwt-int-edit-wakehint-${escapeHtml(entry.id)}">Wake hint</label>
+                <input type="text" id="mwt-int-edit-wakehint-${escapeHtml(entry.id)}" class="mwt-input mwt-int-edit-wakehint" value="${escapeHtml(entry.wakeHint || '')}" placeholder="The event or date to watch for (e.g. harvest festival)">
+            </div>` : ''}
+            <div class="mwt-int-edit-actions">
+                <button class="mwt-btn mwt-btn-primary mwt-int-edit-save-btn" data-id="${escapeHtml(entry.id)}"><span aria-hidden="true">💾</span> Save</button>
+                <button class="mwt-btn mwt-int-edit-cancel-btn" data-id="${escapeHtml(entry.id)}"><span aria-hidden="true">✕</span> Cancel</button>
+            </div>
+        </div>
+    `;
+
+    // Focus the action field (most commonly edited) and select its text
+    const actionInput = entryEl.querySelector('.mwt-int-edit-action');
+    if (actionInput) {
+        actionInput.focus();
+        actionInput.select();
+    }
+
+    // Keyboard shortcuts: Enter to save, Escape to cancel
+    entryEl.querySelectorAll('.mwt-int-edit-npc, .mwt-int-edit-action, .mwt-int-edit-trigger, .mwt-int-edit-wakehint, .mwt-int-edit-expireson, .mwt-int-edit-expiresturn').forEach(input => {
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleInlineEditSave(id);
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelInlineEdit(id);
+            }
+        });
+    });
+}
+
+/**
+ * Handle Save from the inline edit form.
+ * Reads the input values, validates, updates the ledger entry, and re-renders.
+ * @param {string} id - ledger entry id
+ */
+function handleInlineEditSave(id) {
+    const entryEl = findLedgerEntryEl(id);
+    if (!entryEl) return;
+
+    const npc = entryEl.querySelector('.mwt-int-edit-npc')?.value?.trim() || '';
+    const action = entryEl.querySelector('.mwt-int-edit-action')?.value?.trim() || '';
+    const trigger = entryEl.querySelector('.mwt-int-edit-trigger')?.value?.trim() || '';
+
+    if (!npc || !action || !trigger) {
+        setIntStatus('NPC, Action, and Trigger are all required.', 'error');
+        return;
+    }
+
+    // Lifecycle v2 (spec §1): the optional priority/expiry fields ride the same
+    // update. Normalization lives in data.js's write seam ('' / 0 / unknown
+    // values CLEAR the field).
+    const priorityValue = entryEl.querySelector('.mwt-int-edit-priority')?.value ?? undefined;
+    const expiresOnValue = entryEl.querySelector('.mwt-int-edit-expireson')?.value ?? undefined;
+    const expiresTurnValue = entryEl.querySelector('.mwt-int-edit-expiresturn')?.value ?? undefined;
+    if (isStorePausedForCurrentScope('interiority')) {
+        setIntStatus('Interiority is paused for this chat — no changes were saved.', 'error');
+        return;
+    }
+    if (!updateLedgerEntry(id, {
+        npc, action, trigger,
+        priority: priorityValue,
+        expiresOn: expiresOnValue,
+        expiresTurn: expiresTurnValue,
+    })) { setIntStatus('Intention could not be saved.', 'error'); return; }
+
+    // §20: the wake-hint field only renders for dormant entries. Persist it
+    // via setLedgerEntryDormant, which owns the dormant fields (updateLedgerEntry
+    // deliberately restricts itself to the four user-editable core fields).
+    const wakeHintInput = entryEl.querySelector('.mwt-int-edit-wakehint');
+    if (wakeHintInput) {
+        if (!setLedgerEntryDormant(id, wakeHintInput.value.trim())) {
+            setIntStatus('Wake hint could not be saved.', 'error'); return;
+        }
+    }
+
+    setIntStatus('Intention updated.', 'success');
+    renderContent();
+    document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+}
+
+/**
+ * Find a ledger entry's DOM element by id, in whichever list it lives —
+ * active (`#mwt-int-ledger-list`) or scheduled (`#mwt-int-dormant-list`).
+ *
+ * Scoped to the two lists rather than the whole panel so the inline ADD form
+ * (which reuses `.mwt-int-ledger-entry` but carries no data-id) can never match.
+ *
+ * @param {string} id - ledger entry id
+ * @returns {HTMLElement|null}
+ */
+function findLedgerEntryEl(id) {
+    const root = getContentEl();
+    if (!root) return null;
+    const sel = `.mwt-int-ledger-entry[data-id="${CSS.escape(id)}"]`;
+    return root.querySelector(`#mwt-int-ledger-list ${sel}, #mwt-int-dormant-list ${sel}`);
+}
+
+/**
+ * Cancel the inline edit — re-render to restore the display view.
+ * @param {string} id - ledger entry id
+ */
+function cancelInlineEdit(_id) {
+    renderContent();
+}
+
+// ─── Inline add form (user-authored intentions) ──────────────────────────────
+
+/**
+ * Show the inline add form below the ledger list.
+ * Hides the "Add Intention" button while the form is open.
+ */
+function showInlineAddForm() {
+    const container = getContentEl()?.querySelector('#mwt-int-add-form-container');
+    const addBtn = getContentEl()?.querySelector('#mwt-int-add-btn');
+    if (!container) return;
+
+    if (addBtn) addBtn.style.display = 'none';
+
+    container.innerHTML = `
+        <div class="mwt-int-ledger-entry mwt-int-ledger-entry--editing">
+            <div class="mwt-int-edit-form">
+                <div class="mwt-int-edit-row">
+                    <label class="mwt-label" for="mwt-int-add-npc">NPC</label>
+                    <input type="text" id="mwt-int-add-npc" class="mwt-input mwt-int-add-npc" placeholder="NPC name">
+                </div>
+                <div class="mwt-int-edit-row">
+                    <label class="mwt-label" for="mwt-int-add-action">Action</label>
+                    <input type="text" id="mwt-int-add-action" class="mwt-input mwt-int-add-action" placeholder="What the NPC plans to do">
+                </div>
+                <div class="mwt-int-edit-row">
+                    <label class="mwt-label" for="mwt-int-add-trigger">Trigger</label>
+                    <input type="text" id="mwt-int-add-trigger" class="mwt-input mwt-int-add-trigger" placeholder="When/where the NPC will act">
+                </div>
+                <div class="mwt-int-edit-actions">
+                    <button class="mwt-btn mwt-btn-primary mwt-int-add-save-btn">💾 Add</button>
+                    <button class="mwt-btn mwt-int-add-cancel-btn">✕ Cancel</button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    // Focus the NPC field first
+    const npcInput = container.querySelector('.mwt-int-add-npc');
+    if (npcInput) npcInput.focus();
+
+    // Keyboard shortcuts: Enter to save, Escape to cancel
+    container.querySelectorAll('.mwt-int-add-npc, .mwt-int-add-action, .mwt-int-add-trigger').forEach(input => {
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleInlineAddSave();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelInlineAdd();
+            }
+        });
+    });
+}
+
+/**
+ * Handle Save from the inline add form.
+ * Reads the input values, validates, adds a manual ledger entry, and re-renders.
+ */
+function handleInlineAddSave() {
+    const container = getContentEl()?.querySelector('#mwt-int-add-form-container');
+    if (!container) return;
+
+    const npc = container.querySelector('.mwt-int-add-npc')?.value?.trim() || '';
+    const action = container.querySelector('.mwt-int-add-action')?.value?.trim() || '';
+    const trigger = container.querySelector('.mwt-int-add-trigger')?.value?.trim() || '';
+
+    if (!npc || !action || !trigger) {
+        setIntStatus('NPC, Action, and Trigger are all required.', 'error');
+        return;
+    }
+
+    // Dedup check — same as engine-generated entries
+    if (hasDuplicateIntention(npc, action, trigger)) {
+        setIntStatus('An identical intention already exists in the ledger.', 'error');
+        return;
+    }
+
+    if (isStorePausedForCurrentScope('interiority') || !addManualLedgerEntry({ npc, action, trigger })) {
+        setIntStatus('Manual intention could not be saved.', 'error'); return;
+    }
+    setIntStatus('Manual intention added.', 'success');
+    renderContent();
+    document.dispatchEvent(new CustomEvent('mwt:interiority-ledger-changed'));
+}
+
+/**
+ * Cancel the inline add form — re-render to restore the button.
+ */
+function cancelInlineAdd() {
+    renderContent();
+}
+
+// ─── Per-message thought display (§9) ────────────────────────────────────────
+
+/**
+ * Render the thought block into the message DOM.
+ *
+ * This injects a display element into the message's DOM element — NEVER
+ * into msg.mes. The thoughts are not part of chat history and are never
+ * seen by the narrator model.
+ *
+ * @param {number} msgIdx - chat-array index of the message
+ * @param {string|null} [msgKey=null] - the message's stable perMessage key,
+ *   for callers that already know it. renderAllThoughtBlocks() resolves
+ *   key → index up front and hands the key back through here; re-resolving
+ *   via getMsgKeyForIndex() would re-scan the whole chat per message (its
+ *   duplicate-stamp check is O(chat)), making an all-keys render
+ *   O(keys × chat). Omitted/null → resolved from the index as before.
+ */
+export function renderThoughtBlockForMessage(msgIdx, msgKey = null) {
+    // Resolve the stable perMessage key for this index, then look up the data.
+    // perMessage is keyed by UUID (mu-*) or send_date (sd-*), so the lookup
+    // survives chat shifts. Callers that already hold the key (the
+    // renderAllThoughtBlocks loop) pass it in to skip the re-resolve.
+    const key = msgKey ?? getMsgKeyForIndex(msgIdx);
+
+    // INTERIORITY-01: Find the message element and remove any existing thought
+    // block BEFORE checking perMessage metadata. If a swipe/edit/empty-
+    // regeneration left stale metadata, the old block must be cleaned up
+    // regardless of whether new data exists to render. Returning early (as the
+    // old code did) left the stale private-state UI visible on the changed
+    // message.
+    const chat = document.getElementById('chat');
+    if (!chat) return;
+    const msgEl = chat.querySelector(`.mes[mesid="${msgIdx}"]`);
+    if (!msgEl) return;
+    const existing = msgEl.querySelector('.mwt-int-msg-thoughts');
+    if (existing) existing.remove();
+
+    if (!key) return;
+    const pm = getPerMessage(key);
+    if (!pm || !pm.reactions || pm.reactions.length === 0) return;
+
+    // Build the thought block
+    const block = document.createElement('div');
+    block.className = 'mwt-int-msg-thoughts';
+    block.innerHTML = pm.reactions.map(r => {
+        const typeTag = r.type && r.type !== 'reaction'
+            ? `<span class="mwt-int-msg-thought-type">${escapeHtml(r.type)}</span>`
+            : '';
+        const stateTag = r.innerState
+            ? `<span class="mwt-int-msg-thought-state" title="Inner state"><span aria-hidden="true">⟶</span> ${escapeHtml(r.innerState)}</span>`
+            : '';
+        return `
+        <div class="mwt-int-msg-thought">
+            <span class="mwt-int-msg-thought-npc">${escapeHtml(r.npc)}</span>
+            ${typeTag}
+            <span class="mwt-int-msg-thought-text">💭 ${escapeHtml(r.thought)}</span>
+            ${stateTag}
+        </div>
+    `;}).join('');
+
+    // Insert after the message text, before any existing elements
+    const mesText = msgEl.querySelector('.mes_text');
+    if (mesText && mesText.nextSibling) {
+        mesText.parentNode.insertBefore(block, mesText.nextSibling);
+    } else if (mesText) {
+        mesText.parentNode.appendChild(block);
+    } else {
+        msgEl.appendChild(block);
+    }
+}
+
+/**
+ * Re-render all thought blocks for the current chat.
+ * Called on CHAT_CHANGED.
+ *
+ * Iterates over stable perMessage keys, resolves each to its current
+ * chat-array index via buildKeyToIndexMap(), and renders the thought
+ * block on the matching DOM element — passing the key through so the
+ * per-message render doesn't re-resolve it. Thoughts whose messages have
+ * been removed entirely (not in the chat array) are silently skipped.
+ */
+export function renderAllThoughtBlocks() {
+    const keys = getPerMessageKeys();
+    const keyToIndex = buildKeyToIndexMap();
+    for (const key of keys) {
+        const idx = keyToIndex.get(key);
+        if (idx != null) {
+            // Hand the key this loop already resolved back to the renderer —
+            // letting it re-resolve per message would re-scan the chat (the
+            // duplicate-stamp check in getMsgKeyForIndex) for every key,
+            // O(keys × chat) per render.
+            renderThoughtBlockForMessage(idx, key);
+        }
+    }
+}
+
+/**
+ * Remove all thought blocks from the DOM.
+ * Called before re-rendering or when the module is disabled.
+ */
+export function clearAllThoughtBlocks() {
+    document.querySelectorAll('.mwt-int-msg-thoughts').forEach(el => el.remove());
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function getContentEl() {
+    if (state.contentEl) return state.contentEl;
+    if (!state.modal) return null;
+    state.contentEl = state.modal.querySelector('.mwt-tab-content[data-tab="interiority"]')
+        ?? state.modal.querySelector('#mwt-int-content')?.closest('.mwt-tab-content');
+    return state.contentEl;
+}
+
+export function setIntStatus(text, type = 'info') {
+    const el = getContentEl();
+    if (!el) return;
+    const statusEl = el.querySelector('#mwt-int-status');
+    if (statusEl) {
+        // Shared live-region contract (a11y plan §4.4, the setStatus()
+        // precedent): the template ships the semantics and every write
+        // re-stamps them, so re-rendered or legacy shells inherit them too —
+        // generation, completion, and error messages are announced exactly
+        // once. The className assignment below never strips these attributes.
+        statusEl.setAttribute?.('role', 'status');
+        statusEl.setAttribute?.('aria-live', 'polite');
+        statusEl.setAttribute?.('aria-atomic', 'true');
+        statusEl.textContent = text || '';
+        statusEl.className = `mwt-int-status mwt-int-status--${type}`;
+    }
+}

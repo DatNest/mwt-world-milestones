@@ -1,0 +1,653 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   Interiority Module Styles (.mwt-int-*)
+   Tab layout, status, intentions ledger, inline edit, manual entries,
+   recent thoughts, per-message thought display (injected into chat DOM).
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ─── Interiority tab layout ─────────────────────────────────────────────── */
+
+.mwt-interiority-tab {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mwt-interiority-tab h3 {
+    margin: 16px 0 4px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--mwt-text);
+}
+
+.mwt-int-disclosure {
+    border-top: 1px solid var(--mwt-border);
+    padding: 12px 0 4px;
+}
+
+.mwt-int-disclosure:last-child { border-bottom: 1px solid var(--mwt-border); }
+
+.mwt-int-disclosure summary {
+    cursor: pointer;
+    color: var(--mwt-text);
+    font-size: 14px;
+    font-weight: 600;
+    padding: 2px 0;
+}
+
+.mwt-int-disclosure summary:focus-visible {
+    outline: 2px solid var(--mwt-accent);
+    outline-offset: 3px;
+}
+
+.mwt-int-disclosure[open] summary { margin-bottom: 8px; }
+
+/* ─── Status messages ────────────────────────────────────────────────────── */
+
+.mwt-int-status {
+    min-height: 20px;
+    font-size: 12px;
+    margin-bottom: 8px;
+}
+
+.mwt-int-status--info    { color: var(--mwt-info); }
+.mwt-int-status--success { color: var(--mwt-success); }
+.mwt-int-status--error   { color: var(--mwt-error); }
+
+/* ─── Intentions ledger entries ──────────────────────────────────────────── */
+
+.mwt-int-ledger-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* The entry is [ npc → action → trigger ] on the left and [ since · turns ·
+   buttons ] on the right.  The meta block used to be flex-shrink:0, so on a
+   narrow container it held its full ~290px while the main block — flex-basis
+   0 — was crushed to its min-content width, i.e. the single longest word.
+   The action rendered one word per line and the row still overflowed
+   horizontally.  Wrapping here, plus a real flex-basis on the main block,
+   drops the meta to its own row instead: main gets the full width and the
+   meta right-aligns underneath via its margin-left:auto.  Above ~560px of
+   entry width both still fit on one row, so this is a no-op at desktop
+   widths — verified byte-identical box geometry at 1280. */
+.mwt-int-ledger-entry {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    font-size: 13px;
+}
+
+.mwt-int-ledger-entry-main {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    /* basis, not 0: below this the meta wraps rather than crushing the text */
+    flex: 1 1 240px;
+    min-width: 0;
+}
+
+.mwt-int-ledger-npc {
+    font-weight: 600;
+    color: var(--mwt-accent);
+}
+
+.mwt-int-arrow {
+    color: var(--mwt-text-dim);
+    font-size: 12px;
+}
+
+.mwt-int-ledger-action {
+    color: var(--mwt-text);
+}
+
+.mwt-int-ledger-trigger {
+    color: var(--mwt-text-dim);
+    font-style: italic;
+}
+
+.mwt-int-ledger-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 11px;
+    /* Deliberately shrinkable — no flex-shrink:0 here.  That used to protect
+       the buttons, but it also pinned the block at its ~290px max-content
+       width, which still overflowed a ~320px screen even once it had a row to
+       itself.  The buttons are protected individually below instead, so this
+       block can narrow and let its own children wrap.
+       margin-left:auto keeps it right-aligned both inline and on its own
+       wrapped row (the parent's justify-content can't reach a wrapped line). */
+    margin-left: auto;
+}
+
+.mwt-int-ledger-meta > button {
+    flex-shrink: 0;
+}
+
+.mwt-int-remove-btn {
+    background: none;
+    border: none;
+    color: var(--mwt-text-dim);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all var(--mwt-transition);
+}
+
+.mwt-int-remove-btn:hover {
+    color: var(--mwt-error);
+    background: rgba(239, 83, 80, 0.15);
+}
+
+/* Small icon buttons for ledger actions */
+.mwt-btn-sm {
+    background: none;
+    border: none;
+    color: var(--mwt-text-dim);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all var(--mwt-transition);
+}
+
+.mwt-int-edit-btn:hover {
+    color: var(--mwt-accent);
+    background: rgba(74, 158, 255, 0.15);
+}
+
+/* ─── Inline edit form (ledger entry editing state) ──────────────────────── */
+
+.mwt-int-ledger-entry--editing {
+    display: block;
+    flex-direction: column;
+    padding: 12px;
+    border-color: var(--mwt-accent);
+    background: var(--mwt-bg-lighter);
+}
+
+.mwt-int-edit-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mwt-int-edit-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.mwt-int-edit-row .mwt-input {
+    font-size: 13px;
+    padding: 6px 10px;
+}
+
+/* Slice 4 (a11y plan §4.4): visible help for the three edit-form fields whose
+   explanations used to be tooltip-only. Same visual language as the help
+   paragraphs used across the module's settings panel. */
+.mwt-int-edit-help {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    margin: 0;
+}
+
+.mwt-int-edit-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.mwt-int-edit-actions .mwt-btn {
+    font-size: 12px;
+    padding: 4px 12px;
+}
+
+/* ─── Manual entry indicator ─────────────────────────────────────────────── */
+
+.mwt-int-ledger-entry--manual {
+    border-left: 3px solid var(--mwt-warning, #ff9800);
+}
+
+.mwt-int-manual-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    margin-left: 4px;
+    cursor: help;
+    opacity: 0.7;
+}
+
+/* ─── Lifecycle v2: priority / conflict / expiry badges ──────────────────── */
+
+.mwt-int-priority-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    margin-left: 6px;
+    border-radius: 8px;
+    border: 1px solid var(--mwt-border);
+    white-space: nowrap;
+}
+
+.mwt-int-priority--urgent {
+    color: var(--mwt-error, #e5484d);
+    border-color: var(--mwt-error, #e5484d);
+}
+
+.mwt-int-priority--high {
+    color: var(--mwt-warning, #ff9800);
+    border-color: var(--mwt-warning, #ff9800);
+}
+
+.mwt-int-priority--low {
+    color: var(--mwt-text-dim, #888);
+    opacity: 0.8;
+}
+
+.mwt-int-conflict-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    margin-left: 6px;
+    border-radius: 8px;
+    white-space: nowrap;
+}
+
+.mwt-int-conflict-badge--occasion {
+    color: var(--mwt-warning, #ff9800);
+    border: 1px dashed var(--mwt-warning, #ff9800);
+    cursor: help;
+}
+
+button.mwt-int-conflict-badge {
+    color: var(--mwt-warning, #ff9800);
+    border: 1px solid var(--mwt-warning, #ff9800);
+    cursor: pointer;
+    background: transparent;
+}
+
+.mwt-int-expiry-note {
+    font-size: 11px;
+    color: var(--mwt-text-dim, #888);
+    cursor: help;
+}
+
+/* ─── Lifecycle v2: history list ─────────────────────────────────────────── */
+
+.mwt-int-lifecycle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.mwt-int-lifecycle-entry {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+}
+
+.mwt-int-lifecycle-outcome {
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.mwt-int-lifecycle--completed .mwt-int-lifecycle-outcome { color: var(--mwt-success, #46a758); }
+.mwt-int-lifecycle--dropped     .mwt-int-lifecycle-outcome { color: var(--mwt-text-dim, #888); }
+.mwt-int-lifecycle--expired     .mwt-int-lifecycle-outcome { color: var(--mwt-warning, #ff9800); }
+.mwt-int-lifecycle--merged      .mwt-int-lifecycle-outcome { color: var(--mwt-info, #71a7ff); }
+.mwt-int-lifecycle--reopened    .mwt-int-lifecycle-outcome { color: var(--mwt-info, #71a7ff); }
+.mwt-int-lifecycle--slept       .mwt-int-lifecycle-outcome { color: var(--mwt-text-dim, #888); }
+.mwt-int-lifecycle--woken       .mwt-int-lifecycle-outcome { color: var(--mwt-info, #71a7ff); }
+
+.mwt-int-lifecycle-source {
+    font-size: 10px;
+    color: var(--mwt-text-dim, #888);
+    margin-left: 4px;
+}
+
+.mwt-int-lifecycle-reason {
+    font-size: 11px;
+    color: var(--mwt-text-dim, #888);
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ─── Lifecycle v2: per-NPC controls ─────────────────────────────────────── */
+
+.mwt-int-controls-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.mwt-int-controls-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+}
+
+.mwt-int-controls-row--readonly {
+    opacity: 0.75;
+}
+
+/* Slice 4 follow-up (a11y plan §4.4): each NPC's controls now group in a
+   <fieldset> named by its NPC through aria-labelledby — row context without
+   repeating the name in every label. The name line keeps its ordinary
+   .mwt-int-ledger-entry-main styling and stays a flex item, so the row still
+   reads name-left / dials-right. (A <legend> would not: the rendered legend
+   sits outside the fieldset's anonymous content box, so it takes no part in
+   the flex layout and stacks above the dials.)
+
+   Only the fieldset's own user-agent chrome needs resetting — border, padding
+   and background already come from .mwt-int-controls-row above; margin and
+   the min-width: min-content default do not. */
+fieldset.mwt-int-controls-row {
+    margin: 0;
+    min-width: 0;
+}
+
+.mwt-int-controls-fields {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--mwt-text-dim, #888);
+}
+
+.mwt-int-controls-fields label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+}
+
+/* Slice 4 (a11y plan §4.4 / §5 Slice 4 item 3): the per-NPC control dial
+   explanations used to be tooltip-only titles. They now live in four
+   persistent snippets rendered ONCE under the list (not a combined paragraph
+   per row), each referenced via aria-describedby from exactly its own dial,
+   so keyboard and screen-reader users get them reliably and one at a
+   time. */
+.mwt-int-ctl-help-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 12px;
+}
+
+.mwt-int-ctl-help {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    margin: 0;
+    white-space: normal;
+}
+
+/* ─── Recent thoughts list ───────────────────────────────────────────────── */
+
+.mwt-int-thoughts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mwt-int-thought-entry {
+    padding: 10px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-left: 3px solid var(--mwt-accent);
+    border-radius: var(--mwt-radius);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mwt-int-thought-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.mwt-int-thought-npc {
+    font-weight: 600;
+    color: var(--mwt-accent);
+    font-size: 13px;
+}
+
+.mwt-int-thought-msg {
+    font-size: 10px;
+    color: var(--mwt-text-dim);
+    font-family: var(--mwt-font-mono);
+}
+
+.mwt-int-thought-re {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    font-style: italic;
+}
+
+.mwt-int-thought-type {
+    font-size: 10px;
+    color: var(--mwt-text-dim);
+    background: var(--mwt-bg-lighter, rgba(128, 128, 128, 0.15));
+    border: 1px solid var(--mwt-border);
+    border-radius: 8px;
+    padding: 1px 6px;
+    text-transform: lowercase;
+    letter-spacing: 0.02em;
+}
+
+.mwt-int-thought-state {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    border-top: 1px dashed var(--mwt-border);
+    padding-top: 4px;
+    margin-top: 2px;
+    line-height: 1.4;
+}
+
+.mwt-int-thought-text {
+    font-size: 13px;
+    color: var(--mwt-text);
+    line-height: 1.5;
+}
+
+/* ─── Inner states list (v2 §18) ────────────────────────────────────────── */
+
+.mwt-int-inner-states-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* Same shape as .mwt-int-ledger-entry (it reuses .mwt-int-ledger-meta), so it
+   needs the same wrap treatment — see the note there. */
+.mwt-int-inner-state-entry {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-left: 3px solid #b88ce0;
+    border-radius: var(--mwt-radius);
+    font-size: 13px;
+}
+
+.mwt-int-inner-state-main {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    flex: 1 1 240px;
+    min-width: 0;
+}
+
+.mwt-int-inner-state-npc {
+    font-weight: 600;
+    color: #b88ce0;
+}
+
+.mwt-int-inner-state-line {
+    color: var(--mwt-text);
+    font-style: italic;
+    line-height: 1.4;
+}
+
+.mwt-int-state-edit-btn:hover {
+    color: var(--mwt-accent);
+    background: rgba(74, 158, 255, 0.15);
+}
+
+.mwt-int-state-remove-btn:hover {
+    color: var(--mwt-error);
+    background: rgba(239, 83, 80, 0.15);
+}
+
+/* ─── Dormant entries (v2 §20 — scheduled intentions) ───────────────────── */
+
+.mwt-int-ledger-entry--dormant {
+    border-left: 3px solid var(--mwt-warning, #ff9800);
+    opacity: 0.85;
+}
+
+.mwt-int-dormant-hint {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    margin-left: 4px;
+    color: var(--mwt-warning, #ff9800);
+    cursor: help;
+    opacity: 0.9;
+}
+
+.mwt-int-wake-btn {
+    background: none;
+    border: none;
+    color: var(--mwt-warning, #ff9800);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all var(--mwt-transition);
+}
+
+.mwt-int-wake-btn:hover {
+    color: var(--mwt-accent);
+    background: rgba(255, 152, 0, 0.15);
+}
+
+/* Sleep (💤) is the wake button's inverse: it lives in the ACTIVE list and
+   sends an entry to the scheduled list. Rendered dim — it's a de-escalation —
+   and hovers to the warning colour the entry will take on once scheduled. */
+.mwt-int-sleep-btn {
+    background: none;
+    border: none;
+    color: var(--mwt-text-dim);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all var(--mwt-transition);
+}
+
+.mwt-int-sleep-btn:hover {
+    color: var(--mwt-warning, #ff9800);
+    background: rgba(255, 152, 0, 0.15);
+}
+
+/* ─── Per-message thought display (injected into chat DOM) ───────────────── */
+
+.mwt-int-msg-thoughts {
+    margin: 8px 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* Same crush as the ledger rows, but in the chat rather than the modal: the
+   npc name, type pill and state pill are all flex-shrink:0, so on a ~335px
+   message they held 161px between them and left the thought text — the thing
+   being read — only 130px, four words wide.  Wrapping lets the text take a
+   full row of its own once the four don't fit; it stays inline when they do. */
+.mwt-int-msg-thought {
+    padding: 6px 12px;
+    background: rgba(138, 43, 226, 0.08);
+    border-left: 3px solid rgba(138, 43, 226, 0.5);
+    border-radius: 0 var(--mwt-radius) var(--mwt-radius) 0;
+    font-size: 12px;
+    line-height: 1.4;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: baseline;
+    color: var(--mwt-text);
+}
+
+.mwt-int-msg-thought-npc {
+    font-weight: 600;
+    color: #b88ce0;
+    flex-shrink: 0;
+}
+
+.mwt-int-msg-thought-text {
+    /* basis, not auto: below this the text claims its own row rather than
+       being squeezed between the name and the two pills */
+    flex: 1 1 200px;
+    min-width: 0;
+    color: var(--mwt-text);
+    opacity: 0.85;
+}
+
+.mwt-int-msg-thought-type {
+    font-size: 9px;
+    color: var(--mwt-text-dim);
+    background: rgba(138, 43, 226, 0.15);
+    border-radius: 6px;
+    padding: 0 5px;
+    text-transform: lowercase;
+    flex-shrink: 0;
+    align-self: center;
+}
+
+.mwt-int-msg-thought-state {
+    font-size: 10px;
+    color: var(--mwt-text-dim);
+    opacity: 0.8;
+    font-style: italic;
+    flex-shrink: 0;
+    align-self: center;
+}

@@ -1,0 +1,163 @@
+/**
+ * knowledge/state.js — Shared constants and mutable state for the Knowledge module.
+ *
+ * All sub-modules import from here to read/write shared runtime state.
+ * Constants that are used across multiple sub-files live here too.
+ */
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+export const SETTINGS_KEY = 'mwt_knowledge';
+export const LOREBOOK_NAME = 'Knowledge Tracker';
+export const STATE_LOREBOOK_NAME = 'State Tracker';
+export const TRACKER_SENTINEL = '[Tracker]';
+export const REGISTRY_KEY = 'knowledge_tracker_registry';
+export const STATE_REGISTRY_KEY = 'state_tracker_registry';
+export const RELATIONSHIP_KEY = 'knowledge_tracker_relationships';
+export const HISTORY_KEY_PREFIX = 'kt_history_';
+
+/** Chat-metadata key for NPC growth evidence files (two-tier: raw + consolidated). */
+export const GROWTH_EVIDENCE_KEY = 'knowledge_growth_evidence';
+
+/** Name of the separate, non-injected lorebook that holds NPC growth profiles.
+ *  Entries use `key: []` (no keywords) so ST's world-info never injects them. */
+export const PROFILE_LOREBOOK_NAME = 'NPC Profiles';
+export const RELATIONSHIP_TYPES = [
+    'ally', 'enemy', 'neutral', 'friend', 'rival', 'family', 'lover',
+    'subordinate', 'superior', 'acquaintance', 'mentor', 'student',
+    'employer', 'employee',
+];
+
+/** How an NPC currently regards {{user}}, ordered warmest → most adversarial.
+ *  Distinct from RELATIONSHIP_TYPES, which are structural ("employer") and say
+ *  nothing about current disposition. Presets gate NPC yielding on this. */
+export const USER_STANCES = ['caring', 'friendly', 'neutral', 'wary', 'hostile'];
+
+export const RELATIONSHIP_BLOCK_START = '<!-- mwt:relationships:start -->';
+export const RELATIONSHIP_BLOCK_END = '<!-- mwt:relationships:end -->';
+
+/** Chat-metadata key for persisting auto-trigger counters per chat. */
+export const COUNTERS_META_KEY = 'knowledge_tracker_counters';
+
+// ─── Shared mutable state ────────────────────────────────────────────────────
+
+export const state = {
+    /** @type {HTMLElement|null} Parent modal element */
+    modal: null,
+    /** @type {HTMLElement|null} Cached knowledge-tab content element */
+    npcsContentEl: null,
+    /** @type {HTMLElement|null} Cached state content element (same as npcsContentEl after merge) */
+    stateContentEl: null,
+
+    /** Active sub-tab: 'staging' | 'minor' | 'major' | 'state' | 'relationships' */
+    activeSubTab: 'staging',
+    /** Relationship sub-tab view mode: 'graph' | 'list' */
+    relViewMode: 'graph',
+    /** Relationship sub-tab edge filters (a11y plan §4.6, Slice 5 item 5):
+     *  NPC name and/or relationship type; '' = not filtered. Applied by
+     *  filterRelationshipEdges() in render.js to the ONE edge set shared by
+     *  the Graph and List views. Session state, not persisted — cleared on
+     *  chat change (both sweeps) and on a Knowledge scope change, because a
+     *  filter references the previous chat's/book's NPC and type universe. */
+    relFilterNpc: '',
+    relFilterType: '',
+    /** Last text computed for the #kt-rel-filter-summary live region.
+     *  renderRelationshipContent writes it; renderNpcsSubTab defers it into
+     *  the initially-empty region one task later so the change is ANNOUNCED
+     *  rather than silently redrawn (a node inserted already populated is
+     *  not required to be announced). */
+    _relFilterSummaryText: '',
+    /** Whether the "Stances toward {{user}}" list is expanded. Collapsed by
+     *  default: with a large NPC cast the per-NPC stance rows otherwise push
+     *  the graph/edge list far down the tab. */
+    relStancesExpanded: false,
+    /** Whether the "Recent Changes" list is expanded. Collapsed by default —
+     *  the completion toast already names the changes; the panel is review. */
+    relChangesExpanded: false,
+    /** Session-scoped log of recent relationship changes (newest first),
+     *  maintained by knowledge/relationships.js recordRelationshipChanges().
+     *  NOT persisted — see the note there. */
+    relRecentChanges: [],
+    /** Cached graph layout data for drag interactions */
+    _graphData: null,
+    /** Current staging proposals */
+    stagingItems: [],
+    /** ID of the currently selected staging item */
+    activeItemId: null,
+
+    // ── Notification panel state ──
+    notificationEntries: {},
+    notifActiveId: null,
+
+    // ── Growth evidence badge state ──
+    // Incremented when continuous capture adds new observations in the
+    // background. Reset to 0 when the user opens any Growth Profile modal.
+    // Drives the floating-button pulse so the user is drawn back to review
+    // new evidence even when the MWT modal is closed.
+    unreadGrowthEvidenceCount: 0,
+
+    // ── Runtime state ──
+    messageCounter: 0,
+    npcMessageCounter: 0,
+    /** Counter for continuous growth evidence capture (Part A). Fires on a
+     *  separate cadence from npcMessageCounter so users can tune it. */
+    growthMessageCounter: 0,
+    /** Counter for automatic relationship extraction. Fires on its own cadence
+     *  so the relationship graph + stances stay current without manual entry. */
+    relationshipMessageCounter: 0,
+    /** Last observed chat length, used by onMessageDeleted to compute how many
+     *  messages were removed during bulk deletes (e.g. "delete above/below"). */
+    lastChatLength: 0,
+    /** Counted receipt events by stable message identity and cadence. */
+    countedReceiptEvents: new Map(),
+    isRunning: false,
+    trackerQueue: Promise.resolve(),
+
+    // ── Token tracking ──
+    _cachedTokenCount: 0,
+    _refreshingTokens: false,
+
+    // ── Status persistence ──
+    _lastKtStatusMsg: '',
+    _lastKtStatusLevel: '',
+
+    /** ST's world-info module (loaded as a side-effect in lorebook.js).
+     *  Tri-state: `undefined` = not yet attempted; an object = loaded;
+     *  `null` = attempted and failed. store.js's getWiScript() uses this
+     *  to decide whether to attempt its own fallback import. */
+    wiScript: undefined,
+};
+
+// ─── Content helpers (used by settings.js and render.js) ─────────────────────
+
+export function getNpcsContentEl() {
+    if (state.npcsContentEl) return state.npcsContentEl;
+    if (!state.modal) return null;
+    state.npcsContentEl = state.modal.querySelector('.mwt-tab-content[data-tab="knowledge"]')
+        ?? state.modal.querySelector('#mwt-kt-npcs-content')?.closest('.mwt-tab-content');
+    return state.npcsContentEl;
+}
+
+export function getStateContentEl() {
+    return getNpcsContentEl();
+}
+
+export function ktSetStatus(text, type = 'info') {
+    state._lastKtStatusMsg = text || '';
+    state._lastKtStatusLevel = type || 'info';
+    const el = getNpcsContentEl();
+    if (!el) return;
+    const statusEl = el.querySelector('#kt-status');
+    if (statusEl) {
+        // Same polite-live-region contract as setStatus() (accessibility
+        // plan §4.4): the Knowledge tab renders #kt-status in its own markup
+        // (render.js), not createModal's template, so stamp the semantics
+        // here too — attributes first, then the text change, so screen
+        // readers announce the new message exactly once.
+        statusEl.setAttribute?.('role', 'status');
+        statusEl.setAttribute?.('aria-live', 'polite');
+        statusEl.setAttribute?.('aria-atomic', 'true');
+        statusEl.textContent = state._lastKtStatusMsg;
+        statusEl.className = `kt-status kt-status--${state._lastKtStatusLevel}`;
+    }
+}

@@ -1,0 +1,3229 @@
+/**
+ * knowledge/render.js — All UI rendering and DOM event wiring for the
+ * Knowledge tab (NPC lists, staging, state trackers, relationships,
+ * notification panel, settings panel).
+ */
+
+import {
+    escapeHtml, renderLineDiff, notify, isCancellation,
+} from '../core/index.js';
+// Direct import (not the barrel): the chat-scope guard must read the REAL
+// core/scope.js epoch/identity state under the test barrel→stub alias — the
+// same rule knowledge/identity.js follows for its write paths. scopeStillCurrent
+// carries the §7.5 semantics a UI path needs: the epoch (bumped synchronously
+// by CHAT_CHANGED) is always checked, the chat identity only when the capture
+// could actually identify the chat, so hosts without a usable chat id are not
+// falsely marked stale on every await.
+import { captureScope, scopeStillCurrent } from '../core/scope.js';
+
+import {
+    RELATIONSHIP_TYPES, USER_STANCES, TRACKER_SENTINEL,
+    state, getNpcsContentEl, ktSetStatus,
+} from './state.js';
+import { getSettings, hasValidSettings, showKnowledgeSettings } from './settings.js';
+import {
+    getRegistry, saveRegistry, getAllNpcNames,
+    getStateRegistry, registerStateTracker, unregisterStateTracker,
+    setStateTrackerEnabled, setStateTrackerAlwaysUpdate, bumpStateTrackerTimestamp,
+    resolveRegistryKey,
+} from './registry.js';
+import {
+    addAlias, removeAlias, listAliases,
+    renameEntity, mergeEntities, getEntityId, flushIdentityWrites,
+} from './identity.js';
+import {
+    loadEntryContent, loadStateTrackerEntry,
+    runScan, runStateUpdate, runNpcUpdate, runNpcEnrich,
+    runDossierFieldRefresh, DOSSIER_FIELDS, extractDossierFieldValues, isDossierEntry,
+    buildUpdatedMinorContent,
+    buildPromotedContent, buildDemotedContent,
+    enrichStagingItem, writeToLorebook, writeStateTracker,
+} from './lorebook.js';
+import {
+    recordDossierFieldRefresh, deleteDossierFieldStatus,
+    getDossierFieldStaleness, DOSSIER_STALE_AFTER_MSGS,
+} from './dossier_status.js';
+import {
+    getRelationships, getNpcRelationships, updateRelationship, removeRelationship,
+    removeAllRelationshipsFor,
+    getStances, getStance, setStance,
+    isEdgeAutoManaged, isStanceAutoManaged, toggleEdgeSource, toggleStanceSource,
+    syncRelationshipsToLorebook, syncAllRelationshipsToLorebooks,
+    describeRelationshipChange, getRecentRelationshipChanges,
+    recordRelationshipChanges, clearRecentRelationshipChanges,
+} from './relationships.js';
+import {
+    buildStagingItems, exportNpcs, importNpcs, importFromLorebooks,
+    mergeScanResults, formatHistoryAge,
+    STAGING_PLACEHOLDERS,
+} from './staging.js';
+import { getStateLorebookName } from './scope.js';
+// setStatus joins decorateModalShell so the Growth modal's flash messages
+// route through the shared live-region writer instead of a bare textContent
+// assignment (a11y plan §4.4).
+import { decorateModalShell, setStatus } from '../core/modal.js';
+// Direct import (not the barrel) so the real helpers run under the test
+// barrel→stub alias — the wireTablist precedent (accessibility Slice 2).
+// setControlBusy: async handlers set/clear `disabled` + `aria-busy` together
+// (plan §4.4); prefersReducedMotion: gates the one JS-driven smooth scroll
+// (plan §4.5).
+import { setControlBusy, prefersReducedMotion } from '../core/ui.js';
+import { acceptedRefreshFields, contractRejectionSummary, scanContractRejections } from './field_contract.js';
+// Phase 4 (concision plan): the reviewed ledger-condensation UI. Deliberately
+// separate from Enrich/Fields/staging — its proposals never enter the staging
+// auto-approval path, and its writes go through the guarded commit service.
+import { openLedgerCleanupReviewModal } from './cleanup_review_ui.js';
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function sortEntries(obj, key) {
+    return Object.entries(obj).sort((a, b) => String(a[1][key] || a[0]).localeCompare(String(b[1][key] || b[0])));
+}
+
+function setContractStatus(message, rejections = [], level = 'success') {
+    const summary = contractRejectionSummary(rejections);
+    ktSetStatus(summary ? `${message} ${summary}` : message, summary ? 'warning' : level);
+}
+
+// ─── Accept / reject staging item ────────────────────────────────────────────
+
+async function handleAccept(item, text, keywords, _el) {
+    try {
+        if (item.type === 'state') {
+            const result = await writeStateTracker(item.uid, item.name, text);
+            if (!result.success) { ktSetStatus(`Write failed: ${result.error}`, 'error'); return; }
+            bumpStateTrackerTimestamp(item.name);
+        } else {
+            const result = await writeToLorebook(item.name, text, keywords, item.uid);
+            if (!result.success) { ktSetStatus(`Write failed: ${result.error}`, 'error'); return; }
+            // KNOWLEDGE-03: If this is an update (item.uid != null), resolve
+            // the canonical registry key so the model's spelling doesn't create
+            // a duplicate entry beside the real one. For creates, use the
+            // model's name as-is (the NPC is genuinely new).
+            const reg = getRegistry();
+            const regKey = item.uid != null
+                ? (resolveRegistryKey(reg, item.name) ?? item.name)
+                : item.name;
+            // MERGE, never replace. A wholesale `reg[regKey] = {...}` dropped
+            // every field not listed here — most importantly `profileUid`, the
+            // pointer at this NPC's "NPC Profiles" entry. Losing it makes the
+            // next profile save create a SECOND profile entry instead of
+            // overwriting (see MWT.profiles.duplicates), so accepting any
+            // ordinary proposal re-armed a duplicate bug in the other book.
+            reg[regKey] = {
+                ...(reg[regKey] || {}),
+                uid: result.uid,
+                type: item.type === 'promote' ? 'major' : item.type === 'demote' ? 'minor' : item.type,
+                keywords,
+                lastUpdated: Date.now(),
+            };
+            saveRegistry(reg);
+            // TODO §3 (per-field dossier refresh): stamp per-field watermarks so
+            // the 🎯 Fields picker can mark staleness. A field-refresh item
+            // stamps every field it re-examined (requestedFields); an Enrich
+            // item refreshFields covers all of them; any other dossier-mode
+            // proposal stamps the fields it actually rewrote (non-null). This
+            // is bookkeeping only — it must never fail the accept itself.
+            try {
+                if (Array.isArray(item.refreshFields) && item.refreshFields.length > 0) {
+                    recordDossierFieldRefresh(regKey, acceptedRefreshFields(item.refreshFields, item.contractRejections));
+                } else if (item.dossierMode === true && item.fields && typeof item.fields === 'object' && !Array.isArray(item.fields)) {
+                    const rewritten = acceptedRefreshFields(DOSSIER_FIELDS.map(f => f.key).filter(k => item.fields[k] != null), item.contractRejections);
+                    if (rewritten.length > 0) recordDossierFieldRefresh(regKey, rewritten);
+                }
+            } catch (stampErr) {
+                console.warn('[MWT:Knowledge] Dossier field-status stamp skipped:', stampErr?.message || stampErr);
+            }
+        }
+        state.stagingItems = state.stagingItems.filter(i => i.id !== item.id);
+        if (state.activeItemId === item.id) state.activeItemId = null;
+        removeNotificationEntry(item.id);
+        ktSetStatus(`"${item.name}" written to lorebook.`, 'success');
+        renderNpcsSubTab();
+    } catch (err) {
+        ktSetStatus(`Accept failed: ${err.message}`, 'error');
+    }
+}
+
+// ─── Notification panel ──────────────────────────────────────────────────────
+
+function addNotificationEntry(item) {
+    state.notificationEntries[item.id] = { item, ts: Date.now(), read: false };
+}
+
+function removeNotificationEntry(id) {
+    delete state.notificationEntries[id];
+}
+
+/**
+ * Reconcile notification entries against staging items so the bell count
+ * never references proposals that have already been accepted/dismissed.
+ * Returns true if any entries were pruned.
+ */
+function reconcileNotifications() {
+    const stagingIds = new Set(state.stagingItems.map(i => i.id));
+    let pruned = false;
+    for (const id of Object.keys(state.notificationEntries)) {
+        if (!stagingIds.has(id)) {
+            delete state.notificationEntries[id];
+            pruned = true;
+        }
+    }
+    return pruned;
+}
+
+function unreadCount() { return Object.values(state.notificationEntries).filter(n => !n.read).length; }
+
+function showNotificationPanel() {
+    // Navigate to the staging tab, where staged proposals can be reviewed.
+    reconcileNotifications();
+    state.activeSubTab = 'staging';
+    // Mark all notifications as read since the user is now viewing them.
+    for (const n of Object.values(state.notificationEntries)) n.read = true;
+    renderNpcsSubTab();
+}
+
+function hideNotificationPanel() {
+    state.notifActiveId = false;
+}
+
+function initNotificationPanel() {
+    state.notificationEntries = {};
+    state.notifActiveId = false;
+}
+
+// ─── Main render dispatcher ──────────────────────────────────────────────────
+
+export function renderNpcsSubTab() {
+    const el = getNpcsContentEl();
+    if (!el) return;
+
+    // Keep the notification bell count in sync with staged proposals so it
+    // never reports items that have been accepted/dismissed elsewhere.
+    reconcileNotifications();
+
+    const registry = getRegistry();
+    const minorEntries = Object.fromEntries(Object.entries(registry).filter(([, v]) => v.type !== 'major'));
+    const majorEntries = Object.fromEntries(Object.entries(registry).filter(([, v]) => v.type === 'major'));
+
+    el.innerHTML = `
+        <div class="kt-toolbar">
+            <button id="kt-scan-btn" class="mwt-btn mwt-btn-primary" ${!hasValidSettings() || state.isRunning ? 'disabled' : ''} ${state.isRunning ? 'aria-busy="true"' : ''}>${state.isRunning ? '<span aria-hidden="true">⏳</span> Scanning…' : '<span aria-hidden="true">🔍</span> Scan'}</button>
+            ${(() => {
+                const s = getSettings();
+                if (s.npcAutoScanEnabled) {
+                    const everyN = Math.max(1, Number(s.npcAutoScanEveryN) || 10);
+                    const remaining = Math.max(0, everyN - state.npcMessageCounter);
+                    return `<span class="kt-autoscan-countdown" title="Auto-scan fires every ${everyN} messages (${state.npcMessageCounter}/${everyN})"><span aria-hidden="true">⏱️</span> ${remaining} msg${remaining !== 1 ? 's' : ''} until auto-scan</span>`;
+                }
+                return '';
+            })()}
+            <button id="kt-export-btn" class="mwt-btn" title="Export NPC registry"><span aria-hidden="true">📥</span> Export</button>
+            <button id="kt-import-btn" class="mwt-btn" title="Import NPCs from JSON"><span aria-hidden="true">📤</span> Import</button>
+            <button id="kt-import-lb-btn" class="mwt-btn" title="Import from existing lorebooks"><span aria-hidden="true">📚</span> From Lorebooks</button>
+        </div>
+        <div class="kt-sub-tabs">
+            <button class="kt-sub-tab ${state.activeSubTab === 'staging' ? 'active' : ''} ${state.stagingItems.length > 0 && state.activeSubTab !== 'staging' ? 'kt-staging-pulse' : ''}" data-sub="staging">
+                <span aria-hidden="true">📋</span> Staging${state.stagingItems.length > 0 ? ` (${state.stagingItems.length})` : ''}
+            </button>
+            <button class="kt-sub-tab ${state.activeSubTab === 'minor' ? 'active' : ''}" data-sub="minor"><span aria-hidden="true">👤</span> Minor (${Object.keys(minorEntries).length})</button>
+            <button class="kt-sub-tab ${state.activeSubTab === 'major' ? 'active' : ''}" data-sub="major"><span aria-hidden="true">🏛️</span> Major (${Object.keys(majorEntries).length})</button>
+            <button class="kt-sub-tab ${state.activeSubTab === 'state' ? 'active' : ''}" data-sub="state"><span aria-hidden="true">📊</span> State</button>
+            <button class="kt-sub-tab ${state.activeSubTab === 'relationships' ? 'active' : ''}" data-sub="relationships"><span aria-hidden="true">🔗</span> Relationships</button>
+            <span class="kt-sub-spacer"></span>
+            ${unreadCount() > 0 ? `<button class="kt-sub-tab kt-notif-badge" id="kt-notif-btn" aria-label="Notifications — ${unreadCount()} unread">🔔 ${unreadCount()}</button>` : ''}
+            <button class="kt-sub-tab" id="kt-cog-btn" title="Settings" aria-label="Settings"><span aria-hidden="true">⚙️</span></button>
+        </div>
+        <div class="kt-sub-content" id="kt-sub-content">
+            ${state.activeSubTab === 'staging' ? renderStagingContent(state.stagingItems.length) :
+              state.activeSubTab === 'minor' ? renderNpcListContent('minor', minorEntries) :
+              state.activeSubTab === 'major' ? renderNpcListContent('major', majorEntries) :
+              state.activeSubTab === 'state' ? renderStateTrackerContent() :
+              state.activeSubTab === 'relationships' ? renderRelationshipContent() :
+              ''}
+        </div>
+        <div id="kt-status" class="kt-status" role="status" aria-live="polite" aria-atomic="true"></div>`;
+
+    // Wire sub-tab clicks
+    el.querySelectorAll('.kt-sub-tab[data-sub]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            state.activeSubTab = btn.dataset.sub;
+            renderNpcsSubTab();
+        });
+    });
+
+    // Notification bell
+    el.querySelector('#kt-notif-btn')?.addEventListener('click', () => showNotificationPanel());
+
+    // Settings gear
+    el.querySelector('#kt-cog-btn')?.addEventListener('click', () => showKnowledgeSettings());
+
+    // Scan button
+    el.querySelector('#kt-scan-btn')?.addEventListener('click', async () => {
+        if (state.isRunning) return;
+        state.isRunning = true;
+        document.dispatchEvent(new CustomEvent('mwt:busy-changed'));
+        try {
+            ktSetStatus('Scanning…', 'info');
+            renderNpcsSubTab(); // Re-render to show "⏳ Scanning…" state
+            state.activeSubTab = 'staging';
+            const result = await runScan();
+            const newItems = buildStagingItems(result);
+            const added = mergeScanResults(newItems, removeNotificationEntry);
+            state.activeItemId = null;
+            // Enrich non-edited update proposals; edited ones keep their text.
+            await Promise.all(added.filter(it => it.action === 'update' && !it.edited).map(it => enrichStagingItem(it)));
+            added.forEach(item => addNotificationEntry(item));
+            setContractStatus(`Scan complete — ${added.length} proposal(s).`, scanContractRejections(newItems, added));
+            notify('Knowledge Tracker', `Scan found ${added.length} proposal(s).`, added.length ? 'info' : 'success');
+        } catch (err) {
+            // Coordinator cancellation (TODO §1): an intentional stop (chat
+            // switch, MWT.coordinator.cancel) is a quiet discard — logged,
+            // never a failure status/toast. The info status replaces the
+            // stale "Scanning…" line rather than leaving it dangling.
+            if (isCancellation(err)) {
+                console.log('[MWT:Knowledge] Scan cancelled (coordinator) — discarded.');
+                ktSetStatus('Scan cancelled.', 'info');
+                return;
+            }
+            ktSetStatus(`Scan failed: ${err.message}`, 'error');
+            notify('Knowledge Tracker', `Scan failed: ${err.message}`, 'error');
+        }
+        finally { state.isRunning = false; document.dispatchEvent(new CustomEvent('mwt:busy-changed')); renderNpcsSubTab(); }
+    });
+
+    // Export / Import / Import-from-Lorebooks buttons
+    el.querySelector('#kt-export-btn')?.addEventListener('click', () => exportNpcs());
+    el.querySelector('#kt-import-btn')?.addEventListener('click', () => importNpcs());
+    el.querySelector('#kt-import-lb-btn')?.addEventListener('click', () => importFromLorebooks());
+
+    // Wire sub-tab specific events
+    if (state.activeSubTab === 'staging') wireStagingEvents(el);
+    else if (state.activeSubTab === 'minor' || state.activeSubTab === 'major') wireNpcListEvents(el, state.activeSubTab);
+    else if (state.activeSubTab === 'state') wireStateTrackerEvents(el);
+    else if (state.activeSubTab === 'relationships') wireRelationshipEvents(el);
+
+    // Populate the relationship filter-summary live region one task AFTER the
+    // render inserted it empty — the same "announce the change, not the
+    // insertion" contract as #kt-status below, but deferred to its own task
+    // so the insertion and the text change reach the accessibility tree as
+    // two separate mutations. Without this, a filter change re-renders the
+    // region already populated and screen readers are not required to
+    // announce the new counts at all.
+    const relFilterSummaryEl = el.querySelector('#kt-rel-filter-summary');
+    if (relFilterSummaryEl) {
+        const summaryText = state._relFilterSummaryText || '';
+        setTimeout(() => { relFilterSummaryEl.textContent = summaryText; }, 0);
+    }
+
+    // Re-apply persisted status message
+    if (state._lastKtStatusMsg) {
+        const statusEl = el.querySelector('#kt-status');
+        if (statusEl) {
+            statusEl.textContent = state._lastKtStatusMsg;
+            statusEl.className = `kt-status kt-status--${state._lastKtStatusLevel}`;
+        }
+    }
+
+    // Notify the floating-button subsystem that staging state may have changed
+    // so the Knowledge button's attention pulse + countdown badge update
+    // immediately (rather than waiting up to 5 s for the next poll).
+    document.dispatchEvent(new CustomEvent('mwt:busy-changed'));
+}
+
+// ─── Staging sub-tab ─────────────────────────────────────────────────────────
+
+function renderStagingContent(count) {
+    if (count === 0) return '<div class="kt-empty" role="status">No pending proposals.<br>Click <strong><span aria-hidden="true">🔍</span> Scan</strong> to analyse recent messages.</div>';
+    // Slice 5 (a11y plan §4.6): each proposal is a real <button>, not a
+    // clickable div. It was the last essential MWT operation with no keyboard
+    // path at all — Accept All / Dismiss All were reachable, but selecting one
+    // proposal to review, edit, or act on singly was pointer-only. aria-pressed
+    // carries the selection, which also retires the colour-only --active state
+    // ("never colour alone"). Buttons fire click on Enter and Space natively,
+    // so wireStagingEvents' existing click handler is the whole keyboard path.
+    return `
+        <div class="kt-staging-alert">
+            <span class="kt-staging-alert-icon" aria-hidden="true">📬</span>
+            <span class="kt-staging-alert-text"><strong>${count} proposal${count !== 1 ? 's' : ''}</strong> awaiting your review — Accept to write to the lorebook, or Dismiss to discard.</span>
+        </div>
+        <div class="kt-staging-toolbar">
+            <button id="kt-batch-accept" class="mwt-btn mwt-btn-primary"><span aria-hidden="true">✓</span> Accept All</button>
+            <button id="kt-batch-dismiss" class="mwt-btn"><span aria-hidden="true">✗</span> Dismiss All</button>
+            <span>${count} proposal(s)</span>
+        </div>
+        <div class="kt-staging-layout">
+            <div class="kt-staging-list" id="kt-staging-list" role="group" aria-label="Pending proposals">
+                ${state.stagingItems.map(item => `
+                    <button type="button" class="kt-staging-item ${state.activeItemId === item.id ? 'kt-staging-item--active' : ''}" data-id="${item.id}" aria-pressed="${state.activeItemId === item.id}">
+                        <span class="kt-staging-badge">${item.action === 'create' ? 'New' : 'Update'} ${item.type}</span>
+                        <span class="kt-staging-name">${escapeHtml(item.name)}</span>
+                    </button>`).join('')}
+            </div>
+            <div class="kt-staging-detail" id="kt-staging-detail">
+                ${state.activeItemId ? renderDetailForItem(state.stagingItems.find(i => i.id === state.activeItemId)) : '<div class="kt-detail-empty">Select a proposal.</div>'}
+            </div>
+        </div>`;
+}
+
+function renderDetailForItem(item) {
+    if (!item) return '<div class="kt-detail-empty">Select a proposal.</div>';
+    const editorContent = item.mergedContent || item.proposedContent || '';
+
+    // Skip the diff view for state tracker updates: they use the full entry text
+    // as both existing and proposed content, which produces noisy, misleading diffs.
+    let diffHtml = '';
+    if (item.type !== 'state' && item.existingContent && editorContent && item.existingContent !== editorContent) {
+        const diff = renderLineDiff(item.existingContent, editorContent);
+        if (diff) {
+            diffHtml = `<div class="kt-detail-section">
+                <div class="kt-detail-label">Changes (diff)</div>
+                <div class="kt-detail-diff">${diff}</div>
+            </div>`;
+        }
+    }
+
+    // Build a "superseded proposals" section if prior proposals were
+    // replaced by a newer scan. This shows the user exactly what was
+    // overwritten so nothing is lost silently — and lets them restore
+    // an older version if the new scan went in the wrong direction.
+    let supersededHtml = '';
+    if (Array.isArray(item.supersededContent) && item.supersededContent.length > 0) {
+        supersededHtml = `<div class="kt-detail-section">
+            <div class="kt-detail-label">Previous proposal${item.supersededContent.length > 1 ? 's' : ''} (superseded by this scan)</div>
+            ${item.supersededContent.map((entry, i) => `
+                <div class="kt-superseded-entry" style="margin-bottom:8px">
+                    <div class="kt-detail-superseded-meta" style="font-size:11px;color:var(--mwt-text-dim);margin-bottom:2px">
+                        ${escapeHtml(formatHistoryAge(entry.timestamp))}
+                        <button class="mwt-btn kt-superseded-restore" data-idx="${i}" style="margin-left:8px;padding:2px 8px;font-size:11px"><span aria-hidden="true">↩</span> Restore</button>
+                    </div>
+                    <pre class="kt-detail-current" style="opacity:0.7">${escapeHtml(entry.content)}</pre>
+                </div>
+            `).join('')}
+        </div>`;
+    }
+
+    // Slice 5 (a11y plan §4.6), same contract as the cards: the selected
+    // proposal's name is a real heading (h4 — same level as the card names)
+    // so heading navigation lands on the detail pane too.
+    return `<div class="kt-detail-inner">
+        <h4 class="kt-detail-name">${escapeHtml(item.name)}</h4>
+        ${item.contractRejections?.length ? `<div class="kt-detail-section kt-contract-rejections"><div class="kt-detail-label">Rejected model values (not applied or re-verified)</div><ul>${item.contractRejections.map(r => `<li>${escapeHtml(r.field)}: ${escapeHtml(r.reason)}</li>`).join('')}</ul></div>` : ''}
+        ${item.existingContent ? `<div class="kt-detail-section"><div class="kt-detail-label">Current</div><pre class="kt-detail-current">${escapeHtml(item.existingContent)}</pre></div>` : ''}
+        ${diffHtml}
+        <div class="kt-detail-section"><label class="kt-detail-label" for="kt-proposal-editor">Proposed</label><textarea class="kt-detail-editor" id="kt-proposal-editor">${escapeHtml(editorContent)}</textarea></div>
+        ${item.type !== 'state' ? `<div class="kt-detail-section"><label class="kt-detail-label" for="kt-keyword-input">Keywords</label><input class="kt-keyword-input" id="kt-keyword-input" type="text" value="${escapeHtml((item.keywords || [item.name]).join(', '))}" /></div>` : ''}
+        ${supersededHtml}
+        <div class="kt-detail-actions"><button class="mwt-btn mwt-btn-primary" id="kt-accept"><span aria-hidden="true">✓</span> Accept &amp; Write</button><button class="mwt-btn" id="kt-dismiss"><span aria-hidden="true">✗</span> Dismiss</button></div>
+    </div>`;
+}
+
+function wireStagingEvents(el) {
+    // Click staging items
+    el.querySelectorAll('.kt-staging-item').forEach(item => {
+        item.addEventListener('click', async () => {
+            state.activeItemId = item.dataset.id;
+            const stagingItem = state.stagingItems.find(i => i.id === state.activeItemId);
+            // enrichStagingItem loads the existing entry and builds the merged
+            // content using the correct formatter (minor / major / dossier). It
+            // self-guards on action==='update' && existingContent===null && uid.
+            if (stagingItem) await enrichStagingItem(stagingItem);
+            renderNpcsSubTab();
+        });
+    });
+
+    // Track manual edits to the proposal editor so a subsequent re-scan can
+    // preserve the user's text instead of overwriting it wholesale.
+    const editorEl = el.querySelector('#kt-proposal-editor');
+    editorEl?.addEventListener('input', () => {
+        const item = state.stagingItems.find(i => i.id === state.activeItemId);
+        if (!item) return;
+        item.edited = true;
+        item.mergedContent = editorEl.value;
+        if (!item.proposedContent || STAGING_PLACEHOLDERS.includes(item.proposedContent)) {
+            item.proposedContent = editorEl.value;
+        }
+    });
+
+    // Accept/dismiss buttons
+    // A11Y-S3-03: the lorebook write below is async — own the busy pair from
+    // here through handleAccept's re-render (isConnected guard covers the
+    // re-render and the modal closing mid-write).
+    const acceptBtn = el.querySelector('#kt-accept');
+    acceptBtn?.addEventListener('click', async () => {
+        const item = state.stagingItems.find(i => i.id === state.activeItemId);
+        if (!item) return;
+        const editorVal = el.querySelector('#kt-proposal-editor')?.value;
+        let text;
+        if (editorVal && !STAGING_PLACEHOLDERS.includes(editorVal)) {
+            text = editorVal;
+        } else if (item.mergedContent && !STAGING_PLACEHOLDERS.includes(item.mergedContent)) {
+            text = item.mergedContent;
+        } else if (item.proposedContent && !STAGING_PLACEHOLDERS.includes(item.proposedContent)) {
+            text = item.proposedContent;
+        } else {
+            text = '';
+        }
+        if (!text || STAGING_PLACEHOLDERS.includes(text)) {
+            ktSetStatus('Click the staging item first to load full content before accepting.', 'error');
+            return;
+        }
+        const keywordsRaw = el.querySelector('#kt-keyword-input')?.value || item.name;
+        const keywords = item.type === 'state' ? [item.name] : keywordsRaw.split(',').map(k => k.trim()).filter(Boolean);
+        setControlBusy(acceptBtn, true);
+        try {
+            await handleAccept(item, text, keywords, el);
+        } finally {
+            if (acceptBtn.isConnected) setControlBusy(acceptBtn, false);
+        }
+    });
+
+    el.querySelector('#kt-dismiss')?.addEventListener('click', () => {
+        if (state.activeItemId) removeNotificationEntry(state.activeItemId);
+        state.stagingItems = state.stagingItems.filter(i => i.id !== state.activeItemId);
+        state.activeItemId = null;
+        renderNpcsSubTab();
+    });
+
+    // Batch buttons
+    // A11Y-S3-03: busy only after the confirmation succeeds (S3-03), spanning
+    // the sequential lorebook writes; cleared before the closing re-render.
+    const batchAcceptBtn = el.querySelector('#kt-batch-accept');
+    batchAcceptBtn?.addEventListener('click', async () => {
+        if (!confirm(`Accept all ${state.stagingItems.length} proposals?`)) return;
+        setControlBusy(batchAcceptBtn, true);
+        try {
+            let accepted = 0;
+            let skipped = 0;
+            for (const item of [...state.stagingItems]) {
+                const text = item.mergedContent || item.proposedContent;
+                // Reject placeholders (Fetch to see changes / promoting / demoting)
+                // so unloaded proposals are never written to the lorebook. The
+                // single-accept path guards this; the batch path previously had no
+                // guard at all.
+                if (!text || STAGING_PLACEHOLDERS.includes(text)) { skipped++; continue; }
+                try { await handleAccept(item, text, item.keywords || [item.name], el); accepted++; } catch (e) { console.warn('[MWT:Knowledge] Batch accept failed:', e); }
+            }
+            if (skipped > 0) ktSetStatus(`${accepted} accepted · ${skipped} skipped (click the item to load its content first).`, 'info');
+        } finally {
+            if (batchAcceptBtn.isConnected) setControlBusy(batchAcceptBtn, false);
+        }
+        renderNpcsSubTab();
+    });
+
+    el.querySelector('#kt-batch-dismiss')?.addEventListener('click', () => {
+        if (!confirm(`Dismiss all ${state.stagingItems.length} proposals?`)) return;
+        for (const item of state.stagingItems) removeNotificationEntry(item.id);
+        state.stagingItems = [];
+        state.activeItemId = null;
+        renderNpcsSubTab();
+    });
+
+    // Restore a superseded proposal — swap the current proposal text for the
+    // older one the user clicked, so nothing a scan produced is ever truly
+    // lost. The current text becomes the latest superseded entry.
+    el.querySelectorAll('.kt-superseded-restore').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const item = state.stagingItems.find(i => i.id === state.activeItemId);
+            if (!item || !Array.isArray(item.supersededContent)) return;
+            const idx = parseInt(btn.dataset.idx, 10);
+            const entry = item.supersededContent[idx];
+            if (!entry) return;
+            const currentContent = item.mergedContent || item.proposedContent || '';
+            // Swap: old restored content becomes the active proposal; the
+            // current proposal is pushed into the superseded stack at the
+            // same position so the user can flip back if they change their mind.
+            item.mergedContent = entry.content;
+            item.proposedContent = entry.content;
+            item.edited = true;
+            const newSuperseded = [...item.supersededContent];
+            newSuperseded.splice(idx, 1);
+            if (currentContent) newSuperseded.push({ content: currentContent, timestamp: Date.now() });
+            item.supersededContent = newSuperseded;
+            renderNpcsSubTab();
+            ktSetStatus('Previous proposal restored.', 'success');
+        });
+    });
+}
+
+// ─── NPC list sub-tab ────────────────────────────────────────────────────────
+
+function renderNpcListContent(type, entries) {
+    // Slice 5 (a11y plan §4.6): empty states are polite live regions
+    // (role="status"). They render already populated — a node inserted with
+    // its content is not required to be announced at all — so the role is
+    // best-effort and harmless: what it buys is that a later text change in
+    // the region is announced instead of silently redrawn (the same contract
+    // #kt-rel-filter-summary defers its population for).
+    if (Object.keys(entries).length === 0) return `<div class="kt-empty" role="status">No ${type} NPCs tracked yet.</div>`;
+    const sorted = sortEntries(entries, 'name');
+    const dossierMode = getSettings().dossierMode === true;
+    return `<div class="kt-npc-list">${sorted.map(([name, info]) => {
+        const isOrphan = info.uid === null || info.uid === undefined;
+        const showEnrich = type === 'major' && !isOrphan && dossierMode;
+        // ✏️ Identity stays available on orphans too: a record whose lorebook
+        // entry was deleted (uid null) is exactly the duplicate a merge folds
+        // back into its canonical owner, and both identity legs are uid-safe.
+        // Slice 5 (a11y plan §4.6): the card name is a real heading (h4 —
+        // the modal title is h3) so heading navigation lands on cards; every
+        // action stays a real <button> and the card container itself is never
+        // interactive, so keyboard operation and focus order come natively.
+        return `<div class="kt-npc-card${isOrphan ? ' kt-npc-card--orphan' : ''}" data-name="${escapeHtml(name)}" data-uid="${info.uid ?? ''}">
+            <div class="kt-npc-card-header"><h4 class="kt-npc-name">${escapeHtml(name)}${isOrphan ? ' <span aria-hidden="true">⚠</span><span class="mwt-sr-only">(orphaned — lorebook entry missing)</span>' : ''}</h4><span class="kt-npc-meta">${(info.keywords || [name]).join(', ')}</span></div>
+            <div class="kt-npc-actions">
+                ${!isOrphan ? `
+                    <button class="mwt-btn kt-npc-update" data-name="${escapeHtml(name)}" data-type="${type}">Update</button>
+                    ${type === 'minor' ? `<button class="mwt-btn kt-npc-promote" data-name="${escapeHtml(name)}"><span aria-hidden="true">⬆</span> Promote</button>` : ''}
+                    ${showEnrich ? `<button class="mwt-btn kt-npc-enrich" data-name="${escapeHtml(name)}" data-uid="${info.uid}" title="Fill in all dossier fields (appearance, voice, background, secrets, etc.)"><span aria-hidden="true">📋</span> Enrich</button>` : ''}
+                    ${showEnrich ? `<button class="mwt-btn kt-npc-fields" data-name="${escapeHtml(name)}" data-uid="${info.uid}" title="Refresh individual dossier fields (agenda, appearance, secrets, …)"><span aria-hidden="true">🎯</span> Fields</button>` : ''}
+                    <button class="mwt-btn kt-npc-condense" data-name="${escapeHtml(name)}" data-uid="${info.uid}" title="Reviewed condensation of the knowledge ledger — one model proposal (up to two billable attempts), then a source-mapped review; nothing changes until you apply it"><span aria-hidden="true">🧹</span> Condense</button>
+                    ${type === 'major' ? `<button class="mwt-btn kt-npc-growth" data-name="${escapeHtml(name)}" data-uid="${info.uid}" title="Generate an evidence-driven growth profile from behavioral observations"><span aria-hidden="true">🌱</span> Growth</button>` : ''}
+                    ${type === 'major' ? `<button class="mwt-btn kt-npc-demote" data-name="${escapeHtml(name)}"><span aria-hidden="true">⬇</span> Demote</button>` : ''}
+                    <button class="mwt-btn kt-npc-view" data-name="${escapeHtml(name)}"><span aria-hidden="true">📖</span> View</button>
+                ` : ''}
+                <button class="mwt-btn kt-npc-identity" data-name="${escapeHtml(name)}" title="Rename, aliases, and merges — identity management"><span aria-hidden="true">✏️</span> Identity</button>
+                <button class="mwt-btn kt-npc-remove" data-name="${escapeHtml(name)}">Remove</button>
+            </div></div>`;
+    }).join('')}</div>`;
+}
+
+function wireNpcListEvents(el, _type) {
+    el.querySelectorAll('.kt-npc-update').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            const npcType = btn.dataset.type;
+            const reg = getRegistry()[name];
+            if (!reg?.uid && reg?.uid !== 0) { ktSetStatus(`No UID for "${name}".`, 'error'); return; }
+            try {
+                setControlBusy(btn, true); btn.textContent = '⏳…';
+                const result = await runNpcUpdate(name, reg.uid);
+                const hasChanges = Object.values(result.fields).some(v => v !== null) || result.newKnowledge.length > 0;
+                if (!hasChanges) { setContractStatus(`No new info for "${name}".`, result.contractRejections, 'info'); return; }
+                // runNpcUpdate already computed the major/dossier merge (result.merged)
+                // and flagged result.dossierMode. Minor entries need their own merge.
+                const useDossier = result.dossierMode === true;
+                const mergedContent = npcType === 'minor'
+                    ? buildUpdatedMinorContent(result.currentContent, result.fields || {})
+                    : result.merged;
+                state.stagingItems.push({
+                    id: `npc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: npcType, action: 'update', name, data: {},
+                    proposedContent: mergedContent, existingContent: result.currentContent,
+                    mergedContent, keywords: reg.keywords || [name], uid: reg.uid,
+                    fields: result.fields, newKnowledge: npcType === 'major' ? (result.newKnowledge || []) : [],
+                    dossierMode: useDossier,
+                    contractRejections: result.contractRejections || [],
+                });
+                const stagedItem = state.stagingItems[state.stagingItems.length - 1];
+                state.activeItemId = stagedItem.id;
+                state.activeSubTab = 'staging';
+                addNotificationEntry(stagedItem);
+                renderNpcsSubTab();
+                setContractStatus(`Update for "${name}" staged.`, result.contractRejections);
+            } catch (err) {
+                // Coordinator cancellation (TODO §1): quiet discard — the
+                // finally restores the button, no failure status.
+                if (isCancellation(err)) {
+                    console.log(`[MWT:Knowledge] Update for "${name}" cancelled (coordinator) — discarded.`);
+                    return;
+                }
+                ktSetStatus(`Update failed: ${err.message}`, 'error');
+            }
+            finally { setControlBusy(btn, false); btn.textContent = 'Update'; }
+        });
+    });
+
+    // ── Enrich (Dossier) handler ──
+    // Fills in ALL missing dossier fields for a major NPC by drawing on full
+    // chat history + the existing entry content. This is the primary way to
+    // upgrade a compact-format entry to a full dossier.
+    el.querySelectorAll('.kt-npc-enrich').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            const reg = getRegistry()[name];
+            if (!reg?.uid && reg?.uid !== 0) { ktSetStatus(`No UID for "${name}".`, 'error'); return; }
+            try {
+                setControlBusy(btn, true); btn.textContent = '⏳…';
+                const result = await runNpcEnrich(name, reg.uid);
+                state.stagingItems.push({
+                    id: `enrich-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    type: 'major', action: 'update', name, data: {},
+                    proposedContent: result.merged,
+                    existingContent: result.currentContent,
+                    mergedContent: result.merged,
+                    keywords: reg.keywords || [name], uid: reg.uid,
+                    fields: result.fields, newKnowledge: result.newKnowledge || [],
+                    dossierMode: true,
+                    contractRejections: result.contractRejections || [],
+                    // Invalid proposals preserve the old value, not its freshness.
+                    refreshFields: acceptedRefreshFields(DOSSIER_FIELDS.map(f => f.key), result.contractRejections),
+                });
+                const stagedItem = state.stagingItems[state.stagingItems.length - 1];
+                state.activeItemId = stagedItem.id;
+                state.activeSubTab = 'staging';
+                addNotificationEntry(stagedItem);
+                renderNpcsSubTab();
+                setContractStatus(`Dossier enrichment for "${name}" staged for review.`, result.contractRejections);
+            } catch (err) {
+                // Coordinator cancellation (TODO §1): quiet discard — the
+                // finally restores the button, no failure status.
+                if (isCancellation(err)) {
+                    console.log(`[MWT:Knowledge] Enrichment for "${name}" cancelled (coordinator) — discarded.`);
+                    return;
+                }
+                ktSetStatus(`Enrich failed: ${err.message}`, 'error');
+            }
+            finally { setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">📋</span> Enrich'; }
+        });
+    });
+
+    el.querySelectorAll('.kt-npc-fields').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            // Double-click guard (the Enrich pattern): the picker modal only
+            // exists after an awaited lorebook read, so two rapid clicks would
+            // stack two #kt-dossier-refresh-modal nodes with the same id.
+            setControlBusy(btn, true);
+            try { await openDossierFieldRefreshModal(btn.dataset.name); }
+            finally { setControlBusy(btn, false); }
+        });
+    });
+
+    el.querySelectorAll('.kt-npc-condense').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            // Same double-click guard: the review modal only exists after an
+            // awaited identity-bound capture, so two rapid clicks would stack
+            // two #kt-ledger-review-modal nodes with the same id.
+            setControlBusy(btn, true);
+            try { await openLedgerCleanupReviewModal(btn.dataset.name, Number(btn.dataset.uid)); }
+            finally { setControlBusy(btn, false); }
+        });
+    });
+
+    el.querySelectorAll('.kt-npc-promote').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            const reg = getRegistry()[name];
+            if (reg?.uid == null) return;
+            // A11Y-S3-04: the label-verified read below is async — own the
+            // busy pair so the click can't double-fire while the lorebook
+            // loads (the re-render at the end replaces the button, hence the
+            // isConnected guard).
+            setControlBusy(btn, true);
+            try {
+                // Label-verified: refuse to promote off another NPC's entry content.
+                const existing = await loadEntryContent(reg.uid, name);
+                const item = {
+                    id: `promote-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: 'promote', action: 'update', name, data: {},
+                    proposedContent: '(promoting)', existingContent: existing,
+                    mergedContent: existing ? buildPromotedContent(existing) : '',
+                    keywords: reg.keywords || [name], uid: reg.uid, fromType: 'minor', toType: 'major',
+                };
+                state.stagingItems.push(item);
+                addNotificationEntry(item);
+                state.activeItemId = item.id;
+                state.activeSubTab = 'staging';
+                renderNpcsSubTab();
+            } finally {
+                if (btn.isConnected) setControlBusy(btn, false);
+            }
+        });
+    });
+
+    el.querySelectorAll('.kt-npc-demote').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            const reg = getRegistry()[name];
+            if (reg?.uid == null) return;
+            // A11Y-S3-04: same busy contract as Promote — the read is async,
+            // so the click can't double-fire while the lorebook loads.
+            setControlBusy(btn, true);
+            try {
+                // Label-verified: refuse to demote off another NPC's entry content.
+                const existing = await loadEntryContent(reg.uid, name);
+                const item = {
+                    id: `demote-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: 'demote', action: 'update', name, data: {},
+                    proposedContent: '(demoting)', existingContent: existing,
+                    mergedContent: existing ? buildDemotedContent(existing) : '',
+                    keywords: reg.keywords || [name], uid: reg.uid, fromType: 'major', toType: 'minor',
+                };
+                state.stagingItems.push(item);
+                addNotificationEntry(item);
+                state.activeItemId = item.id;
+                state.activeSubTab = 'staging';
+                renderNpcsSubTab();
+            } finally {
+                if (btn.isConnected) setControlBusy(btn, false);
+            }
+        });
+    });
+
+    // ── Growth Profile handler ──
+    // Generates an evidence-driven character profile (anti-textbook) from
+    // behavioral observations captured in recent messages. Two API calls:
+    // evidence capture, then profile synthesis. See NPC_GROWTH_BLUEPRINT.md.
+    el.querySelectorAll('.kt-npc-growth').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            openGrowthProfileModal(name, btn);
+        });
+    });
+
+    el.querySelectorAll('.kt-npc-view').forEach(btn => {
+        // Pass the button so openNpcViewModal can own its busy pair across
+        // the awaited lorebook read (A11Y-S3-04).
+        btn.addEventListener('click', () => openNpcViewModal(btn.dataset.name, btn));
+    });
+
+    el.querySelectorAll('.kt-npc-identity').forEach(btn => {
+        btn.addEventListener('click', () => openIdentityModal(btn.dataset.name));
+    });
+
+    el.querySelectorAll('.kt-npc-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const name = btn.dataset.name;
+            if (!confirm(`Remove "${name}" from registry? (Lorebook entry stays.)`)) return;
+            state.stagingItems = state.stagingItems.filter(i => i.name !== name);
+            if (state.activeItemId && !state.stagingItems.find(i => i.id === state.activeItemId)) state.activeItemId = null;
+            for (const id of Object.keys(state.notificationEntries)) {
+                if (state.notificationEntries[id]?.item?.name === name) removeNotificationEntry(id);
+            }
+            const reg = getRegistry();
+            delete reg[name];
+            saveRegistry(reg);
+            // Capture what the relationship wipe below removes BEFORE removing
+            // it, so the Recent Changes panel can log it — this is a manual
+            // mutation path, and the panel claims a full session audit.
+            const removedRelChanges = [];
+            for (const edge of getNpcRelationships(name)) {
+                removedRelChanges.push({ kind: 'edge', action: 'removed', from: name, to: edge.target, previousType: edge.type });
+            }
+            for (const [from, targets] of Object.entries(getRelationships())) {
+                for (const edge of targets) {
+                    if (edge.target === name) removedRelChanges.push({ kind: 'edge', action: 'removed', from, to: name, previousType: edge.type });
+                }
+            }
+            const previousStance = getStance(name);
+            if (previousStance) removedRelChanges.push({ kind: 'stance', action: 'cleared', npc: name, previousStance });
+            removeAllRelationshipsFor(name);
+            setStance(name, '');
+            if (removedRelChanges.length > 0) recordRelationshipChanges(removedRelChanges, 'manual');
+            // Clean up the evidence file (Slice 2) so chat metadata doesn't
+            // accumulate orphaned evidence for removed NPCs.
+            import('./evidence.js').then(({ deleteEvidenceFile }) => deleteEvidenceFile(name));
+            // Same for the per-field dossier staleness watermarks (TODO §3).
+            // Like the accept-path stamp, this is bookkeeping only — a throw
+            // here must never fail the removal itself (it would skip the
+            // re-render below).
+            try { deleteDossierFieldStatus(name); } catch (err) {
+                console.warn('[MWT:Knowledge] Dossier field-status cleanup skipped:', err?.message || err);
+            }
+            renderNpcsSubTab();
+        });
+    });
+}
+
+// ─── State Trackers sub-tab ──────────────────────────────────────────────────
+
+function renderStateTrackerContent() {
+    const reg = getStateRegistry();
+    const entries = Object.entries(reg);
+
+    return `
+        <div class="kt-state-container">
+            <div class="kt-state-toolbar">
+                <button id="kt-state-export" class="mwt-btn">⬇ Export</button>
+                <button id="kt-state-import" class="mwt-btn">⬆ Import</button>
+                <input type="file" id="kt-state-import-file" accept=".json" style="display:none" />
+            </div>
+            <div class="kt-state-register">
+                <h3>Register a State Tracker</h3>
+                <p style="color:var(--mwt-text-dim);font-size:12px">Create a lorebook entry in <strong>${getStateLorebookName()}</strong> with comment starting with <code>${TRACKER_SENTINEL}</code>.</p>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                    <label class="mwt-sr-only" for="kt-state-uid">UID</label>
+                    <input type="number" id="kt-state-uid" placeholder="UID" min="0" class="mwt-input" style="width:80px" />
+                    <label class="mwt-sr-only" for="kt-state-name">Display name</label>
+                    <input type="text" id="kt-state-name" placeholder="Display name" class="mwt-input" style="flex:1" />
+                    <button id="kt-state-register" class="mwt-btn mwt-btn-primary">Register</button>
+                </div>
+            </div>
+            ${entries.length === 0 ? '<div class="kt-empty" role="status">No state trackers registered.</div>' : `
+            <div class="kt-state-list">
+                ${entries.map(([name, info]) => {
+                    const enabled = info.enabled !== false;
+                    const alwaysUpdate = !!info.alwaysUpdate;
+                    // Slice 5 (a11y plan §4.6): same card contract as the NPC
+                    // lists — the name is a real h4 heading under the h3
+                    // "Register a State Tracker" section above.
+                    return `<div class="kt-npc-card">
+                        <div class="kt-npc-card-header"><h4 class="kt-npc-name">${escapeHtml(name)}</h4><span class="kt-npc-meta">UID ${info.uid}${enabled ? '' : ' · off'}${alwaysUpdate ? ' · always' : ''}</span></div>
+                        <div class="kt-npc-actions">
+                            <label for="kt-state-enabled-${escapeHtml(name)}"><input type="checkbox" id="kt-state-enabled-${escapeHtml(name)}" class="kt-state-enabled" data-name="${escapeHtml(name)}" ${enabled ? 'checked' : ''} /> Auto</label>
+                            <label for="kt-state-always-${escapeHtml(name)}"><input type="checkbox" id="kt-state-always-${escapeHtml(name)}" class="kt-state-always" data-name="${escapeHtml(name)}" ${alwaysUpdate ? 'checked' : ''} /> Always</label>
+                            <button class="mwt-btn kt-state-update" data-name="${escapeHtml(name)}">Update</button>
+                            <button class="mwt-btn kt-state-remove" data-name="${escapeHtml(name)}">Remove</button>
+                            <button class="mwt-btn kt-state-view" data-name="${escapeHtml(name)}">📖 View</button>
+                        </div></div>`;
+                }).join('')}
+            </div>`}
+        </div>`;
+}
+
+function wireStateTrackerEvents(el) {
+    const registerBtn = el.querySelector('#kt-state-register');
+    registerBtn?.addEventListener('click', async () => {
+        const uid = parseInt(el.querySelector('#kt-state-uid')?.value, 10);
+        const name = el.querySelector('#kt-state-name')?.value?.trim();
+        if (Number.isNaN(uid) || !name) { ktSetStatus('Enter both UID and name.', 'error'); return; }
+        // A11Y-S3-04: the sentinel check awaits a lorebook read — own the
+        // busy pair across it (the successful path re-renders the sub-tab
+        // and replaces this button, hence the isConnected guard).
+        setControlBusy(registerBtn, true);
+        try {
+            const loaded = await loadStateTrackerEntry(uid);
+            if (!loaded) { ktSetStatus(`UID ${uid} not found.`, 'error'); return; }
+            if (!loaded.comment.startsWith(TRACKER_SENTINEL)) { ktSetStatus(`Missing ${TRACKER_SENTINEL} sentinel.`, 'error'); return; }
+            registerStateTracker(name, uid);
+            renderNpcsSubTab();
+        } finally {
+            if (registerBtn.isConnected) setControlBusy(registerBtn, false);
+        }
+    });
+
+    el.querySelectorAll('.kt-state-enabled').forEach(cb => {
+        cb.addEventListener('change', () => { setStateTrackerEnabled(cb.dataset.name, cb.checked); renderNpcsSubTab(); });
+    });
+
+    el.querySelectorAll('.kt-state-always').forEach(cb => {
+        cb.addEventListener('change', () => { setStateTrackerAlwaysUpdate(cb.dataset.name, cb.checked); renderNpcsSubTab(); });
+    });
+
+    el.querySelectorAll('.kt-state-update').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            const info = getStateRegistry()[name];
+            if (!info) return;
+            try {
+                setControlBusy(btn, true); btn.textContent = '⏳…';
+                const result = await runStateUpdate(name, info.uid);
+                if (result.unchanged) { bumpStateTrackerTimestamp(name); renderNpcsSubTab(); ktSetStatus(`No change for "${name}".`, 'info'); return; }
+                const stagingItem = {
+                    id: `state-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: 'state', action: 'update', name, data: {},
+                    proposedContent: result.merged, existingContent: result.currentContent,
+                    mergedContent: result.merged, keywords: [name], uid: info.uid,
+                };
+                const existingIdx = state.stagingItems.findIndex(it => it.type === 'state' && it.uid === info.uid);
+                if (existingIdx >= 0) {
+                    const existing = state.stagingItems[existingIdx];
+                    removeNotificationEntry(existing.id);
+                    if (existing.edited) {
+                        // Preserve the user's manual edits; only refresh metadata.
+                        stagingItem.id = existing.id;
+                        stagingItem.edited = true;
+                        stagingItem.mergedContent = existing.mergedContent;
+                        stagingItem.proposedContent = existing.mergedContent || existing.proposedContent;
+                        stagingItem.existingContent = existing.existingContent ?? stagingItem.existingContent;
+                    } else {
+                        // Preserve the outgoing proposal as superseded so
+                        // nothing is silently lost on re-scan.
+                        const priorSuperseded = Array.isArray(existing.supersededContent) ? existing.supersededContent : [];
+                        const outgoingContent = existing.mergedContent || existing.proposedContent;
+                        stagingItem.id = existing.id;
+                        stagingItem.supersededContent = outgoingContent
+                            ? [...priorSuperseded, { content: outgoingContent, timestamp: Date.now() }]
+                            : priorSuperseded;
+                    }
+                    state.stagingItems[existingIdx] = stagingItem;
+                }
+                else state.stagingItems.push(stagingItem);
+                state.activeItemId = stagingItem.id;
+                state.activeSubTab = 'staging';
+                addNotificationEntry(stagingItem);
+                renderNpcsSubTab();
+                ktSetStatus(`State update for "${name}" staged.`, 'success');
+            } catch (err) {
+                // Coordinator cancellation (TODO §1): quiet discard — the
+                // finally restores the button, no failure status.
+                if (isCancellation(err)) {
+                    console.log(`[MWT:Knowledge] State update for "${name}" cancelled (coordinator) — discarded.`);
+                    return;
+                }
+                ktSetStatus(`Update failed: ${err.message}`, 'error');
+            }
+            finally { setControlBusy(btn, false); btn.textContent = 'Update'; }
+        });
+    });
+
+    el.querySelectorAll('.kt-state-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!confirm(`Remove "${btn.dataset.name}"? (Lorebook entry stays.)`)) return;
+            unregisterStateTracker(btn.dataset.name);
+            renderNpcsSubTab();
+        });
+    });
+
+    el.querySelectorAll('.kt-state-view').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            // Same singleton + in-flight contract as openNpcViewModal: the
+            // shared flag spans this await, so a click on EITHER view path
+            // cannot start a second load while one is already in flight and
+            // cannot stack a second #kt-view-modal.
+            if (document.getElementById('kt-view-modal') || viewModalOpening) return;
+            viewModalOpening = true;
+            // A11Y-S3-04: own this button's busy pair across the awaited read.
+            setControlBusy(btn, true);
+            try {
+                const name = btn.dataset.name;
+                const info = getStateRegistry()[name];
+                if (!info) return;
+                const loaded = await loadStateTrackerEntry(info.uid);
+                if (loaded) {
+                    createKnowledgeViewModal(name, loaded.content);
+                }
+            } finally {
+                viewModalOpening = false;
+                if (btn.isConnected) setControlBusy(btn, false);
+            }
+        });
+    });
+
+    const exportBtn = el.querySelector('#kt-state-export');
+    exportBtn?.addEventListener('click', async () => {
+        // A11Y-S3-04: one awaited lorebook read per tracker — own the busy
+        // pair so the export can't be double-fired mid-walk.
+        setControlBusy(exportBtn, true);
+        try {
+            const trackers = {};
+            for (const [name, info] of Object.entries(getStateRegistry())) {
+                const loaded = await loadStateTrackerEntry(info.uid);
+                trackers[name] = { uid: info.uid, content: loaded?.content || null };
+            }
+            const { downloadJson } = await import('../core/index.js');
+            downloadJson(`state-trackers-${Date.now()}.json`, { version: 1, trackers });
+        } finally {
+            if (exportBtn.isConnected) setControlBusy(exportBtn, false);
+        }
+    });
+
+    const importBtn = el.querySelector('#kt-state-import');
+    importBtn?.addEventListener('click', async () => {
+        // A11Y-S3-04: the file picker + parse are async — own the busy pair.
+        setControlBusy(importBtn, true);
+        try {
+            const { pickTextFile } = await import('../core/index.js');
+            const text = await pickTextFile('.json');
+            if (!text) return;
+            try {
+                const snapshot = JSON.parse(text);
+                if (!snapshot.trackers) throw new Error('Invalid format');
+                for (const [name, data] of Object.entries(snapshot.trackers)) {
+                    if (data.uid !== undefined) registerStateTracker(name, data.uid);
+                }
+                renderNpcsSubTab();
+                ktSetStatus('State trackers imported.', 'success');
+            } catch (err) { ktSetStatus(`Import failed: ${err.message}`, 'error'); }
+        } finally {
+            if (importBtn.isConnected) setControlBusy(importBtn, false);
+        }
+    });
+}
+
+// ─── NPC Growth Profile modal ────────────────────────────────────────────────
+
+/**
+ * Open the Growth Profile modal in READ-ONLY mode.
+ *
+ * Design fix: nothing touches the API on open. The modal shows what's already
+ * in evidence (the observation list from the two-tier store) and the last
+ * saved profile (if any). The user then explicitly chooses to:
+ *   - Capture: extract new behavioral evidence from recent messages
+ *   - Generate: synthesize a profile from existing evidence
+ *   - Consolidate: distill raw observations into consolidated claims
+ *   - Backfill: recover evidence from ILS-summarized history (one batch)
+ *   - Catch Up: loop Backfill + Capture until evidence is current (multi-batch)
+ *
+ * All are explicit button presses — no silent API calls on open.
+ *
+ * @param {string} name — NPC name
+ * @param {HTMLButtonElement} triggerBtn — the button that launched the modal
+ */
+// In-flight singleton guard for openGrowthProfileModal. The modal node only
+// exists once its opening awaits resolve, so the DOM-level singleton check
+// below cannot see a second click that lands inside that window — two rapid
+// clicks used to stack two #kt-growth-modal nodes (duplicate ids, Escape
+// handlers fighting over one close).
+let growthModalOpening = false;
+
+async function openGrowthProfileModal(name, triggerBtn) {
+    // Singleton: never two Growth modals. The DOM check covers a modal that
+    // already finished opening; the in-flight flag covers the await window
+    // before the node exists — a race openIdentityModal /
+    // openDossierFieldRefreshModal's id checks cannot see.
+    if (growthModalOpening || document.getElementById('kt-growth-modal')) return;
+    growthModalOpening = true;
+    // A11Y-S3-04: the opening awaits module loads + read-only lorebook reads —
+    // own the trigger button's busy pair so a second click can't race the
+    // in-flight guard's await window.
+    if (triggerBtn) setControlBusy(triggerBtn, true);
+    try {
+        // Opening a Growth Profile modal = the user is now reviewing evidence.
+        // Clear the unread counter so the floating-button pulse stops, and
+        // dispatch mwt:busy-changed so the button updates immediately.
+        if (state.unreadGrowthEvidenceCount !== 0) {
+            state.unreadGrowthEvidenceCount = 0;
+            document.dispatchEvent(new CustomEvent('mwt:busy-changed'));
+        }
+
+        // Chat-scope guard. The chat-change sweeps (knowledge/index.js)
+        // remove #kt-growth-modal on a chat switch, but they cannot remove a
+        // modal that does not exist yet: without this check a chat change
+        // during the opening awaits appended the OLD chat's modal into the
+        // NEW chat, where its evidence editing and Save-to-Lorebook handlers
+        // acted on the new chat's stores. Capture before the first await;
+        // recheck after each one (§7.5: epoch always, identity when known).
+        const scope = captureScope();
+
+        // Load what's already in evidence + the last profile — all READ-ONLY
+        // (synchronous reads from chat metadata + one local lorebook read).
+        // No API calls fire here.
+        const { loadProfile } = await import('./growth.js');
+        const { getEvidenceForProfile, getEvidenceSummary, getUserOverrides } = await import('./evidence.js');
+
+        // Stale after the module awaits → the reads below would already be
+        // reading the NEW chat's stores with the OLD chat's intent; discard
+        // the open entirely.
+        if (!scopeStillCurrent(scope).ok) {
+            console.log('[MWT:Knowledge] Growth Profile modal discarded — the chat changed while it was opening.');
+            return;
+        }
+
+        const observations = getEvidenceForProfile(name);
+        const summary = getEvidenceSummary(name);
+        const overrides = getUserOverrides(name);
+        let existingProfile = null;
+        try { existingProfile = await loadProfile(name); } catch { /* ignore load errors */ }
+
+        // Final recheck, immediately before the append: this is the last
+        // moment the modal is invisible to the chat-change sweep, so a stale
+        // append here would land the old chat's evidence in the new chat.
+        if (!scopeStillCurrent(scope).ok) {
+            console.log('[MWT:Knowledge] Growth Profile modal discarded — the chat changed while it was opening.');
+            return;
+        }
+
+        // Build the modal with the read-only state already populated (no spinner).
+        const modal = document.createElement('div');
+        modal.id = 'kt-growth-modal';
+        modal.className = 'mwt-modal kt-growth-modal';
+        modal.style.display = 'flex';
+        modal.innerHTML = `
+            <div class="mwt-modal-backdrop"></div>
+            <div class="mwt-modal-panel">
+                <div class="mwt-modal-header">
+                    <h3><span aria-hidden="true">🌱</span> Growth Profile — ${escapeHtml(name)}</h3>
+                    <button class="mwt-modal-close" title="Close">&times;</button>
+                </div>
+                <div class="mwt-modal-body">
+                    <div class="kt-growth-status">
+                        <span class="kt-growth-status-text">${renderGrowthStatusText(summary, existingProfile)}</span>
+                    </div>
+                    <div class="kt-growth-content"></div>
+                </div>
+                <div class="mwt-modal-statusbar">
+                    <span class="mwt-status" role="status" aria-live="polite" aria-atomic="true"></span>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+
+        const contentEl = modal.querySelector('.kt-growth-content');
+        decorateModalShell(modal, { title: `Growth Profile — ${name}`, closeOnBackdrop: false, destroyOnClose: true });
+        // Render the read-only state immediately. The profile editor shows the
+        // existing profile (or an empty editor + hint if none has been generated).
+        contentEl.innerHTML = renderGrowthProfileContent(name, observations, existingProfile || '', '', false, existingProfile, null, overrides);
+        wireGrowthProfileEvents(modal, name, existingProfile || '', triggerBtn);
+    } finally {
+        growthModalOpening = false;
+        // The tab may have re-rendered while the modal was opening; never
+        // touch a control a re-render already replaced.
+        if (triggerBtn?.isConnected) setControlBusy(triggerBtn, false);
+    }
+}
+
+/**
+ * Build the status-line text shown at the top of the growth modal.
+ * Summarizes what's currently in evidence so the user knows their starting
+ * point before pressing any action button.
+ */
+function renderGrowthStatusText(summary, existingProfile) {
+    if (!summary || (summary.raw === 0 && summary.consolidated === 0)) {
+        return 'No evidence captured yet. Use the actions below to begin.';
+    }
+    const parts = [];
+    if (summary.consolidated > 0) parts.push(`${summary.consolidated} consolidated`);
+    if (summary.raw > 0) parts.push(`${summary.raw} raw`);
+    let text = `Evidence on file: ${parts.join(', ')} observation${(summary.raw + summary.consolidated) !== 1 ? 's' : ''}`;
+    if (existingProfile) text += ' · profile loaded (editable below)';
+    if (summary.lastProfileAt) text += ` · last generated ${formatHistoryAge(summary.lastProfileAt)}`;
+    return text;
+}
+
+/**
+ * Re-read the evidence store + profile and re-render the modal body in place.
+ * Used after Capture / Consolidate / Backfill mutate the evidence store, so
+ * the user sees the updated state without the modal closing and reopening.
+ *
+ * Preserves any unsaved edits in the profile editor and the optional flash
+ * message is shown in the modal's status bar.
+ */
+async function refreshGrowthModalContent(modal, name, triggerBtn, flashMsg) {
+    const { getEvidenceForProfile, getEvidenceSummary, getUserOverrides } = await import('./evidence.js');
+    const observations = getEvidenceForProfile(name);
+    const summary = getEvidenceSummary(name);
+    const overrides = getUserOverrides(name);
+    // Preserve any unsaved edits in the profile editor so a capture/consolidate
+    // doesn't blow away what the user was typing.
+    const editorEl = modal.querySelector('#kt-growth-profile-text');
+    const preservedProfile = editorEl ? editorEl.value : '';
+
+    const statusTextEl = modal.querySelector('.kt-growth-status-text');
+    if (statusTextEl) statusTextEl.textContent = renderGrowthStatusText(summary, preservedProfile || null);
+
+    const contentEl = modal.querySelector('.kt-growth-content');
+    if (contentEl) {
+        contentEl.innerHTML = renderGrowthProfileContent(name, observations, preservedProfile, '', false, null, null, overrides);
+        wireGrowthProfileEvents(modal, name, preservedProfile, triggerBtn);
+    }
+    if (flashMsg) {
+        // Route through the shared setStatus() (a11y plan §4.4) so the write
+        // lands in the live-region contract instead of the bare textContent
+        // assignment the Growth modal's custom shell never announced.
+        setStatus(modal, flashMsg, 'success', 3000);
+    }
+}
+
+/**
+ * Render the growth profile results: evidence observations + profile prose.
+ *
+ * Slice 2: the profile section now includes a "Save to Lorebook" button that
+ * writes the (possibly edited) profile to the non-injected "NPC Profiles"
+ * lorebook, and the evidence section is editable (claim text, delete, promote
+ * to canon) so the user can correct the model before saving.
+ */
+function renderGrowthProfileContent(name, observations, profile, canon, truncated = false, existingProfile = null, captureStats = null, overrides = []) {
+    const obsByCategory = { trait: [], value: [], speech: [] };
+    for (const o of observations) {
+        const cat = obsByCategory[o.category] ? o.category : 'trait';
+        obsByCategory[cat].push(o);
+    }
+
+    // Count consolidated vs raw for the toolbar status
+    const consolidatedCount = observations.filter(o => o.tier === 'consolidated').length;
+    const rawCount = observations.filter(o => o.tier !== 'consolidated').length;
+    const nonCanonRawCount = observations.filter(o => o.tier !== 'consolidated' && !o.canon).length;
+
+    const renderObsList = (cat, label) => {
+        const list = obsByCategory[cat];
+        if (!list || list.length === 0) return '';
+        return `<div class="kt-growth-obs-group">
+            <div class="kt-growth-obs-cat">${escapeHtml(label)} (${list.length})</div>
+            ${list.map(o => `
+                <div class="kt-growth-obs" data-obs-id="${escapeHtml(o.id || '')}" data-tier="${escapeHtml(o.tier || 'raw')}">
+                    <div class="kt-growth-obs-header">
+                        ${o.canon ? '<span class="kt-growth-obs-canon" title="Canon: user-authored, authoritative, outranks inference"><span aria-hidden="true">👑</span> canon</span>' : ''}
+                        ${o.tier === 'consolidated' ? '<span class="kt-growth-obs-tier" title="Consolidated from raw observations"><span aria-hidden="true">🔗</span> consolidated</span>' : ''}
+                    </div>
+                    <div class="kt-growth-obs-claim" contenteditable="true" data-field="claim">${escapeHtml(o.claim)}</div>
+                    <div class="kt-growth-obs-quote">"${escapeHtml(o.quote)}"${o.msgIdx != null ? ` <span class="kt-growth-obs-msgidx">[msg ${o.msgIdx}]</span>` : ''}${o.verified === false ? ` <span class="kt-growth-obs-unverified" title="This quote could not be matched word-for-word to its cited message — it may be paraphrased. Trace the message to confirm."><span aria-hidden="true">⚠</span> not verbatim</span>` : ''}</div>
+                    ${o.tier !== 'consolidated' ? `<div class="kt-growth-obs-tools">
+                        <button class="mwt-btn kt-growth-obs-canon-btn" data-action="canon" data-id="${escapeHtml(o.id || '')}">${o.canon ? '<span aria-hidden="true">👑</span> Remove canon' : '<span aria-hidden="true">👑</span> Promote to canon'}</button>
+                        <button class="mwt-btn kt-growth-obs-del-btn" data-action="delete" data-id="${escapeHtml(o.id || '')}" title="Delete this observation" aria-label="Delete observation">🗑</button>
+                    </div>` : `<div class="kt-growth-obs-tools">
+                        <button class="mwt-btn kt-growth-con-del-btn" data-action="con-delete" data-id="${escapeHtml(o.id || '')}" title="Delete this consolidated claim" aria-label="Delete consolidated claim">🗑</button>
+                        <button class="mwt-btn kt-growth-con-expand-btn" data-action="con-expand" data-id="${escapeHtml(o.id || '')}" title="Undo consolidation — restore source observations to raw"><span aria-hidden="true">↩</span> Expand</button>
+                    </div>`}
+                </div>
+            `).join('')}
+        </div>`;
+    };
+
+    const captureNote = captureStats
+        ? (captureStats.added > 0
+            ? `${captureStats.added} new observation${captureStats.added !== 1 ? 's' : ''} added to evidence${captureStats.skipped > 0 ? `, ${captureStats.skipped} duplicate${captureStats.skipped !== 1 ? 's' : ''} skipped` : ''}.`
+            : (captureStats.skipped > 0 ? `${captureStats.skipped} duplicate${captureStats.skipped !== 1 ? 's' : ''} — all already captured.` : ''))
+        : '';
+
+    return `
+        ${truncated ? `<div class="kt-growth-warning"><span aria-hidden="true">⚠️</span> <strong>This profile looks cut off mid-sentence.</strong> The model's response was likely truncated by a response-length cap <em>below</em> your Max Tokens — most often the connection profile's own preset. Open the browser console for <code>finish_reason</code> / <code>completion_tokens</code>, raise the effective cap, then regenerate.</div>` : ''}
+        ${existingProfile ? `<div class="kt-growth-existing-note"><span aria-hidden="true">📝</span> An existing profile was found in the NPC Profiles lorebook. The generated profile below will replace it when you save.</div>` : ''}
+        ${captureNote ? `<div class="kt-growth-capture-note"><span aria-hidden="true">📊</span> ${escapeHtml(captureNote)}</div>` : ''}
+        <div class="kt-growth-actions-toolbar">
+            <div class="kt-growth-section-label"><span aria-hidden="true">⚙️</span> Actions <span class="kt-growth-hint">— explicit steps; nothing fires until you press a button</span></div>
+            <div class="kt-growth-actions-buttons">
+                <button class="mwt-btn mwt-btn-primary" id="kt-growth-capture" title="Extract new behavioral evidence (observations + verbatim quotes) from recent messages and append it to the evidence store. One API call."><span aria-hidden="true">🔍</span> Capture Evidence</button>
+                <button class="mwt-btn mwt-btn-primary" id="kt-growth-regenerate" title="Synthesize the profile from existing evidence (no re-capture). One API call. Disabled if no evidence on file." ${observations.length === 0 ? 'disabled' : ''}><span aria-hidden="true">📝</span> Generate Profile</button>
+                <button class="mwt-btn" id="kt-growth-consolidate" title="Distill raw observations into consolidated claims. Consumed raw entries are archived. Disabled if fewer than 2 non-canon raw observations." ${nonCanonRawCount < 2 ? 'disabled' : ''}><span aria-hidden="true">🔗</span> Consolidate</button>
+                <button class="mwt-btn" id="kt-growth-backfill" title="Expand ILS summary messages back to their originals and capture evidence from the restored text (one-time/bounded)."><span aria-hidden="true">📦</span> Backfill</button>
+                <button class="mwt-btn" id="kt-growth-catchup" title="Continuously read ALL history (summarized + live) until evidence is caught up to the current chat. Fires a notification when done."><span aria-hidden="true">🚀</span> Catch Up</button>
+            </div>
+            <div class="kt-growth-catchup-progress" id="kt-growth-catchup-progress" style="display:none"></div>
+        </div>
+        <div class="kt-growth-evidence">
+            <div class="kt-growth-section-label">📊 Evidence (${observations.length} observation${observations.length !== 1 ? 's' : ''}${consolidatedCount > 0 ? `: ${consolidatedCount} consolidated, ${rawCount} raw` : ''}) <span class="kt-growth-hint">— click a claim to edit, 👑 to promote to canon, 🗑 to delete</span></div>
+            ${renderObsList('trait', 'Traits')}
+            ${renderObsList('value', 'Values')}
+            ${renderObsList('speech', 'Speech')}
+        </div>
+        <div class="kt-growth-profile-section">
+            <div class="kt-growth-section-label" id="kt-growth-profile-label"><span aria-hidden="true">📝</span> Generated Profile <span class="kt-growth-hint">(edit freely before saving)</span></div>
+            <textarea class="kt-growth-profile-editor" id="kt-growth-profile-text" aria-labelledby="kt-growth-profile-label">${escapeHtml(profile)}</textarea>
+            <div class="kt-growth-actions">
+                <button class="mwt-btn mwt-btn-primary" id="kt-growth-save"><span aria-hidden="true">💾</span> Save to Lorebook</button>
+                <button class="mwt-btn" id="kt-growth-copy"><span aria-hidden="true">📋</span> Copy Profile</button>
+                <button class="mwt-btn" id="kt-growth-copy-evidence"><span aria-hidden="true">📋</span> Copy Evidence</button>
+                <button class="mwt-btn" id="kt-growth-psychoanalyze" title="Generate a depth-oriented psychoanalytic portrait (copy-only — NEVER injected or saved)"><span aria-hidden="true">🧠</span> Psychoanalyze</button>
+            </div>
+        </div>
+        <div class="kt-growth-psychoanalyze-section" id="kt-growth-psychoanalyze-container" style="display:none">
+            <div class="kt-growth-section-label" id="kt-growth-psychoanalyze-label"><span aria-hidden="true">🧠</span> Psychoanalytic Portrait <span class="kt-growth-hint">(copy-only · NEVER injected or saved to any lorebook)</span></div>
+            <div class="kt-growth-psychoanalyze-warning"><span aria-hidden="true">⚠️</span> <strong>This is a dead-end analytical view.</strong> It reads the full character entry including <code>Personality:</code> as historical baseline. It is never injected, never saved, and never read by any other system. Copy it externally (notepad, etc.) to compare against future portraits.</div>
+            <div class="kt-growth-psychoanalyze-content"></div>
+        </div>
+        ${overrides.length > 0 ? `<div class="kt-growth-overrides-section">
+            <div class="kt-growth-section-label"><span aria-hidden="true">📌</span> User Notes (survive regeneration) <span class="kt-growth-hint">— hand-edits pinned to the profile</span></div>
+            ${overrides.map(o => `
+                <div class="kt-growth-override" data-override-id="${escapeHtml(o.id)}">
+                    <div class="kt-growth-override-text" contenteditable="true">${escapeHtml(o.text)}</div>
+                    <button class="mwt-btn kt-growth-override-del" data-id="${escapeHtml(o.id)}" title="Delete this user note" aria-label="Delete user note">🗑</button>
+                </div>
+            `).join('')}
+        </div>` : ''}
+        <div class="kt-growth-overrides-add">
+            <button class="mwt-btn" id="kt-growth-add-override" title="Add a user note that survives profile regeneration"><span aria-hidden="true">📌</span> Add User Note</button>
+        </div>
+        <div class="kt-growth-explainer">
+            <strong>How this works:</strong> The profile above is generated solely from the behavioral
+            observations listed under Evidence — each backed by a verbatim quote. It does not read or
+            refine any prior <code>Personality:</code> line, breaking the feedback loop where personality
+            is re-derived from its own prose every cycle. Observations are now persisted in chat metadata
+            (the two-tier evidence store); saving writes the profile to the <strong>NPC Profiles</strong>
+            lorebook (a separate lorebook with no keywords, so it's never auto-injected). Once an NPC has
+            a growth profile, the dossier updater stops touching its <code>Personality:</code> line.
+        </div>
+    `;
+}
+
+function wireGrowthProfileEvents(modal, name, profile, triggerBtn) {
+
+    // Helper to flash a status message in the modal's status bar. Routes
+    // through the shared setStatus() (a11y plan §4.4): same text/class/opacity
+    // behavior, plus the polite live-region semantics stamped on the Growth
+    // modal's custom shell, and the CORE-03 timer-cancellation the old bare
+    // write never had.
+    const flash = (msg, type = 'success') => {
+        setStatus(modal, msg, type, type === 'success' ? 3000 : 0);
+    };
+
+    // ── Save to Lorebook ──
+    modal.querySelector('#kt-growth-save')?.addEventListener('click', async () => {
+        const text = modal.querySelector('#kt-growth-profile-text')?.value || profile;
+        if (!text.trim()) { flash('Profile is empty — nothing to save.', 'error'); return; }
+        const btn = modal.querySelector('#kt-growth-save');
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Saving…';
+            const { saveProfile } = await import('./growth.js');
+            const result = await saveProfile(name, text);
+            if (result.success && result.uidRecorded === false) {
+                // The entry is on disk but nothing points at it: the profile
+                // will read as "never saved" everywhere (including the
+                // Interiority "Profiled NPCs only" filter) and the next save
+                // will create a duplicate. Reporting a plain success here hid
+                // exactly that state. setProfileUid logged the details.
+                flash(
+                    `Saved to the lorebook (UID ${result.uid}), but the NPC registry could not ` +
+                    `record the pointer — see the console.`,
+                    'error'
+                );
+            } else if (result.success) {
+                flash(`Profile saved to "NPC Profiles" lorebook (UID ${result.uid}).`, 'success');
+            } else {
+                flash(`Save failed: ${result.error}`, 'error');
+            }
+        } catch (err) {
+            flash(`Save failed: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">💾</span> Save to Lorebook';
+        }
+    });
+
+    // ── Copy Profile ──
+    // A11Y-S3-03: clipboard writes are permission-gated async calls — own the
+    // busy pair so a hanging permission prompt can't double-fire the write.
+    const copyProfileBtn = modal.querySelector('#kt-growth-copy');
+    copyProfileBtn?.addEventListener('click', async () => {
+        const text = modal.querySelector('#kt-growth-profile-text')?.value || profile;
+        setControlBusy(copyProfileBtn, true);
+        try {
+            await navigator.clipboard.writeText(text);
+            flash('Profile copied to clipboard.');
+        } catch (err) {
+            flash(`Copy failed: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(copyProfileBtn, false);
+        }
+    });
+
+    // ── Copy Evidence ──
+    const copyEvidenceBtn = modal.querySelector('#kt-growth-copy-evidence');
+    copyEvidenceBtn?.addEventListener('click', async () => {
+        const claims = [...modal.querySelectorAll('.kt-growth-obs-claim')].map(el => el.textContent);
+        const quotes = [...modal.querySelectorAll('.kt-growth-obs-quote')].map(el => el.textContent);
+        const evidenceText = claims.map((c, i) => `- ${c}\n  Quote: ${quotes[i] || ''}`).join('\n');
+        setControlBusy(copyEvidenceBtn, true);
+        try {
+            await navigator.clipboard.writeText(`Evidence for ${name}:\n${evidenceText}`);
+            flash('Evidence copied to clipboard.');
+        } catch (err) {
+            flash(`Copy failed: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(copyEvidenceBtn, false);
+        }
+    });
+
+    // ── Psychoanalyze (dead-end view) ──
+    // Generates a depth-oriented psychoanalytic portrait from the existing
+    // evidence + the FULL lorebook entry (including Personality:). This is a
+    // DEAD-END view — never injected, never saved, never read back. The user
+    // copies it externally to compare across generations. See the blueprint
+    // discussion for why the full entry is safe here (no path back to context).
+    modal.querySelector('#kt-growth-psychoanalyze')?.addEventListener('click', async () => {
+        const btn = modal.querySelector('#kt-growth-psychoanalyze');
+        const container = modal.querySelector('#kt-growth-psychoanalyze-container');
+        const contentDiv = modal.querySelector('.kt-growth-psychoanalyze-content');
+        if (!container || !contentDiv) return;
+
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Analyzing…';
+            flash('Generating psychoanalytic portrait…', 'info');
+
+            const { runPsychoanalyzeProfile, looksTruncated } = await import('./growth.js');
+            const { portrait } = await runPsychoanalyzeProfile(name);
+
+            // Prepend a self-documenting header so a saved profile (copied to
+            // notepad) records when it was generated and how much evidence it
+            // was based on — essential for longitudinal comparison.
+            const now = new Date();
+            const ts = now.toLocaleString();
+            const header = `=== Psychoanalytic Portrait: ${name} ===\nGenerated: ${ts}\n(This is a dead-end analytical view — never injected, never saved to any lorebook. Copy externally to compare across generations.)\n\n`;
+
+            const truncated = looksTruncated(portrait);
+            container.style.display = '';
+            contentDiv.innerHTML = `
+                ${truncated ? '<div class="kt-growth-warning" style="margin-bottom:8px">⚠️ <strong>This portrait looks cut off mid-sentence.</strong> The model may have hit a response-length cap below your Max Tokens. Raise the effective cap and regenerate.</div>' : ''}
+                <textarea class="kt-growth-psychoanalyze-editor" id="kt-growth-psychoanalyze-text" aria-labelledby="kt-growth-psychoanalyze-label">${escapeHtml(header + portrait)}</textarea>
+                <div class="kt-growth-actions">
+                    <button class="mwt-btn mwt-btn-primary" id="kt-growth-copy-psychoanalyze">📋 Copy Portrait</button>
+                    <span class="kt-growth-hint" style="margin-left:8px">⚠ NEVER injected or saved — copy externally only</span>
+                </div>
+            `;
+
+            // Wire the copy button for the psychoanalyze portrait
+            // A11Y-S3-03: same busy contract as the other clipboard buttons.
+            const copyBtn = contentDiv.querySelector('#kt-growth-copy-psychoanalyze');
+            copyBtn?.addEventListener('click', async () => {
+                const text = contentDiv.querySelector('#kt-growth-psychoanalyze-text')?.value || '';
+                setControlBusy(copyBtn, true);
+                try {
+                    await navigator.clipboard.writeText(text);
+                    flash('Psychoanalytic portrait copied to clipboard.');
+                } catch (err) {
+                    flash(`Copy failed: ${err.message}`, 'error');
+                } finally {
+                    setControlBusy(copyBtn, false);
+                }
+            });
+
+            flash('Psychoanalytic portrait generated.', 'success');
+            // Scroll to the new section — plain jump under reduced motion
+            // (a11y plan §4.5: gate JS-driven movement, not the scroll
+            // itself, so the section still becomes visible).
+            container.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' });
+        } catch (err) {
+            flash(`Psychoanalyze failed: ${err.message}`, 'error');
+            const innerContentDiv = modal.querySelector('.kt-growth-psychoanalyze-content');
+            if (innerContentDiv) {
+                innerContentDiv.innerHTML = `<div class="kt-growth-error">❌ ${escapeHtml(err.message)}</div>`;
+            }
+            const panelContainer = modal.querySelector('#kt-growth-psychoanalyze-container');
+            if (panelContainer) panelContainer.style.display = '';
+        } finally {
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">🧠</span> Psychoanalyze';
+        }
+    });
+
+    // ── Evidence editor: claim editing (save on blur) ──
+    modal.querySelectorAll('.kt-growth-obs-claim[contenteditable]').forEach(el => {
+        const obsId = el.closest('.kt-growth-obs')?.dataset.obsId;
+        if (!obsId) return;
+        el.addEventListener('blur', async () => {
+            const { updateRawObservation } = await import('./evidence.js');
+            updateRawObservation(name, obsId, { claim: el.textContent.trim() });
+        });
+    });
+
+    // ── Evidence editor: promote/remove canon ──
+    modal.querySelectorAll('.kt-growth-obs-canon-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const obsId = btn.dataset.id;
+            if (!obsId) return;
+            const { toggleCanon } = await import('./evidence.js');
+            const isCanon = toggleCanon(name, obsId);
+            if (isCanon === null) return;
+            // Update the UI in-place without a full re-render so the user's
+            // scroll position and editing focus are preserved.
+            const obsEl = btn.closest('.kt-growth-obs');
+            if (obsEl) {
+                const header = obsEl.querySelector('.kt-growth-obs-header');
+                if (isCanon) {
+                    if (!header.querySelector('.kt-growth-obs-canon')) {
+                        header.innerHTML = '<span class="kt-growth-obs-canon" title="Canon: user-authored, authoritative, outranks inference"><span aria-hidden="true">👑</span> canon</span>';
+                    }
+                    btn.innerHTML = '<span aria-hidden="true">👑</span> Remove canon';
+                } else {
+                    header.querySelector('.kt-growth-obs-canon')?.remove();
+                    btn.innerHTML = '<span aria-hidden="true">👑</span> Promote to canon';
+                }
+            }
+            flash(isCanon ? 'Promoted to canon.' : 'Canon removed.');
+        });
+    });
+
+    // ── Evidence editor: delete observation ──
+    modal.querySelectorAll('.kt-growth-obs-del-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const obsId = btn.dataset.id;
+            if (!obsId) return;
+            const obsEl = btn.closest('.kt-growth-obs');
+            if (!obsEl) return;
+            if (!confirm('Delete this observation from the evidence store?')) return;
+            const { deleteRawObservation } = await import('./evidence.js');
+            const deleted = deleteRawObservation(name, obsId);
+            if (deleted) {
+                obsEl.remove();
+                flash('Observation deleted from evidence.');
+            }
+        });
+    });
+
+    // ── Consolidated evidence: delete ── (Slice 3)
+    modal.querySelectorAll('.kt-growth-con-del-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const conId = btn.dataset.id;
+            if (!conId) return;
+            if (!confirm('Delete this consolidated claim? (Its source observations remain archived.)')) return;
+            const { deleteConsolidated } = await import('./evidence.js');
+            const deleted = deleteConsolidated(name, conId);
+            if (deleted) {
+                btn.closest('.kt-growth-obs')?.remove();
+                flash('Consolidated claim deleted.');
+            }
+        });
+    });
+
+    // ── Consolidated evidence: expand (undo consolidation) ── (Slice 3)
+    modal.querySelectorAll('.kt-growth-con-expand-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const conId = btn.dataset.id;
+            if (!conId) return;
+            if (!confirm('Expand this consolidated claim? Its source observations will be restored from the archive to raw evidence.')) return;
+            const { expandConsolidated } = await import('./evidence.js');
+            const expanded = expandConsolidated(name, conId);
+            if (expanded) {
+                btn.closest('.kt-growth-obs')?.remove();
+                flash('Consolidated claim expanded — source observations restored to raw.');
+            }
+        });
+    });
+
+    // ── Capture Evidence ──
+    // Extract new behavioral evidence from recent messages and append it to
+    // the evidence store. One API call. After capture, re-render the modal
+    // in place so the new observations appear without closing/reopening.
+    modal.querySelector('#kt-growth-capture')?.addEventListener('click', async () => {
+        const btn = modal.querySelector('#kt-growth-capture');
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Capturing…';
+            flash('Capturing behavioral evidence from recent messages…', 'info');
+            const { runCaptureOnly } = await import('./growth.js');
+            const { captureStats } = await runCaptureOnly(name);
+
+            let addedText;
+            if (captureStats.deltaTooSmall) {
+                addedText = `Already up to date — no new messages found since the last capture. Use “Catch Up” to read all history, or play a few more turns and try again.`;
+            } else if (captureStats.added > 0) {
+                addedText = `Capture complete: +${captureStats.added} observation${captureStats.added !== 1 ? 's' : ''}${captureStats.skipped > 0 ? ` (${captureStats.skipped} duplicate${captureStats.skipped !== 1 ? 's' : ''} skipped)` : ''}.`;
+            } else {
+                addedText = `No new observations found${captureStats.skipped > 0 ? ` (${captureStats.skipped} duplicate${captureStats.skipped !== 1 ? 's' : ''} already captured)` : ''}.`;
+            }
+            await refreshGrowthModalContent(modal, name, triggerBtn, addedText);
+        } catch (err) {
+            flash(`Capture failed: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">🔍</span> Capture Evidence';
+        }
+    });
+
+    // ── Consolidate Evidence (Slice 3) ──
+    modal.querySelector('#kt-growth-consolidate')?.addEventListener('click', async () => {
+        const btn = modal.querySelector('#kt-growth-consolidate');
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Consolidating…';
+            flash('Consolidating evidence…', 'info');
+            const { runConsolidation } = await import('./growth.js');
+            const { consolidatedCount, archivedCount, totalConsolidated } = await runConsolidation(name);
+
+            // Re-render the modal in place so the consolidated state appears
+            // without closing/reopening (which would lose any unsaved profile
+            // edits and the user's scroll position).
+            //
+            // Report ADDED and TOTAL separately: a pass appends to the tier
+            // rather than replacing it, so a bare "consolidated into N claims"
+            // would read as if the claims from earlier passes were gone.
+            const totalNote = totalConsolidated > consolidatedCount ? ` (${totalConsolidated} total)` : '';
+            const msg = `+${consolidatedCount} consolidated claim${consolidatedCount !== 1 ? 's' : ''}${totalNote}; ${archivedCount} raw observation${archivedCount !== 1 ? 's' : ''} archived.`;
+            await refreshGrowthModalContent(modal, name, triggerBtn, msg);
+        } catch (err) {
+            flash(`Consolidation failed: ${err.message}`, 'error');
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">🔗</span> Consolidate';
+        }
+    });
+
+    // ── Generate Profile ──
+    // Synthesize the profile from existing evidence (no re-capture). One API
+    // call. The new profile populates the editor so the user can review/edit
+    // before saving.
+    modal.querySelector('#kt-growth-regenerate')?.addEventListener('click', async () => {
+        const btn = modal.querySelector('#kt-growth-regenerate');
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Generating…';
+            flash('Generating profile from existing evidence…', 'info');
+            const { regenerateProfile, looksTruncated } = await import('./growth.js');
+            const { observations, profile: newProfile } = await regenerateProfile(name);
+            const truncated = looksTruncated(newProfile);
+            const { getUserOverrides } = await import('./evidence.js');
+            const overrides = getUserOverrides(name);
+
+            // Update the status text
+            const statusTextEl = modal.querySelector('.kt-growth-status-text');
+            if (statusTextEl) {
+                statusTextEl.textContent = truncated
+                    ? '⚠️ Profile may be truncated — see warning below.'
+                    : `Generated from ${observations.length} observation${observations.length !== 1 ? 's' : ''}.`;
+            }
+
+            // Re-render the content with the new profile + evidence
+            const contentEl = modal.querySelector('.kt-growth-content');
+            if (contentEl) {
+                contentEl.innerHTML = renderGrowthProfileContent(name, observations, newProfile, '', truncated, null, null, overrides);
+                wireGrowthProfileEvents(modal, name, newProfile, triggerBtn);
+            }
+            flash('Profile generated from existing evidence.', 'success');
+        } catch (err) {
+            flash(`Generation failed: ${err.message}`, 'error');
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">📝</span> Generate Profile';
+        }
+    });
+
+    // ── ILS Backfill (Part B) ──
+    // Expands ILS summary messages to their verbatim originals (from
+    // chatMetadata.ILS_Originals) and captures evidence from the restored
+    // text. READ-ONLY with respect to ILS data. Bounded/one-time op.
+    modal.querySelector('#kt-growth-backfill')?.addEventListener('click', async () => {
+        const btn = modal.querySelector('#kt-growth-backfill');
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Backfilling…';
+            flash('Backfilling evidence from ILS summaries…', 'info');
+            const { runIlsBackfillCapture } = await import('./growth.js');
+            const result = await runIlsBackfillCapture(name);
+
+            // Re-render the modal in place so the backfilled evidence appears
+            // without closing/reopening (preserves unsaved profile edits and
+            // scroll position). Works whether or not new evidence was added.
+            const msg = result.added > 0
+                ? `Backfill complete: expanded ${result.expandedSummaries} summary(ies), +${result.added} observation(s).`
+                : `Backfill: no new observations (${result.expandedSummaries} summary(ies) expanded, ${result.skipped} duplicate(s)).`;
+            await refreshGrowthModalContent(modal, name, triggerBtn, msg);
+        } catch (err) {
+            flash(`Backfill failed: ${err.message}`, 'error');
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">📦</span> Backfill';
+        }
+    });
+
+    // ── Catch Up (loop backfill + continuous capture until current) ──
+    // A user-initiated "read everything until caught up" pass. Loops the
+    // bounded backfill (Part B) through all summarized history, then loops
+    // continuous capture (Part A) through all live messages, firing a
+    // progress update after each batch and a toastr notification on
+    // completion. This complements the single-batch Backfill button — instead
+    // of clicking repeatedly to walk through history 80 messages at a time,
+    // Catch Up does the whole walk in one action.
+    modal.querySelector('#kt-growth-catchup')?.addEventListener('click', async () => {
+        const btn = modal.querySelector('#kt-growth-catchup');
+        const progressEl = modal.querySelector('#kt-growth-catchup-progress');
+        const captureBtn = modal.querySelector('#kt-growth-capture');
+        const regenerateBtn = modal.querySelector('#kt-growth-regenerate');
+        const consolidateBtn = modal.querySelector('#kt-growth-consolidate');
+        const backfillBtn = modal.querySelector('#kt-growth-backfill');
+        // Snapshot each action's eligibility BEFORE marking everything busy:
+        // Generate Profile renders disabled with zero observations and
+        // Consolidate with fewer than two non-canon raw ones, and a failed
+        // catch-up must not clear busy into an enabled state the evidence
+        // rules forbid.
+        const priorDisabled = new Map([btn, captureBtn, regenerateBtn, consolidateBtn, backfillBtn]
+            .map(b => [b, b?.disabled ?? false]));
+        try {
+            // Disable all action buttons for the duration — catch-up is a
+            // multi-batch loop and concurrent actions would race the watermarks.
+            [btn, captureBtn, regenerateBtn, consolidateBtn, backfillBtn].forEach(b => setControlBusy(b, true));
+            btn.textContent = '⏳ Reading…';
+            if (progressEl) {
+                progressEl.style.display = '';
+                progressEl.innerHTML = '<div class="kt-growth-catchup-line">🚀 Starting catch-up…</div>';
+            }
+            flash('Catch-up: reading all history until current…', 'info');
+            const { runCatchUpCapture } = await import('./growth.js');
+
+            // Progress callback updates the in-modal progress panel after each
+            // batch so the user sees the loop making forward progress.
+            const onProgress = (p) => {
+                if (!progressEl) return;
+                const phaseLabel = p.phase === 'backfill' ? '📦 summarized history' : '🔍 live messages';
+                progressEl.innerHTML = `
+                    <div class="kt-growth-catchup-line">
+                        ${phaseLabel} — batch ${p.batch}<br>
+                        +${p.added} observation${p.added !== 1 ? 's' : ''} so far
+                        ${p.skipped > 0 ? ` · ${p.skipped} duplicate${p.skipped !== 1 ? 's' : ''}` : ''}
+                        ${p.batchAdded > 0 ? ` · +${p.batchAdded} this batch` : ''}
+                    </div>`;
+            };
+
+            const result = await runCatchUpCapture(name, onProgress);
+
+            // Re-render the modal so the newly captured evidence appears.
+            let msg;
+            if (result.stoppedOnError && result.added === 0) {
+                // Complete failure on the first batch — nothing captured.
+                msg = `Catch-up stopped: ${result.errors[0] || 'unknown error'}.`;
+            } else if (result.stoppedOnError) {
+                // Partial success — phrase chronologically using errorPhase so
+                // the message reads in execution order. Phase 1 (backfill) runs
+                // before Phase 2 (live), so a backfill error followed by live
+                // successes must NOT read "+N … then error" (that's backwards).
+                const errMsg = result.errors[result.errors.length - 1] || 'unknown';
+                const obsWord = result.added !== 1 ? 's' : '';
+                if (result.errorPhase === 'backfill' && result.liveBatches > 0) {
+                    msg = `Catch-up incomplete: backfill stopped on error (${errMsg}), but +${result.added} observation${obsWord} were captured from live messages. Partial evidence was saved.`;
+                } else if (result.errorPhase === 'backfill') {
+                    msg = `Catch-up incomplete: backfill stopped on error (${errMsg}); no live messages were processed. Partial evidence was saved.`;
+                } else {
+                    // errorPhase === 'live' — backfill completed first, then live
+                    // errored. "+N … then error" is chronologically correct here.
+                    const batchWord = result.batches !== 1 ? 'es' : '';
+                    msg = `Catch-up incomplete: +${result.added} observation${obsWord} across ${result.batches} batch${batchWord}, then live capture stopped on error: ${errMsg}. Partial evidence was saved.`;
+                }
+            } else if (result.added > 0) {
+                msg = `Catch-up complete: +${result.added} observation${result.added !== 1 ? 's' : ''} across ${result.batches} batch${result.batches !== 1 ? 'es' : ''}${result.skipped > 0 ? ` (${result.skipped} duplicate${result.skipped !== 1 ? 's' : ''})` : ''}.`;
+            } else {
+                msg = `Catch-up complete — evidence is already current (${result.batches} batch${result.batches !== 1 ? 'es' : ''}, no new observations).`;
+            }
+            await refreshGrowthModalContent(modal, name, triggerBtn, msg);
+
+            // Fire a toastr notification so the user knows it's done even if
+            // they switched away from the modal/tab during the long run.
+            if (result.stoppedOnError) {
+                notify('Knowledge Tracker', `Catch-up incomplete for ${name}: ${result.errors[result.errors.length - 1] || 'error'}. (+${result.added} captured before failure.)`, 'error');
+            } else {
+                notify('Knowledge Tracker', `Catch-up finished for ${name}: +${result.added} observation(s).`, result.added > 0 ? 'success' : 'info');
+            }
+        } catch (err) {
+            flash(`Catch-up failed: ${err.message}`, 'error');
+            notify('Knowledge Tracker', `Catch-up failed for ${name}: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">🚀</span> Catch Up';
+            // Re-enable the other action buttons (refreshGrowthModalContent
+            // re-renders and re-wires them, but this covers the failure path
+            // where the modal isn't re-rendered). Clearing busy enables by
+            // contract, so restore each action's prior eligibility — a failed
+            // catch-up must not make Generate available with zero
+            // observations or Consolidate with fewer than two eligible ones.
+            [captureBtn, regenerateBtn, consolidateBtn, backfillBtn].forEach(b => {
+                setControlBusy(b, false);
+                if (b && priorDisabled.get(b)) b.disabled = true;
+            });
+            const progressEl2 = modal.querySelector('#kt-growth-catchup-progress');
+            if (progressEl2) {
+                // Keep the final progress line visible briefly, then hide.
+                setTimeout(() => { if (progressEl2) progressEl2.style.display = 'none'; }, 5000);
+            }
+        }
+    });
+
+    // ── User Overrides: add (Slice 3) ──
+    modal.querySelector('#kt-growth-add-override')?.addEventListener('click', async () => {
+        const text = prompt('Enter a user note that will survive profile regeneration:');
+        if (!text || !text.trim()) return;
+        const { addUserOverride } = await import('./evidence.js');
+        const id = addUserOverride(name, text);
+        if (id) {
+            flash('User note added.');
+            // Re-render to show the new override
+            const { getUserOverrides } = await import('./evidence.js');
+            const overrides = getUserOverrides(name);
+            const editorText = modal.querySelector('#kt-growth-profile-text')?.value || '';
+            const contentEl = modal.querySelector('.kt-growth-content');
+            if (contentEl) {
+                // We need observations for re-render; read from the current modal
+                // state by extracting from existing DOM. For simplicity, just
+                // reload the modal content via regeneration (no API call needed
+                // since the evidence hasn't changed, but we DO need the evidence
+                // array). The cleanest approach: trigger the regenerate button
+                // which reads from the store.
+                const obsEls = [...modal.querySelectorAll('.kt-growth-obs')];
+                const observations = obsEls.map(el => ({
+                    id: el.dataset.obsId || '',
+                    tier: el.dataset.tier || 'raw',
+                    category: 'trait',
+                    claim: el.querySelector('.kt-growth-obs-claim')?.textContent || '',
+                    quote: el.querySelector('.kt-growth-obs-quote')?.textContent?.replace(/^"|"$/g, '') || '',
+                    canon: !!el.querySelector('.kt-growth-obs-canon'),
+                }));
+                contentEl.innerHTML = renderGrowthProfileContent(name, observations, editorText, '', false, null, null, overrides);
+                wireGrowthProfileEvents(modal, name, editorText, triggerBtn);
+            }
+        }
+    });
+
+    // ── User Overrides: edit (save on blur) ── (Slice 3)
+    modal.querySelectorAll('.kt-growth-override-text[contenteditable]').forEach(el => {
+        const overrideEl = el.closest('.kt-growth-override');
+        const overrideId = overrideEl?.dataset.overrideId;
+        if (!overrideId) return;
+        el.addEventListener('blur', async () => {
+            const { updateUserOverride } = await import('./evidence.js');
+            updateUserOverride(name, overrideId, el.textContent.trim());
+        });
+    });
+
+    // ── User Overrides: delete ── (Slice 3)
+    modal.querySelectorAll('.kt-growth-override-del').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.dataset.id;
+            if (!id) return;
+            const { deleteUserOverride } = await import('./evidence.js');
+            const deleted = deleteUserOverride(name, id);
+            if (deleted) {
+                btn.closest('.kt-growth-override')?.remove();
+                flash('User note deleted.');
+            }
+        });
+    });
+}
+
+// ─── NPC view modal (shared) ─────────────────────────────────────────────────
+
+/**
+ * In-flight guard for #kt-view-modal, shared by BOTH open paths (the NPC
+ * dossier path below and the State Tracker path in wireStateTrackerEvents).
+ * It spans each path's await, so a click on either path cannot start a
+ * competing load while the first is still in flight. Without it the two
+ * paths could each pass their own singleton check before their awaits and
+ * then each build a node, duplicating the #kt-view-modal id.
+ */
+let viewModalOpening = false;
+
+function createKnowledgeViewModal(name, content) {
+    // Singleton enforced here, at the only construction site: whichever open
+    // path arrives second finds the winner's node already in the DOM and
+    // keeps it, instead of stacking a duplicate #kt-view-modal with a second
+    // Escape handler fighting over the same close.
+    if (document.getElementById('kt-view-modal')) return null;
+    const viewModal = document.createElement('div');
+    viewModal.id = 'kt-view-modal';
+    viewModal.className = 'mwt-modal kt-view-modal-overlay';
+    viewModal.innerHTML = `<div class="kt-history-backdrop"></div><div class="kt-history-panel"><div class="kt-history-header"><h3>${escapeHtml(name)}</h3><button class="kt-history-close" aria-label="Close">✕</button></div><div class="kt-history-body"><pre>${escapeHtml(content)}</pre></div></div>`;
+    document.body.appendChild(viewModal);
+    decorateModalShell(viewModal, { title: name, destroyOnClose: true });
+    return viewModal;
+}
+
+async function openNpcViewModal(name, triggerBtn = null) {
+    if (document.getElementById('kt-view-modal') || viewModalOpening) return;
+    viewModalOpening = true;
+    // A11Y-S3-04: the label-verified read below is async — when the call came
+    // from a button, own its busy pair across the load.
+    if (triggerBtn) setControlBusy(triggerBtn, true);
+    try {
+    const reg = getRegistry()[name];
+    if (!reg?.uid && reg?.uid !== 0) return;
+    // Label-verified: a uid pointing at a differently-labelled entry must not
+    // display that character's dossier under this NPC's name.
+    const content = await loadEntryContent(reg.uid, name);
+    if (!content) return;
+    createKnowledgeViewModal(name, content);
+    } finally {
+        viewModalOpening = false;
+        if (triggerBtn?.isConnected) setControlBusy(triggerBtn, false);
+    }
+}
+
+// ─── Identity modal (TODO §1 entity identity + alias service) ────────────────
+
+/**
+ * The per-NPC identity panel: canonical entity id, alias chips, rename, and
+ * merge-into. Everything here routes through knowledge/identity.js — the UI
+ * approves, the service propagates. Every action reports through ktSetStatus
+ * and re-renders so the NPC list reflects the new canonical name immediately.
+ */
+function openIdentityModal(name) {
+    // One identity modal at a time (the id is a singleton): a double-click
+    // would stack a second node sharing #kt-identity-modal — duplicated
+    // Escape handlers fighting over one close. Same guard as
+    // openDossierFieldRefreshModal.
+    if (document.getElementById('kt-identity-modal')) return;
+    const reg = getRegistry();
+    const key = resolveRegistryKey(reg, name);
+    if (!key) { ktSetStatus(`No registry record for "${name}".`, 'error'); return; }
+    const aliases = listAliases(key);
+    const entityId = getEntityId(key);
+
+    const modal = document.createElement('div');
+    modal.id = 'kt-identity-modal';
+    modal.className = 'mwt-modal kt-identity-modal';
+    modal.style.display = 'flex';
+    modal.innerHTML = `
+        <div class="mwt-modal-backdrop"></div>
+        <div class="mwt-modal-panel">
+            <div class="mwt-modal-header">
+                <h3><span aria-hidden="true">✏️</span> Identity — ${escapeHtml(key)}</h3>
+                <button class="mwt-modal-close" title="Close">&times;</button>
+            </div>
+            <div class="mwt-modal-body">
+                <p class="kt-identity-hint">The registry key is a display name; the entity id below is the stable identity that survives renames and merges.</p>
+                <div class="kt-identity-entityid">Entity ID: <code>${escapeHtml(entityId ?? '(not stamped — save the registry once to stamp)')}</code></div>
+
+                <div class="kt-identity-section">
+                    <h4>Aliases</h4>
+                    <p class="kt-identity-note">Alternate spellings, titles, and nicknames that resolve to this NPC. Exact match only — a good alias is what the model actually calls the character.</p>
+                    <div class="kt-identity-aliases">
+                        ${aliases.length === 0 ? '<span class="kt-identity-empty">No aliases yet.</span>' : aliases.map(a => `
+                            <span class="kt-alias-chip">${escapeHtml(a)}<button class="kt-alias-chip-x" data-alias="${escapeHtml(a)}" title="Remove this alias" aria-label="Remove alias ${escapeHtml(a)}">&times;</button></span>
+                        `).join('')}
+                    </div>
+                    <div class="kt-identity-row">
+                        <label class="mwt-sr-only" for="kt-alias-input">Add an alias</label>
+                        <input type="text" id="kt-alias-input" class="mwt-input kt-alias-input" placeholder="Add an alias (e.g. The Vixen)" />
+                        <button class="mwt-btn kt-alias-add">Add alias</button>
+                    </div>
+                </div>
+
+                <div class="kt-identity-section">
+                    <h4>Rename</h4>
+                    <p class="kt-identity-note">Changes the canonical name across the registry, relationships, stances, evidence, dossier watermarks, and lorebook entry labels. The old name is kept as an alias, so existing references keep resolving.</p>
+                    <div class="kt-identity-row">
+                        <label class="mwt-sr-only" for="kt-rename-input">New canonical name</label>
+                        <input type="text" id="kt-rename-input" class="mwt-input kt-rename-input" placeholder="New canonical name" value="${escapeHtml(key)}" />
+                        <button class="mwt-btn mwt-btn-primary kt-rename-go">Rename</button>
+                    </div>
+                </div>
+
+                <div class="kt-identity-section">
+                    <h4>Merge another NPC into this one</h4>
+                    <p class="kt-identity-note">Folds a duplicate identity (e.g. a stray "Sophie" record for "Sophie Simpson") into this NPC: its evidence, relationships, and aliases are absorbed and its name becomes an alias. The absorbed registry record is removed; its lorebook entry is left for manual deletion. This cannot be undone automatically.</p>
+                    <div class="kt-identity-row">
+                        <label class="mwt-sr-only" for="kt-merge-input">NPC to absorb into ${escapeHtml(key)}</label>
+                        <input type="text" id="kt-merge-input" class="mwt-input kt-merge-input" placeholder="NPC to absorb into ${escapeHtml(key)}" />
+                        <button class="mwt-btn kt-merge-go">Merge into ${escapeHtml(key)}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    decorateModalShell(modal, { title: `Identity — ${key}`, destroyOnClose: true });
+    const close = () => modal._closeModal?.();
+
+    const refresh = canonical => {
+        close();
+        if (canonical && getRegistry()[canonical]) openIdentityModal(canonical);
+    };
+
+    modal.querySelectorAll('.kt-alias-chip-x').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const result = removeAlias(key, btn.dataset.alias);
+            if (!result.ok) { ktSetStatus(`Could not remove alias: ${result.reason}`, 'error'); return; }
+            ktSetStatus(result.removed ? `Alias "${btn.dataset.alias}" removed.` : 'Alias was not on the record.', 'info');
+            refresh(key);
+        });
+    });
+
+    const aliasInput = modal.querySelector('.kt-alias-input');
+    const doAddAlias = () => {
+        const value = aliasInput.value.trim();
+        if (!value) return;
+        const result = addAlias(key, value);
+        if (!result.ok) {
+            ktSetStatus(result.reason === 'alias-taken'
+                ? `"${value}" already belongs to ${result.owner}.`
+                : `Could not add alias: ${result.reason}`, 'error');
+            return;
+        }
+        ktSetStatus(result.added ? `Alias "${value}" added to ${key}.` : `"${value}" was already an alias of ${key}.`, 'info');
+        refresh(key);
+    };
+    modal.querySelector('.kt-alias-add').addEventListener('click', doAddAlias);
+    aliasInput.addEventListener('keydown', e => { if (e.key === 'Enter') doAddAlias(); });
+
+    const renameInput = modal.querySelector('.kt-rename-input');
+    const doRename = async () => {
+        const target = renameInput.value.trim();
+        if (!target || target === key) return;
+        if (!confirm(`Rename "${key}" to "${target}"?`)) return;
+        const result = await renameEntity(key, target);
+        if (!result.ok) { ktSetStatus(`Rename refused: ${result.reason}`, 'error'); return; }
+        // Flush the book the operation CAPTURED, not the now-active one — a
+        // chat switch mid-rename must not point the flush at the new chat.
+        await flushIdentityWrites(result.book);
+        ktSetStatus(
+            `Renamed "${key}" → "${target}".${result.warnings?.length ? ` ${result.warnings.length} warning(s) — see the console.` : ''}`,
+            result.warnings?.length ? 'warning' : 'success',
+        );
+        for (const w of result.warnings ?? []) console.warn('[MWT:Knowledge]', w);
+        refresh(target);
+        renderNpcsSubTab();
+    };
+    modal.querySelector('.kt-rename-go').addEventListener('click', () => { void doRename(); });
+    renameInput.addEventListener('keydown', e => { if (e.key === 'Enter') void doRename(); });
+
+    const mergeInput = modal.querySelector('.kt-merge-input');
+    const doMerge = async () => {
+        const other = mergeInput.value.trim();
+        if (!other) return;
+        const otherKey = resolveRegistryKey(getRegistry(), other);
+        if (!otherKey) { ktSetStatus(`No NPC named "${other}" in the registry.`, 'error'); return; }
+        if (otherKey === key) { ktSetStatus('An NPC cannot merge into itself.', 'error'); return; }
+        if (!confirm(`Merge "${otherKey}" into "${key}"?\n\nThis absorbs its evidence, relationships, and aliases, keeps "${otherKey}" as a resolvable alias, and removes its registry record. Its lorebook entry stays for manual deletion. This cannot be undone automatically.`)) return;
+        const result = await mergeEntities(key, otherKey);
+        if (!result.ok) { ktSetStatus(`Merge refused: ${result.reason}`, 'error'); return; }
+        // Same as the rename flush: the captured book, never the new chat's.
+        await flushIdentityWrites(result.book);
+        ktSetStatus(
+            `Merged "${otherKey}" into "${key}".${result.warnings?.length ? ` ${result.warnings.length} warning(s) — see the console.` : ''}`,
+            result.warnings?.length ? 'warning' : 'success',
+        );
+        for (const w of result.warnings ?? []) console.warn('[MWT:Knowledge]', w);
+        close();
+        renderNpcsSubTab();
+    };
+    modal.querySelector('.kt-merge-go').addEventListener('click', () => { void doMerge(); });
+    mergeInput.addEventListener('keydown', e => { if (e.key === 'Enter') void doMerge(); });
+}
+
+// ─── Dossier per-field refresh modal (TODO §3) ───────────────────────────────
+
+/** Build one field row's staleness chip class + text. */
+function dossierStalenessChip(staleness) {
+    if (!staleness.known) return { cls: 'kt-dfr-chip--stale', text: 'never tracked' };
+    if (staleness.stale) {
+        return { cls: 'kt-dfr-chip--stale', text: staleness.msgsSince === null ? 'stale' : `stale · ${staleness.msgsSince} msgs ago` };
+    }
+    return { cls: 'kt-dfr-chip--fresh', text: staleness.msgsSince === null ? 'fresh' : `fresh · ${staleness.msgsSince} msgs ago` };
+}
+
+/**
+ * The per-field dossier refresh picker. Lists every DOSSIER_FIELDS section of
+ * one NPC's entry with its current value, a staleness chip (message-count
+ * watermark), and the two ownership locks: canon_lock is user-authored canon
+ * (manual-only), and personality is owned by the Growth profile system when
+ * the NPC has an evidence file. "Select stale" pre-checks every stale,
+ * selectable field (the bulk "refresh stale fields" action); "Refresh
+ * selected" runs runDossierFieldRefresh and stages the result for the normal
+ * review flow — nothing is written to the lorebook from this modal.
+ */
+async function openDossierFieldRefreshModal(name) {
+    // One picker at a time (the id is a singleton): the awaited lorebook read
+    // below means button-level disabling alone cannot close every race, and a
+    // second node with the same id would stack Escape handlers.
+    if (document.getElementById('kt-dossier-refresh-modal')) return;
+    const reg = getRegistry()[name];
+    if (!reg?.uid && reg?.uid !== 0) { ktSetStatus(`No UID for "${name}".`, 'error'); return; }
+    // Label-verified load — never show another NPC's dossier under this name.
+    const content = await loadEntryContent(reg.uid, name);
+    if (!content) { ktSetStatus(`Could not load entry for "${name}".`, 'error'); return; }
+    if (!isDossierEntry(content)) {
+        ktSetStatus(`"${name}" is not in dossier format — use 📋 Enrich to convert it first.`, 'error');
+        return;
+    }
+    const { hasEvidenceFile } = await import('./evidence.js');
+    const growthOwnsPersonality = hasEvidenceFile(name);
+    const values = extractDossierFieldValues(content);
+    const rows = DOSSIER_FIELDS.map(f => {
+        const staleness = getDossierFieldStaleness(name, f.key);
+        const lockedCanon = f.key === 'canon_lock';
+        const growthField = f.key === 'personality' && growthOwnsPersonality;
+        return {
+            key: f.key,
+            label: f.label,
+            value: values[f.key],
+            staleness,
+            selectable: !lockedCanon && !growthField,
+            note: lockedCanon
+                ? '🔒 user-authored canon — edit it manually; never model-refreshed'
+                : growthField
+                    ? '🌱 owned by the Growth profile system (evidence-driven)'
+                    : null,
+        };
+    });
+
+    const modal = document.createElement('div');
+    modal.id = 'kt-dossier-refresh-modal';
+    modal.className = 'mwt-modal kt-dossier-refresh-modal';
+    modal.style.display = 'flex';
+    modal.innerHTML = `
+        <div class="mwt-modal-backdrop"></div>
+        <div class="mwt-modal-panel">
+            <div class="mwt-modal-header">
+                <h3><span aria-hidden="true">🎯</span> Refresh fields — ${escapeHtml(name)}</h3>
+                <button class="mwt-modal-close" title="Close">&times;</button>
+            </div>
+            <div class="mwt-modal-body">
+                <p class="kt-dfr-hint">Pick the dossier fields to re-derive from recent messages; everything else is left untouched. A field is flagged stale once ${DOSSIER_STALE_AFTER_MSGS} new messages have arrived since it was last written or re-verified (or when it has never been tracked).</p>
+                <div class="kt-dfr-rows">
+                    ${rows.map(r => {
+                        const chip = dossierStalenessChip(r.staleness);
+                        const checked = r.selectable && r.staleness.stale ? 'checked' : '';
+                        const disabled = r.selectable ? '' : 'disabled';
+                        return `<label class="kt-dfr-row${r.selectable ? '' : ' kt-dfr-row--locked'}" for="kt-dfr-field-${escapeHtml(r.key)}">
+                            <input type="checkbox" id="kt-dfr-field-${escapeHtml(r.key)}" class="kt-dfr-field" data-key="${escapeHtml(r.key)}" ${checked} ${disabled} />
+                            <span class="kt-dfr-row-main">
+                                <span class="kt-dfr-row-label">${escapeHtml(r.label)}</span>
+                                <span class="kt-dfr-row-value">${r.value ? escapeHtml(r.value.slice(0, 140)) + (r.value.length > 140 ? '…' : '') : '<em>(not set)</em>'}</span>
+                                ${r.note ? `<span class="kt-dfr-row-note">${r.note}</span>` : ''}
+                            </span>
+                            <span class="kt-dfr-chip ${chip.cls}">${chip.text}</span>
+                        </label>`;
+                    }).join('')}
+                </div>
+            </div>
+            <div class="mwt-modal-statusbar kt-dfr-footer">
+                <button class="mwt-btn kt-dfr-select-stale">Select stale</button>
+                <button class="mwt-btn kt-dfr-clear">Clear all</button>
+                <span style="flex:1"></span>
+                <button class="mwt-btn mwt-btn-primary kt-dfr-run" title="Re-derive the selected fields from recent messages and stage the result for review"><span aria-hidden="true">🔄</span> Refresh selected</button>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+    decorateModalShell(modal, { title: `Refresh fields — ${name}`, destroyOnClose: true });
+    const cleanup = () => modal._closeModal?.();
+    wireDossierFieldRefreshModal(modal, name, reg, rows, cleanup);
+}
+
+/**
+ * Wire the picker modal's footer actions: checkbox count on the run button,
+ * "Select stale" (bulk), "Clear all", and the run flow itself — which calls
+ * runDossierFieldRefresh and stages the merged result into the standard
+ * review pipeline (staging tab, diff, Accept writes). Stale-but-unchanged
+ * results still stamp the re-verified watermarks.
+ *
+ * @param {() => void} cleanup - the opener's full teardown (node + Escape
+ *   handler). Both run-flow exits must go through it, never a bare
+ *   modal.remove(), or the document-level key listener leaks.
+ */
+function wireDossierFieldRefreshModal(modal, name, reg, rows, cleanup) {
+    const runBtn = modal.querySelector('.kt-dfr-run');
+    const updateRunBtn = () => {
+        const selected = modal.querySelectorAll('.kt-dfr-field:checked').length;
+        runBtn.textContent = selected > 0 ? `🔄 Refresh selected (${selected})` : '🔄 Refresh selected';
+        runBtn.disabled = selected === 0;
+    };
+    modal.querySelectorAll('.kt-dfr-field').forEach(cb => cb.addEventListener('change', updateRunBtn));
+    modal.querySelector('.kt-dfr-select-stale').addEventListener('click', () => {
+        // Bulk "refresh stale fields": check every selectable stale row.
+        modal.querySelectorAll('.kt-dfr-field').forEach(cb => {
+            const row = rows.find(r => r.key === cb.dataset.key);
+            cb.checked = !!row && row.selectable && row.staleness.stale;
+        });
+        updateRunBtn();
+    });
+    modal.querySelector('.kt-dfr-clear').addEventListener('click', () => {
+        modal.querySelectorAll('.kt-dfr-field').forEach(cb => { cb.checked = false; });
+        updateRunBtn();
+    });
+    updateRunBtn();
+
+    runBtn.addEventListener('click', async () => {
+        const selected = [...modal.querySelectorAll('.kt-dfr-field:checked')].map(cb => cb.dataset.key);
+        if (selected.length === 0) return;
+        try {
+            setControlBusy(runBtn, true); runBtn.textContent = '⏳…';
+            const result = await runDossierFieldRefresh(name, reg.uid, selected);
+            // The field-refresh prompt ECHOES unchanged values instead of
+            // returning null (the Update prompt's convention), so "nothing
+            // changed" cannot be read off the field values — a byte-identical
+            // merge is the no-change signal and takes the re-verify path.
+            const hasChanges = result.merged !== result.currentContent;
+            if (!hasChanges) {
+                const verified = acceptedRefreshFields(result.requestedFields, result.contractRejections);
+                try { if (verified.length) recordDossierFieldRefresh(name, verified); } catch { /* bookkeeping */ }
+                setContractStatus(`No new info for the selected fields of "${name}" — ${verified.length ? `${verified.length} field(s) marked re-verified` : 'no fields marked re-verified'}.`, result.contractRejections, 'info');
+                cleanup();
+                return;
+            }
+            state.stagingItems.push({
+                id: `dossier-fields-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                type: 'major', action: 'update', name, data: {},
+                proposedContent: result.merged,
+                existingContent: result.currentContent,
+                mergedContent: result.merged,
+                keywords: reg.keywords || [name], uid: reg.uid,
+                fields: result.fields, newKnowledge: [],
+                dossierMode: true,
+                contractRejections: result.contractRejections || [],
+                // Only successfully examined fields receive watermarks on accept.
+                refreshFields: acceptedRefreshFields(result.requestedFields, result.contractRejections),
+            });
+            const stagedItem = state.stagingItems[state.stagingItems.length - 1];
+            state.activeItemId = stagedItem.id;
+            state.activeSubTab = 'staging';
+            addNotificationEntry(stagedItem);
+            renderNpcsSubTab();
+            if (result.skippedFields.length > 0) {
+                setContractStatus(`Field refresh for "${name}" staged (${result.skippedFields.length} field(s) skipped as locked).`, result.contractRejections, 'info');
+            } else {
+                setContractStatus(`Field refresh for "${name}" staged for review.`, result.contractRejections);
+            }
+            cleanup();
+        } catch (err) {
+            // Coordinator cancellation (TODO §1): quiet discard — the modal
+            // stays open and usable, so the button must be re-enabled here
+            // rather than via an early return.
+            if (isCancellation(err)) {
+                console.log(`[MWT:Knowledge] Field refresh for "${name}" cancelled (coordinator) — discarded.`);
+            } else {
+                ktSetStatus(`Field refresh failed: ${err.message}`, 'error');
+            }
+            setControlBusy(runBtn, false);
+            updateRunBtn();
+        }
+    });
+}
+
+// ─── Relationship sub-tab ────────────────────────────────────────────────────
+
+const REL_EDGE_COLORS = {
+    ally: '#4ade80', friend: '#22c55e', family: '#f59e0b', lover: '#ec4899',
+    rival: '#f97316', enemy: '#ef4444', neutral: '#9ca3af', acquaintance: '#6b7280',
+    subordinate: '#3b82f6', superior: '#8b5cf6', mentor: '#06b6d4', student: '#0ea5e9',
+    employer: '#a855f7', employee: '#d946ef',
+};
+function relEdgeColor(type) {
+    return REL_EDGE_COLORS[(type || '').toLowerCase()] || '#6366f1';
+}
+
+/**
+ * Flatten the store's from→targets relationship map into one edge list, plus
+ * the raw map (the list view needs it for reverse-edge lookups). The single
+ * source for the Graph view, the List view, and the filter below — a11y plan
+ * §4.6 requires both views to consume the identical edge set.
+ */
+function getRelationshipEdges() {
+    const rels = getRelationships();
+    const edges = [];
+    for (const [from, targets] of Object.entries(rels)) {
+        for (const r of targets) {
+            edges.push({ from, to: r.target, type: r.type, notes: r.notes || '', source: r.source });
+        }
+    }
+    return { rels, edges };
+}
+
+/**
+ * Apply the sub-tab's NPC/type filters (state.relFilterNpc / relFilterType).
+ * An edge is kept when it involves the filtered NPC on either side and, when
+ * a type is selected, is of that type. Shared by renderRelationshipContent()
+ * and renderRelationshipGraph() so a filter can never desync the two views.
+ */
+function filterRelationshipEdges(edges) {
+    const npc = state.relFilterNpc || '';
+    const type = state.relFilterType || '';
+    if (!npc && !type) return edges;
+    return edges.filter(e => (!npc || e.from === npc || e.to === npc) && (!type || e.type === type));
+}
+
+function renderRelationshipContent() {
+    const npcNames = getAllNpcNames();
+    const { rels, edges: allEdges } = getRelationshipEdges();
+    const visibleEdges = filterRelationshipEdges(allEdges);
+
+    const npcOptions = npcNames.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+    const typeOptions = RELATIONSHIP_TYPES.map(t => `<option value="${t}">${t}</option>`).join('') + '<option value="__other__">Other…</option>';
+    const stanceOptions = USER_STANCES.map(s => `<option value="${s}">${s}</option>`).join('');
+    const stanceEntries = Object.entries(getStances()).sort((a, b) => a[0].localeCompare(b[0]));
+
+    const viewMode = state.relViewMode || 'graph';
+
+    // Collect unique types present for the legend and the sr-only summary.
+    // Derived from the FILTERED set so the legend only names colors that are
+    // actually drawn (the filter menu below deliberately uses the unfiltered
+    // set, so its choices never shrink as filters combine).
+    const presentTypes = [...new Set(visibleEdges.map(e => e.type))];
+    // Slice 5 (a11y plan §4.6): the graph's accessible summary names the edge
+    // and node counts (and the legend's types) as text.
+    const nodeCount = new Set(visibleEdges.flatMap(e => [e.from, e.to])).size;
+
+    // ── Slice 5 (a11y plan §4.6, item 5): accessible filter summary ──
+    // Labeled NPC/type filters narrow the edge set BEFORE the Graph/List
+    // split, and a polite live region names the active filters plus the
+    // visible/total counts so the result is announced, not just redrawn.
+    const filterNpc = state.relFilterNpc || '';
+    const filterType = state.relFilterType || '';
+    // The menus only offer choices that exist in the unfiltered edge set; a
+    // stale active value (e.g. its NPC was deleted mid-session) is appended
+    // so the control shows what is actually filtering instead of "All".
+    const filterNpcNames = [...new Set(allEdges.flatMap(e => [e.from, e.to]))].sort((a, b) => a.localeCompare(b));
+    if (filterNpc && !filterNpcNames.includes(filterNpc)) filterNpcNames.push(filterNpc);
+    const filterTypeNames = [...new Set(allEdges.map(e => e.type))];
+    if (filterType && !filterTypeNames.includes(filterType)) filterTypeNames.push(filterType);
+    const filterDescParts = [];
+    if (filterNpc) filterDescParts.push(`NPC: ${filterNpc}`);
+    if (filterType) filterDescParts.push(`type: ${filterType}`);
+    const filterSummaryText = filterDescParts.length > 0
+        ? `Showing ${visibleEdges.length} of ${allEdges.length} relationship${allEdges.length === 1 ? '' : 's'} — filter: ${filterDescParts.join(', ')}.`
+        : `Showing all ${allEdges.length} relationship${allEdges.length === 1 ? '' : 's'}. No filter active.`;
+    // Stashed for renderNpcsSubTab, which populates the (initially empty)
+    // live region below one task AFTER this markup lands: a node inserted
+    // already populated is not required to be announced, and applying a
+    // filter re-renders the whole panel — region included — so the new counts
+    // would otherwise redraw silently for assistive tech.
+    state._relFilterSummaryText = filterSummaryText;
+    const filterSection = allEdges.length > 0 ? `
+        <div class="kt-rel-add-row kt-rel-filter-row">
+            <label for="kt-rel-filter-npc" style="font-size:12px;color:var(--mwt-text-dim)">Filter by NPC:</label>
+            <select id="kt-rel-filter-npc" class="mwt-input" style="min-width:120px">
+                <option value="">All NPCs</option>
+                ${filterNpcNames.map(n => `<option value="${escapeHtml(n)}"${n === filterNpc ? ' selected' : ''}>${escapeHtml(n)}</option>`).join('')}
+            </select>
+            <label for="kt-rel-filter-type" style="font-size:12px;color:var(--mwt-text-dim)">Filter by type:</label>
+            <select id="kt-rel-filter-type" class="mwt-input" style="min-width:100px">
+                <option value="">All types</option>
+                ${filterTypeNames.map(t => `<option value="${escapeHtml(t)}"${t === filterType ? ' selected' : ''}>${escapeHtml(t)}</option>`).join('')}
+            </select>
+            <button id="kt-rel-filter-clear" class="mwt-btn" title="Clear the NPC and type filters">Clear</button>
+            <span id="kt-rel-filter-summary" class="kt-rel-filter-summary" role="status" aria-live="polite" aria-atomic="true" style="font-size:12px;color:var(--mwt-text-dim)"></span>
+        </div>` : '';
+
+    // ── Collapsible: Recent Changes ──
+    // The auto-extract toast names up to three changes; this log keeps the full
+    // session history (auto AND manual) for review. Session-scoped — cleared on
+    // chat change, never persisted.
+    const recentChanges = getRecentRelationshipChanges();
+    const changesSection = recentChanges.length > 0 ? `
+        <div class="kt-rel-section">
+            <button class="kt-rel-section-header" id="kt-rel-changes-toggle" title="${state.relChangesExpanded ? 'Collapse' : 'Expand'} the recent-changes log for this session" aria-expanded="${state.relChangesExpanded}">
+                <span class="kt-rel-section-caret" aria-hidden="true">${state.relChangesExpanded ? '▾' : '▸'}</span>
+                <span class="kt-rel-section-title"><span aria-hidden="true">🕘</span> Recent Changes</span>
+                <span class="kt-rel-count-badge">${recentChanges.length}</span>
+                <span class="kt-rel-section-hint">this session — auto &amp; manual</span>
+            </button>
+            ${state.relChangesExpanded ? `
+            <div class="kt-rel-list kt-rel-changes-list">
+                ${recentChanges.map(c => `
+                <div class="kt-rel-row kt-rel-change-row">
+                    <span class="kt-rel-change-origin" title="${c.origin === 'manual' ? 'Changed by you' : 'Changed by auto-extraction'}"><span aria-hidden="true">${c.origin === 'manual' ? '✍️' : '🤖'}</span><span class="mwt-sr-only">${c.origin === 'manual' ? 'changed by you' : 'changed by auto-extraction'}</span></span>
+                    <span class="kt-rel-change-desc">${escapeHtml(describeRelationshipChange(c))}</span>
+                    <span class="kt-rel-change-age">${escapeHtml(formatHistoryAge(c.ts || Date.now()))}</span>
+                </div>`).join('')}
+                <button class="kt-rel-changes-clear" id="kt-rel-changes-clear" title="Clear this session's change log">Clear log</button>
+            </div>` : ''}
+        </div>` : '';
+
+    // ── Collapsible: Stances toward {{user}} ──
+    // Collapsed by default: with a large NPC cast the per-NPC stance rows
+    // otherwise push the graph and edge list far down the tab.
+    const stancesSection = stanceEntries.length ? `
+        <div class="kt-rel-section">
+            <button class="kt-rel-section-header" id="kt-rel-stances-toggle" title="${state.relStancesExpanded ? 'Collapse' : 'Expand'} the per-NPC stance list" aria-expanded="${state.relStancesExpanded}">
+                <span class="kt-rel-section-caret" aria-hidden="true">${state.relStancesExpanded ? '▾' : '▸'}</span>
+                <span class="kt-rel-section-title">Stances toward {{user}}</span>
+                <span class="kt-rel-count-badge">${stanceEntries.length}</span>
+            </button>
+            ${state.relStancesExpanded ? `<div class="kt-rel-list">${stanceEntries.map(([n, s]) => {
+                 const locked = !isStanceAutoManaged(n);
+                 const stanceTitle = locked ? 'Locked — you set this, so auto-extraction will not change it. Click to hand it back to auto-updating.' : 'Auto-managed — extraction may update this. Click to lock it.';
+                 // The name is the action this press performs, not the state
+                 // it is in: the button is a toggle, so a locked one unlocks.
+                 // (State still reaches AT through the title/description.)
+                 const stanceName = locked
+                     ? `Unlock stance of ${escapeHtml(n)} (hand back to auto-updating)`
+                     : `Lock stance of ${escapeHtml(n)} (currently auto-managed)`;
+                 return `<div class="kt-rel-row">
+                 <span class="kt-rel-from">${escapeHtml(n)}</span>
+                 <span class="kt-rel-type">${escapeHtml(s)}</span>
+                 <span class="kt-rel-notes">toward {{user}}</span>
+                 <button class="kt-stance-lock ${locked ? 'locked' : ''}" data-name="${escapeHtml(n)}" title="${stanceTitle}" aria-label="${stanceName}">${locked ? '🔒' : '🔓'}</button>
+                 <button class="kt-stance-clear" data-name="${escapeHtml(n)}" title="Clear stance" aria-label="Clear stance of ${escapeHtml(n)}">✕</button>
+             </div>`;
+             }).join('')}</div>` : ''}
+        </div>` : '';
+
+    return `
+       <div class="kt-rel-container">
+           <div class="kt-rel-toolbar">
+               <button id="kt-rel-sync-all" class="mwt-btn mwt-btn-primary" title="Write relationship blocks to all NPC lorebook entries"><span aria-hidden="true">💾</span> Sync to Lorebooks</button>
+               <span style="font-size:12px;color:var(--mwt-text-dim)">${allEdges.length} relationship(s)</span>
+               <span class="kt-rel-view-toggle" role="group" aria-label="Relationship view">
+                   <button class="kt-rel-view-btn ${viewMode === 'graph' ? 'active' : ''}" data-view="graph" title="Graph view" aria-pressed="${viewMode === 'graph'}"><span aria-hidden="true">🕸️</span> Graph</button>
+                   <button class="kt-rel-view-btn ${viewMode === 'list' ? 'active' : ''}" data-view="list" title="List view" aria-pressed="${viewMode === 'list'}"><span aria-hidden="true">📋</span> List</button>
+               </span>
+            </div>
+           <div class="kt-rel-add-row">
+               <select id="kt-rel-from" class="mwt-input" style="min-width:120px" aria-label="Relationship from (NPC)"><option value="">From…</option>${npcOptions}</select>
+               <select id="kt-rel-type" class="mwt-input" style="min-width:100px" aria-label="Relationship type">${typeOptions}</select>
+               <input id="kt-rel-type-custom" class="mwt-input" type="text" placeholder="Custom type…" style="display:none;min-width:100px" aria-label="Custom relationship type" />
+               <select id="kt-rel-to" class="mwt-input" style="min-width:120px" aria-label="Relationship to (NPC)"><option value="">To…</option>${npcOptions}</select>
+               <input id="kt-rel-notes" class="mwt-input" type="text" placeholder="Notes (optional)" style="flex:1;min-width:120px" aria-label="Relationship notes" />
+               <button id="kt-rel-add" class="mwt-btn mwt-btn-primary">+ Add</button>
+            </div>
+           <div class="kt-rel-add-row">
+               <label for="kt-stance-npc" style="font-size:12px;color:var(--mwt-text-dim)">Stance toward {{user}}:</label>
+               <select id="kt-stance-npc" class="mwt-input" style="min-width:120px"><option value="">NPC…</option>${npcOptions}</select>
+               <select id="kt-stance-value" class="mwt-input" style="min-width:100px" aria-label="Stance value">${stanceOptions}</select>
+               <button id="kt-stance-set" class="mwt-btn mwt-btn-primary">Set</button>
+               <span style="flex:1;min-width:160px;font-size:11px;color:var(--mwt-text-dim)">How far this NPC pushes before backing off. Unset NPCs fall back to persona.</span>
+            </div>
+            ${changesSection}
+            ${stancesSection}
+             ${filterSection}
+            ${allEdges.length === 0 ? '<div class="kt-empty" role="status">No relationships tracked yet.</div>' : visibleEdges.length === 0 ? '<div class="kt-empty" role="status">No relationships match the current filters.</div>' : (viewMode === 'graph' ? `
+                <div class="kt-rel-graph-wrap">
+                    <p class="mwt-sr-only" id="kt-rel-graph-desc">Relationship graph: ${visibleEdges.length} relationship${visibleEdges.length === 1 ? '' : 's'} between ${nodeCount} NPC${nodeCount === 1 ? '' : 's'}. Types present: ${presentTypes.map(t => escapeHtml(t)).join(', ')}.</p>
+                    <svg id="kt-rel-graph" class="kt-rel-graph" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Relationship graph" aria-describedby="kt-rel-graph-desc"></svg>
+                    <div class="kt-rel-graph-legend">
+                        ${presentTypes.map(t => `<span class="kt-rel-legend-item"><span class="kt-rel-legend-swatch" style="background:${relEdgeColor(t)}"></span>${escapeHtml(t)}</span>`).join('')}
+                    </div>
+                    <div class="kt-rel-graph-controls">
+                        <button type="button" class="kt-rel-graph-ctrl" id="kt-rel-zoom-in" title="Zoom in" aria-label="Zoom in"><span aria-hidden="true">+</span></button>
+                        <button type="button" class="kt-rel-graph-ctrl" id="kt-rel-zoom-out" title="Zoom out" aria-label="Zoom out"><span aria-hidden="true">−</span></button>
+                        <button type="button" class="kt-rel-graph-ctrl" id="kt-rel-zoom-reset" title="Reset pan and zoom" aria-label="Reset view"><span aria-hidden="true">⟲</span></button>
+                        <span class="kt-rel-graph-zoom-level" id="kt-rel-zoom-level">Zoom 100%</span>
+                        <span class="mwt-sr-only" id="kt-rel-zoom-announce" role="status" aria-live="polite" aria-atomic="true"></span>
+                    </div>
+                    <div class="kt-rel-graph-summary" id="kt-rel-node-summary" role="status" aria-live="polite" aria-atomic="true"></div>
+                    <div class="kt-rel-graph-hint">Click a node to open its dossier, or Tab to a node and press Enter to hear its relationships (Enter again opens) • Drag to rearrange (cosmetic only) • Scroll to zoom, or use the zoom buttons above • Prefer plain text? Switch to List view</div>
+                </div>
+            ` : `
+           <div class="kt-rel-list">
+                 ${visibleEdges.map(e => {
+                     const reverse = (rels[e.to] || []).find(r => r.target === e.from);
+                     const reverseLabel = reverse ? `<span class="kt-rel-reverse" title="${escapeHtml(e.to)} sees ${escapeHtml(e.from)} as: ${escapeHtml(reverse.type)}"><span aria-hidden="true">↩</span> ${escapeHtml(reverse.type)}</span>` : '';
+                     const locked = !isEdgeAutoManaged(e);
+                     const lockTitle = locked
+                         ? 'Locked — you entered this, so auto-extraction will not change it. Click to hand it back to auto-updating.'
+                         : 'Auto-managed — extraction may update this. Click to lock it.';
+                     // Same rule as the stance lock above: the name is the
+                     // action the press performs, so a locked edge unlocks.
+                     const lockName = locked
+                         ? `Unlock relationship ${escapeHtml(e.from)} to ${escapeHtml(e.to)} (hand back to auto-updating)`
+                         : `Lock relationship ${escapeHtml(e.from)} to ${escapeHtml(e.to)} (currently auto-managed)`;
+                     return `<div class="kt-rel-row" data-from="${escapeHtml(e.from)}" data-to="${escapeHtml(e.to)}">
+                       <span class="kt-rel-from">${escapeHtml(e.from)}</span>
+                       <span class="kt-rel-type">${escapeHtml(e.type)}</span>
+                       <span class="kt-rel-to">${escapeHtml(e.to)}</span>
+                         ${e.notes ? `<span class="kt-rel-notes">${escapeHtml(e.notes)}</span>` : ''}
+                         ${reverseLabel}
+                       <button class="kt-rel-lock ${locked ? 'locked' : ''}" data-from="${escapeHtml(e.from)}" data-to="${escapeHtml(e.to)}" title="${lockTitle}" aria-label="${lockName}">${locked ? '🔒' : '🔓'}</button>
+                       <button class="kt-rel-remove" data-from="${escapeHtml(e.from)}" data-to="${escapeHtml(e.to)}" title="Remove" aria-label="Remove relationship ${escapeHtml(e.from)} to ${escapeHtml(e.to)}">✕</button>
+                     </div>`;
+                 }).join('')}
+             </div>`)}
+        </div>`;
+}
+
+// ─── Relationship graph (force-directed SVG) ─────────────────────────────────
+
+/**
+ * Compute node positions for the relationship graph using a lightweight
+ * Fruchterman–Reingold-style force-directed layout.
+ *
+ * @param {Array<{from:string,to:string,type:string}>} edges
+ * @returns {{nodes:Map<string,{x:number,y:number}>, edges:Array, pairs:Map}}
+ */
+function computeGraphLayout(edges) {
+    // Build node set
+    const nodeNames = new Set();
+    for (const e of edges) { nodeNames.add(e.from); nodeNames.add(e.to); }
+
+    const W = 600, H = 400;
+    const n = nodeNames.size;
+    if (n === 0) return { nodes: new Map(), edges, pairs: new Map() };
+
+    // Initial placement: circle
+    const nodes = new Map();
+    const cx = W / 2, cy = H / 2;
+    const radius = Math.min(W, H) * 0.35;
+    let i = 0;
+    for (const name of nodeNames) {
+        const angle = (i / Math.max(1, n)) * Math.PI * 2;
+        nodes.set(name, {
+            x: cx + radius * Math.cos(angle) + (Math.random() - 0.5) * 20,
+            y: cy + radius * Math.sin(angle) + (Math.random() - 0.5) * 20,
+        });
+        i++;
+    }
+
+    // Group bidirectional edges into pairs for curved rendering
+    const pairs = new Map(); // key "a|b" (sorted) -> { a, b, forward:edge, reverse:edge }
+    for (const e of edges) {
+        const key = [e.from, e.to].sort().join('|');
+        if (!pairs.has(key)) pairs.set(key, { a: e.from, b: e.to, forward: null, reverse: null });
+        const p = pairs.get(key);
+        if (e.from === p.a) p.forward = e; else p.reverse = e;
+    }
+
+    // Simulate
+    const idealLen = Math.max(60, Math.min(W, H) / Math.sqrt(Math.max(1, n)) * 0.8);
+    const k = idealLen;
+    const iterations = 200;
+    const posArr = Array.from(nodes.values());
+
+    // Precompute node-name → array-index lookup once (outside the hot loop).
+    // The previous code called `Array.from(nodes.keys()).indexOf(p.a/b)` inside
+    // the 200-iteration simulation for every edge — O(200 × E × N) linear
+    // searches that dominated layout time for large graphs.
+    const nodeIndex = new Map([...nodes.keys()].map((key, idx) => [key, idx]));
+    const edgeList = Array.from(pairs.values());
+
+    for (let iter = 0; iter < iterations; iter++) {
+        const t = 1 - iter / iterations; // cooling
+        const disp = posArr.map(() => ({ x: 0, y: 0 }));
+
+        // Repulsive forces (all pairs)
+        for (let a = 0; a < posArr.length; a++) {
+            for (let b = 0; b < posArr.length; b++) {
+                if (a === b) continue;
+                const dx = posArr[a].x - posArr[b].x;
+                const dy = posArr[a].y - posArr[b].y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+                const force = (k * k) / dist;
+                disp[a].x += (dx / dist) * force;
+                disp[a].y += (dy / dist) * force;
+            }
+        }
+
+        // Attractive forces (edges)
+        for (const p of edgeList) {
+            const aIdx = nodeIndex.get(p.a);
+            const bIdx = nodeIndex.get(p.b);
+            if (aIdx == null || bIdx == null) continue;
+            const dx = posArr[aIdx].x - posArr[bIdx].x;
+            const dy = posArr[aIdx].y - posArr[bIdx].y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+            const force = (dist * dist) / k;
+            const fx = (dx / dist) * force;
+            const fy = (dy / dist) * force;
+            disp[aIdx].x -= fx;
+            disp[aIdx].y -= fy;
+            disp[bIdx].x += fx;
+            disp[bIdx].y += fy;
+        }
+
+        // Apply displacement with cooling and frame clamping
+        const maxDisp = Math.max(4, 40 * t);
+        for (let a = 0; a < posArr.length; a++) {
+            const dx = disp[a].x, dy = disp[a].y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+            const limited = Math.min(dist, maxDisp);
+            posArr[a].x += (dx / dist) * limited;
+            posArr[a].y += (dy / dist) * limited;
+            posArr[a].x = Math.max(30, Math.min(W - 30, posArr[a].x));
+            posArr[a].y = Math.max(30, Math.min(H - 30, posArr[a].y));
+        }
+    }
+
+    return { nodes, edges, pairs };
+}
+
+function drawSelfLoopEdge(ns, edgeGroup, pos, edge) {
+    // Draw a self-relationship as a small loop offset up-right of the node.
+    const r = 14;
+    const cx = pos.x + 20;
+    const cy = pos.y - 20;
+    // Direction from loop center back toward the node; place arc endpoints
+    // near the node so the loop visually attaches to it.
+    const nodeAng = Math.atan2(pos.y - cy, pos.x - cx);
+    const spread = 0.45; // radians between start/end points
+    const sx = cx + r * Math.cos(nodeAng + spread);
+    const sy = cy + r * Math.sin(nodeAng + spread);
+    const ex = cx + r * Math.cos(nodeAng - spread);
+    const ey = cy + r * Math.sin(nodeAng - spread);
+    const color = relEdgeColor(edge.type);
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', `M ${sx} ${sy} A ${r} ${r} 0 1 1 ${ex} ${ey}`);
+    path.setAttribute('stroke', color);
+    path.setAttribute('stroke-width', '1.8');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('marker-end', `url(#arrow-${edge.type.replace(/[^a-z0-9]/gi, '')})`);
+    path.setAttribute('opacity', '0.85');
+    path.setAttribute('class', 'kt-rel-graph-edge');
+    const title = document.createElementNS(ns, 'title');
+    title.textContent = `${edge.from} → ${edge.to}: ${edge.type}${edge.notes ? ` (${edge.notes})` : ''}`;
+    path.appendChild(title);
+    edgeGroup.appendChild(path);
+}
+
+function renderRelationshipGraph() {
+    const svg = state.modal?.querySelector('#kt-rel-graph');
+    if (!svg) return;
+
+    // Same source + filter as renderRelationshipContent() (a11y plan §4.6):
+    // the graph draws exactly the edge set the list view renders, so a filter
+    // can never desync the two views. The layout cache's _edgeSig derives
+    // from this filtered list, so a filter change recomputes the layout.
+    const visibleEdges = filterRelationshipEdges(getRelationshipEdges().edges);
+    if (visibleEdges.length === 0) { svg.innerHTML = ''; return; }
+
+    // Use cached layout if available (preserves drag), else compute
+    if (!state._graphData || state._graphData._edgeSig !== JSON.stringify(visibleEdges.map(e => [e.from, e.to, e.type]).sort())) {
+        state._graphData = computeGraphLayout(visibleEdges);
+        state._graphData._edgeSig = JSON.stringify(visibleEdges.map(e => [e.from, e.to, e.type]).sort());
+    }
+    const data = state._graphData;
+
+    const W = 600, H = 400;
+    const ns = 'http://www.w3.org/2000/svg';
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+    // Clear
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    // <defs> for arrowheads per type color
+    const defs = document.createElementNS(ns, 'defs');
+    const typeColors = new Map();
+    for (const e of visibleEdges) typeColors.set(e.type, relEdgeColor(e.type));
+    for (const [type, color] of typeColors) {
+        const marker = document.createElementNS(ns, 'marker');
+        marker.setAttribute('id', `arrow-${type.replace(/[^a-z0-9]/gi, '')}`);
+        marker.setAttribute('viewBox', '0 0 10 10');
+        marker.setAttribute('refX', '18');
+        marker.setAttribute('refY', '5');
+        marker.setAttribute('markerWidth', '7');
+        marker.setAttribute('markerHeight', '7');
+        marker.setAttribute('orient', 'auto-start-reverse');
+        const path = document.createElementNS(ns, 'path');
+        path.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
+        path.setAttribute('fill', color);
+        marker.appendChild(path);
+        defs.appendChild(marker);
+    }
+    svg.appendChild(defs);
+
+    // Edges (as a group beneath nodes)
+    const edgeGroup = document.createElementNS(ns, 'g');
+    edgeGroup.setAttribute('class', 'kt-rel-graph-edges');
+    for (const p of data.pairs.values()) {
+        const aPos = data.nodes.get(p.a);
+        const bPos = data.nodes.get(p.b);
+        if (!aPos || !bPos) continue;
+        if (p.a === p.b) {
+            const edge = p.forward || p.reverse;
+            if (edge) drawSelfLoopEdge(ns, edgeGroup, aPos, edge);
+            continue;
+        }
+        const isBidirectional = !!(p.forward && p.reverse);
+        const drawCurve = (fromPos, toPos, edge, offset) => {
+            const mx = (fromPos.x + toPos.x) / 2;
+            const my = (fromPos.y + toPos.y) / 2;
+            const dx = toPos.x - fromPos.x;
+            const dy = toPos.y - fromPos.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            // perpendicular unit vector for curve control point
+            const px = -dy / len;
+            const py = dx / len;
+            const cxp = mx + px * offset;
+            const cyp = my + py * offset;
+            const color = relEdgeColor(edge.type);
+            const path = document.createElementNS(ns, 'path');
+            path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cxp} ${cyp} ${toPos.x} ${toPos.y}`);
+            path.setAttribute('stroke', color);
+            path.setAttribute('stroke-width', '1.8');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('marker-end', `url(#arrow-${edge.type.replace(/[^a-z0-9]/gi, '')})`);
+            path.setAttribute('opacity', '0.85');
+            path.setAttribute('class', 'kt-rel-graph-edge');
+            const title = document.createElementNS(ns, 'title');
+            title.textContent = `${edge.from} → ${edge.to}: ${edge.type}${edge.notes ? ` (${edge.notes})` : ''}`;
+            path.appendChild(title);
+            edgeGroup.appendChild(path);
+        };
+        if (isBidirectional) {
+            // Offset the two edges so both arrows are visible
+            drawCurve(aPos, bPos, p.forward, 25);
+            drawCurve(bPos, aPos, p.reverse, 25);
+        } else {
+            const single = p.forward || p.reverse;
+            if (single) drawCurve(data.nodes.get(single.from), data.nodes.get(single.to), single, 0);
+        }
+    }
+    svg.appendChild(edgeGroup);
+
+    // Nodes
+    const nodeGroup = document.createElementNS(ns, 'g');
+    nodeGroup.setAttribute('class', 'kt-rel-graph-nodes');
+    for (const [name, pos] of data.nodes) {
+        // Slice 5 (a11y plan §4.6): every node is a real Tab stop with an
+        // accessible name that carries its edge count, so the keyboard path
+        // announces more than a bare label (wireRelationshipGraphInteractions
+        // adds the Enter/Space selection handler).
+        const relCount = data.edges.filter(e => e.from === name || e.to === name).length;
+        const g = document.createElementNS(ns, 'g');
+        g.setAttribute('class', 'kt-rel-graph-node');
+        g.setAttribute('data-name', name);
+        g.setAttribute('transform', `translate(${pos.x}, ${pos.y})`);
+        g.style.cursor = 'pointer';
+        g.setAttribute('tabindex', '0');
+        g.setAttribute('role', 'button');
+        g.setAttribute('aria-label', `${name} — ${relCount} relationship${relCount === 1 ? '' : 's'}`);
+
+        const circle = document.createElementNS(ns, 'circle');
+        circle.setAttribute('r', '14');
+        circle.setAttribute('class', 'kt-rel-graph-node-circle');
+        g.appendChild(circle);
+
+        const text = document.createElementNS(ns, 'text');
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('dy', '0.35em');
+        text.setAttribute('class', 'kt-rel-graph-node-label');
+        text.textContent = name.length > 10 ? name.slice(0, 9) + '…' : name;
+        text.setAttribute('font-size', '11');
+        text.setAttribute('fill', 'currentColor');
+        g.appendChild(text);
+
+        const title = document.createElementNS(ns, 'title');
+        title.textContent = name;
+        g.appendChild(title);
+
+        nodeGroup.appendChild(g);
+    }
+    svg.appendChild(nodeGroup);
+
+    wireRelationshipGraphInteractions(svg, data);
+}
+
+// Pending debounced zoom announcement for the relationship graph (see
+// wireRelationshipGraphInteractions). Module-scoped so a re-render that
+// re-wires a fresh graph cancels a gesture that was still settling — the
+// stale closure would otherwise announce the previous gesture's zoom level
+// into the new (reset-to-100%) announce region a moment later.
+let pendingZoomAnnounceTimer = null;
+
+function wireRelationshipGraphInteractions(svg, data) {
+    // Seed pan/zoom state from the viewBox ATTRIBUTE, not svg.viewBox.baseVal.
+    // SVGRect exposes `width`/`height` — there are no `w`/`h` properties — so
+    // the previous `baseVal.w`/`baseVal.h` reads silently produced `undefined`,
+    // and the wheel/pan handlers then wrote an invalid "NaN NaN NaN NaN"
+    // viewBox string that browsers discard outright. The graph kept rendering
+    // with its last valid viewBox, which made "Scroll to zoom" (and background
+    // panning) do nothing at all. Parsing the attribute is deterministic and
+    // engine-independent.
+    const [vbX, vbY, vbW, vbH] = (svg.getAttribute('viewBox') || '0 0 600 400')
+        .trim().split(/\s+/).map(Number);
+    const vbState = { x: vbX, y: vbY, w: vbW, h: vbH };
+    // The seeded viewBox is the reset target and the 100% zoom reference.
+    const vbBase = { x: vbX, y: vbY, w: vbW, h: vbH };
+
+    // ── Slice 5 (a11y plan §4.6): labeled zoom/reset + announced level ──
+    // The wheel handler stays the pointer path; these buttons give the same
+    // operations a keyboard path. All lookups are optional-chained because the
+    // controls live in the wrap markup OUTSIDE the svg, and older fake-DOM
+    // harnesses pre-attach a bare svg with no wrap around it.
+    // A re-wired graph starts from the seeded viewBox again — a wheel gesture
+    // that was still debouncing against the OLD graph must not fire into the
+    // fresh announce region.
+    if (pendingZoomAnnounceTimer !== null) { clearTimeout(pendingZoomAnnounceTimer); pendingZoomAnnounceTimer = null; }
+    const zoomLevelEl = () => state.modal?.querySelector?.('#kt-rel-zoom-level');
+    const zoomAnnounceEl = () => state.modal?.querySelector?.('#kt-rel-zoom-announce');
+    const zoomText = () => `Zoom ${Math.max(1, Math.round((vbBase.w / vbState.w) * 100))}%`;
+    // The visible percentage is PLAIN TEXT and updates on every zoom change —
+    // it must not be a live region, because the wheel path fires once per
+    // wheel event and a touchpad gesture would queue one announcement per
+    // notch. Announcements go to the dedicated sr-only region instead:
+    // discrete operations (the buttons below) speak immediately, the wheel
+    // path debounces to one announcement per settled gesture.
+    const updateZoomLevel = () => {
+        const el = zoomLevelEl();
+        if (el) el.textContent = zoomText();
+    };
+    const setZoomAnnouncement = () => {
+        const el = zoomAnnounceEl();
+        if (el) el.textContent = zoomText();
+    };
+    const announceZoomLevel = () => {
+        // A discrete op supersedes any gesture that is still settling.
+        if (pendingZoomAnnounceTimer !== null) { clearTimeout(pendingZoomAnnounceTimer); pendingZoomAnnounceTimer = null; }
+        setZoomAnnouncement();
+    };
+    const announceZoomLevelDebounced = () => {
+        if (pendingZoomAnnounceTimer !== null) clearTimeout(pendingZoomAnnounceTimer);
+        pendingZoomAnnounceTimer = setTimeout(() => {
+            pendingZoomAnnounceTimer = null;
+            setZoomAnnouncement();
+        }, 500);
+    };
+    const applyZoom = (factor) => {
+        const newW = Math.max(150, Math.min(2400, vbState.w * factor));
+        const newH = newW * (vbState.h / vbState.w);
+        // Centre-anchored — the button analogue of the wheel handler's
+        // cursor-anchored zoom.
+        vbState.x += (vbState.w - newW) / 2;
+        vbState.y += (vbState.h - newH) / 2;
+        vbState.w = newW;
+        vbState.h = newH;
+        svg.setAttribute('viewBox', `${vbState.x} ${vbState.y} ${vbState.w} ${vbState.h}`);
+        updateZoomLevel();
+        announceZoomLevel(); // a button press is a discrete, keyboard-path op
+    };
+    const resetView = () => {
+        vbState.x = vbBase.x;
+        vbState.y = vbBase.y;
+        vbState.w = vbBase.w;
+        vbState.h = vbBase.h;
+        svg.setAttribute('viewBox', `${vbBase.x} ${vbBase.y} ${vbBase.w} ${vbBase.h}`);
+        updateZoomLevel();
+        announceZoomLevel();
+    };
+    state.modal?.querySelector?.('#kt-rel-zoom-in')?.addEventListener?.('click', () => applyZoom(0.8));
+    state.modal?.querySelector?.('#kt-rel-zoom-out')?.addEventListener?.('click', () => applyZoom(1.25));
+    state.modal?.querySelector?.('#kt-rel-zoom-reset')?.addEventListener?.('click', resetView);
+    updateZoomLevel();
+
+    // ── Slice 5 (a11y plan §4.6): keyboard node selection + summary ──
+    // First activation selects and announces the node's edge list into the
+    // #kt-rel-node-summary live region; a second activation opens the dossier
+    // (the same thing a pointer click does). Pointer clicks also select first,
+    // so the summary is up to date when the modal closes again.
+    let selectedName = null;
+    let selectedNodeG = null;
+    const summaryEl = () => state.modal?.querySelector?.('#kt-rel-node-summary');
+    const describeNode = (name) => {
+        const outgoing = data.edges.filter(e => e.from === name);
+        const incoming = data.edges.filter(e => e.to === name && e.from !== name);
+        const parts = [];
+        if (outgoing.length) parts.push(`outgoing: ${outgoing.map(e => `${e.type} → ${e.to}`).join(', ')}`);
+        if (incoming.length) parts.push(`incoming: ${incoming.map(e => `${e.type} ← ${e.from}`).join(', ')}`);
+        const n = outgoing.length + incoming.length;
+        return `${name}: ${n} relationship${n === 1 ? '' : 's'}${parts.length ? ` (${parts.join('; ')})` : ''}. Press Enter again to open the dossier.`;
+    };
+    // Attribute-based class toggle (not classList): the Node-suite fake DOM
+    // implements get/setAttribute only.
+    const setNodeSelected = (g, on) => {
+        const cls = (g.getAttribute('class') || '').split(/\s+/).filter(Boolean);
+        const sel = 'kt-rel-graph-node--selected';
+        const i = cls.indexOf(sel);
+        if (on && i === -1) cls.push(sel);
+        if (!on && i !== -1) cls.splice(i, 1);
+        g.setAttribute('class', cls.join(' '));
+        if (on) g.setAttribute('aria-current', 'true');
+        else g.removeAttribute('aria-current');
+    };
+    const selectNode = (g, name) => {
+        if (selectedNodeG && selectedNodeG !== g) setNodeSelected(selectedNodeG, false);
+        selectedNodeG = g;
+        selectedName = name;
+        setNodeSelected(g, true);
+        const el = summaryEl();
+        if (el) el.textContent = describeNode(name);
+    };
+
+    // Node dragging
+    let dragNode = null;
+    let dragStart = null;
+    let didDrag = false;
+
+    const nodes = svg.querySelectorAll('.kt-rel-graph-node');
+
+    nodes.forEach(nodeG => {
+        const onPointerDown = (ev) => {
+            const name = nodeG.getAttribute('data-name');
+            dragNode = name;
+            const pt = svgPoint(svg, ev);
+            if (!pt) return;
+            dragStart = { x: pt.x, y: pt.y };
+            didDrag = false;
+            ev.stopPropagation();
+            nodeG.setPointerCapture(ev.pointerId);
+        };
+        const onPointerMove = (ev) => {
+            if (!dragNode || dragNode !== nodeG.getAttribute('data-name')) return;
+            const pt = svgPoint(svg, ev);
+            if (!pt) return;
+            const pos = data.nodes.get(dragNode);
+            if (pos) {
+                const dx = pt.x - dragStart.x;
+                const dy = pt.y - dragStart.y;
+                if (Math.abs(dx) + Math.abs(dy) > 3) didDrag = true;
+                pos.x = Math.max(20, Math.min(580, pos.x + dx));
+                pos.y = Math.max(20, Math.min(380, pos.y + dy));
+                dragStart = { x: pt.x, y: pt.y };
+                nodeG.setAttribute('transform', `translate(${pos.x}, ${pos.y})`);
+                updateEdges(svg, data);
+            }
+        };
+        const onPointerUp = (ev) => {
+            if (dragNode === nodeG.getAttribute('data-name')) {
+                try { nodeG.releasePointerCapture(ev.pointerId); } catch { /* */ }
+                if (!didDrag) {
+                    const name = nodeG.getAttribute('data-name');
+                    // Select first (Slice 5): the summary box reflects the node
+                    // the dossier belongs to once the modal closes.
+                    selectNode(nodeG, name);
+                    openNpcViewModal(name);
+                }
+                dragNode = null;
+            }
+        };
+        nodeG.addEventListener('pointerdown', onPointerDown);
+        nodeG.addEventListener('pointermove', onPointerMove);
+        nodeG.addEventListener('pointerup', onPointerUp);
+        nodeG.addEventListener('pointercancel', onPointerUp);
+        // Keyboard selection (Slice 5): Enter/Space select + announce; a
+        // second activation opens the dossier like a pointer click. Space is
+        // prevented so it never scrolls the panel behind the graph.
+        nodeG.addEventListener('keydown', (ev) => {
+            if (ev.key !== 'Enter' && ev.key !== ' ') return;
+            ev.preventDefault?.();
+            const name = nodeG.getAttribute('data-name');
+            if (selectedName === name) {
+                void openNpcViewModal(name, nodeG);
+                return;
+            }
+            selectNode(nodeG, name);
+        });
+    });
+
+    // Pan via background drag
+    let panStart = null;
+    svg.addEventListener('pointerdown', (ev) => {
+        if (ev.target === svg || ev.target.tagName === 'rect') {
+            panStart = { x: ev.clientX, y: ev.clientY, vbx: vbState.x, vby: vbState.y };
+            svg.setPointerCapture(ev.pointerId);
+        }
+    });
+    svg.addEventListener('pointermove', (ev) => {
+        if (!panStart) return;
+        const rect = svg.getBoundingClientRect();
+        const scale = vbState.w / rect.width;
+        const dx = (ev.clientX - panStart.x) * scale;
+        const dy = (ev.clientY - panStart.y) * scale;
+        vbState.x = panStart.vbx - dx;
+        vbState.y = panStart.vby - dy;
+        svg.setAttribute('viewBox', `${vbState.x} ${vbState.y} ${vbState.w} ${vbState.h}`);
+    });
+    svg.addEventListener('pointerup', (ev) => {
+        panStart = null;
+        try { svg.releasePointerCapture(ev.pointerId); } catch { /* */ }
+    });
+
+    // Zoom on wheel (cursor-centered)
+    svg.addEventListener('wheel', (ev) => {
+        ev.preventDefault();
+        const rect = svg.getBoundingClientRect();
+        const mx = (ev.clientX - rect.left) / rect.width;
+        const my = (ev.clientY - rect.top) / rect.height;
+        const zoomFactor = ev.deltaY > 0 ? 1.1 : 0.9;
+        const newW = Math.max(150, Math.min(2400, vbState.w * zoomFactor));
+        const newH = newW * (vbState.h / vbState.w);
+        // Keep the point under cursor stable
+        vbState.x += (vbState.w - newW) * mx;
+        vbState.y += (vbState.h - newH) * my;
+        vbState.w = newW;
+        vbState.h = newH;
+        svg.setAttribute('viewBox', `${vbState.x} ${vbState.y} ${vbState.w} ${vbState.h}`);
+        updateZoomLevel();
+        announceZoomLevelDebounced();
+    }, { passive: false });
+}
+
+function svgPoint(svg, ev) {
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    const pt = svg.createSVGPoint();
+    pt.x = ev.clientX;
+    pt.y = ev.clientY;
+    return pt.matrixTransform(ctm.inverse());
+}
+
+function updateEdges(svg, data) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const edgeGroup = svg.querySelector('.kt-rel-graph-edges');
+    if (!edgeGroup) return;
+    edgeGroup.innerHTML = '';
+    for (const p of data.pairs.values()) {
+        const aPos = data.nodes.get(p.a);
+        const bPos = data.nodes.get(p.b);
+        if (!aPos || !bPos) continue;
+        if (p.a === p.b) {
+            const edge = p.forward || p.reverse;
+            if (edge) drawSelfLoopEdge(ns, edgeGroup, aPos, edge);
+            continue;
+        }
+        const isBidirectional = !!(p.forward && p.reverse);
+        const drawCurve = (fromPos, toPos, edge, offset) => {
+            const mx = (fromPos.x + toPos.x) / 2;
+            const my = (fromPos.y + toPos.y) / 2;
+            const dx = toPos.x - fromPos.x;
+            const dy = toPos.y - fromPos.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const px = -dy / len;
+            const py = dx / len;
+            const cxp = mx + px * offset;
+            const cyp = my + py * offset;
+            const color = relEdgeColor(edge.type);
+            const path = document.createElementNS(ns, 'path');
+            path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cxp} ${cyp} ${toPos.x} ${toPos.y}`);
+            path.setAttribute('stroke', color);
+            path.setAttribute('stroke-width', '1.8');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('marker-end', `url(#arrow-${edge.type.replace(/[^a-z0-9]/gi, '')})`);
+            path.setAttribute('opacity', '0.85');
+            path.setAttribute('class', 'kt-rel-graph-edge');
+            const title = document.createElementNS(ns, 'title');
+            title.textContent = `${edge.from} → ${edge.to}: ${edge.type}${edge.notes ? ` (${edge.notes})` : ''}`;
+            path.appendChild(title);
+            edgeGroup.appendChild(path);
+        };
+        if (isBidirectional) {
+            drawCurve(aPos, bPos, p.forward, 25);
+            drawCurve(bPos, aPos, p.reverse, 25);
+        } else {
+            const single = p.forward || p.reverse;
+            if (single) drawCurve(data.nodes.get(single.from), data.nodes.get(single.to), single, 0);
+        }
+    }
+}
+
+// The relationship filter-row controls whose focus must survive the panel
+// re-render that a filter change triggers — the two selects and the Clear
+// button (the chronicle search input's hadFocus pattern, applied to selects).
+const REL_FILTER_FOCUS_IDS = new Set(['kt-rel-filter-npc', 'kt-rel-filter-type', 'kt-rel-filter-clear']);
+
+function wireRelationshipEvents(el) {
+    const typeSelect = el.querySelector('#kt-rel-type');
+    const customInput = el.querySelector('#kt-rel-type-custom');
+    if (typeSelect && customInput) {
+        typeSelect.addEventListener('change', () => {
+            customInput.style.display = typeSelect.value === '__other__' ? '' : 'none';
+            if (typeSelect.value === '__other__') customInput.focus();
+        });
+    }
+
+    // View toggle (graph ↔ list)
+    el.querySelectorAll('.kt-rel-view-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            state.relViewMode = btn.dataset.view;
+            renderNpcsSubTab();
+        });
+    });
+
+    // NPC/type filters (Slice 5, a11y plan §4.6 item 5): a change re-renders
+    // from the shared filtered edge set; #kt-rel-filter-summary announces the
+    // new active filters and visible/total counts as a polite live region.
+    // The re-render replaces the whole panel — the focused select included —
+    // so remember which filter-row control had focus and hand it back to its
+    // replacement (the same select re-renders with its value selected);
+    // without this, keyboard focus falls out of the control to <body>.
+    const filterNpcSelect = el.querySelector('#kt-rel-filter-npc');
+    const filterTypeSelect = el.querySelector('#kt-rel-filter-type');
+    const restoreRelFilterFocus = (previouslyFocusedId) => {
+        if (!REL_FILTER_FOCUS_IDS.has(previouslyFocusedId)) return;
+        const replacement = getNpcsContentEl()?.querySelector(`#${previouslyFocusedId}`);
+        replacement?.focus?.();
+    };
+    const applyRelFilters = () => {
+        const focusedId = document.activeElement?.id;
+        state.relFilterNpc = filterNpcSelect?.value || '';
+        state.relFilterType = filterTypeSelect?.value || '';
+        renderNpcsSubTab();
+        restoreRelFilterFocus(focusedId);
+    };
+    filterNpcSelect?.addEventListener('change', applyRelFilters);
+    filterTypeSelect?.addEventListener('change', applyRelFilters);
+
+    el.querySelector('#kt-rel-filter-clear')?.addEventListener('click', () => {
+        const focusedId = document.activeElement?.id;
+        state.relFilterNpc = '';
+        state.relFilterType = '';
+        renderNpcsSubTab();
+        restoreRelFilterFocus(focusedId);
+    });
+
+    // Collapsible section toggles — Recent Changes and the stance list. Pure
+    // view state, persisted in memory only, so no store write or re-sync.
+    el.querySelector('#kt-rel-changes-toggle')?.addEventListener('click', () => {
+        state.relChangesExpanded = !state.relChangesExpanded;
+        renderNpcsSubTab();
+    });
+
+    el.querySelector('#kt-rel-changes-clear')?.addEventListener('click', () => {
+        clearRecentRelationshipChanges();
+        renderNpcsSubTab();
+    });
+
+    el.querySelector('#kt-rel-stances-toggle')?.addEventListener('click', () => {
+        state.relStancesExpanded = !state.relStancesExpanded;
+        renderNpcsSubTab();
+    });
+
+    // Render the graph SVG now that the container is in the DOM
+    if (state.relViewMode === 'graph') {
+        requestAnimationFrame(() => renderRelationshipGraph());
+    }
+
+    // A11Y-S3-03: the lorebook sync below is async — set busy only after
+    // validation, clear it in finally before the re-render rebuilds the row.
+    const relAddBtn = el.querySelector('#kt-rel-add');
+    relAddBtn?.addEventListener('click', async () => {
+        const from = el.querySelector('#kt-rel-from')?.value;
+        const to = el.querySelector('#kt-rel-to')?.value;
+        let type = el.querySelector('#kt-rel-type')?.value;
+        if (type === '__other__') {
+            type = customInput?.value?.trim() || '';
+        }
+        const notes = el.querySelector('#kt-rel-notes')?.value?.trim() || '';
+        if (!from || !to || !type) { ktSetStatus('Select From, Type, and To.', 'error'); return; }
+        // Self-relationships (e.g. "their own worst enemy") are allowed.
+        const npcNames = getAllNpcNames();
+        if (!npcNames.includes(from)) { ktSetStatus(`"${from}" is not a known NPC.`, 'error'); return; }
+        if (!npcNames.includes(to)) { ktSetStatus(`"${to}" is not a known NPC.`, 'error'); return; }
+        setControlBusy(relAddBtn, true);
+        try {
+            // Capture the prior edge (if any) so the Recent Changes log can say "was X".
+            const previous = getNpcRelationships(from).find(r => r.target === to);
+            updateRelationship(from, to, type, notes);
+            recordRelationshipChanges([{ kind: 'edge', action: previous ? 'updated' : 'added', from, to, type, previousType: previous?.type, notes }], 'manual');
+            state._graphData = null; // invalidate cached layout
+            try {
+                const result = await syncRelationshipsToLorebook(from);
+                if (result.success && !result.unchanged) {
+                    ktSetStatus(`Relationship added and synced to "${from}" lorebook.`, 'success');
+                } else if (result.success) {
+                    ktSetStatus(`Relationship added (lorebook unchanged).`, 'success');
+                } else {
+                    ktSetStatus(`Relationship added but lorebook sync failed: ${result.error}`, 'warning');
+                }
+            } catch (err) {
+                ktSetStatus(`Relationship added but sync failed: ${err.message}`, 'warning');
+            }
+        } finally {
+            if (relAddBtn.isConnected) setControlBusy(relAddBtn, false);
+        }
+        renderNpcsSubTab();
+    });
+
+    const stanceSetBtn = el.querySelector('#kt-stance-set');
+    stanceSetBtn?.addEventListener('click', async () => {
+        const name = el.querySelector('#kt-stance-npc')?.value;
+        const stance = el.querySelector('#kt-stance-value')?.value;
+        if (!name || !stance) { ktSetStatus('Select an NPC and a stance.', 'error'); return; }
+        if (!getAllNpcNames().includes(name)) { ktSetStatus(`"${name}" is not a known NPC.`, 'error'); return; }
+        setControlBusy(stanceSetBtn, true);
+        try {
+            const previousStance = getStance(name);
+            setStance(name, stance);
+            recordRelationshipChanges([{ kind: 'stance', action: 'set', npc: name, stance, previousStance }], 'manual');
+            try {
+                const result = await syncRelationshipsToLorebook(name);
+                if (result.success) ktSetStatus(`"${name}" is now ${stance} toward {{user}}.`, 'success');
+                else ktSetStatus(`Stance saved but lorebook sync failed: ${result.error}`, 'warning');
+            } catch (err) {
+                ktSetStatus(`Stance saved but sync failed: ${err.message}`, 'warning');
+            }
+        } finally {
+            if (stanceSetBtn.isConnected) setControlBusy(stanceSetBtn, false);
+        }
+        renderNpcsSubTab();
+    });
+
+    // Provenance toggles. Purely a store flag — no lorebook re-sync needed,
+    // since the rendered relationship block doesn't carry the lock state.
+    el.querySelectorAll('.kt-rel-lock').forEach(btn => {
+        btn.addEventListener('click', () => {
+            toggleEdgeSource(btn.dataset.from, btn.dataset.to);
+            renderNpcsSubTab();
+        });
+    });
+
+    el.querySelectorAll('.kt-stance-lock').forEach(btn => {
+        btn.addEventListener('click', () => {
+            toggleStanceSource(btn.dataset.name);
+            renderNpcsSubTab();
+        });
+    });
+
+    el.querySelectorAll('.kt-stance-clear').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            // A11Y-S3-03: the lorebook sync is async — own the busy pair.
+            setControlBusy(btn, true);
+            try {
+                const previousStance = getStance(name);
+                setStance(name, '');
+                recordRelationshipChanges([{ kind: 'stance', action: 'cleared', npc: name, previousStance }], 'manual');
+                try { await syncRelationshipsToLorebook(name); } catch { /* entry may be gone */ }
+            } finally {
+                if (btn.isConnected) setControlBusy(btn, false);
+            }
+            renderNpcsSubTab();
+        });
+    });
+
+    el.querySelectorAll('.kt-rel-remove').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const from = btn.dataset.from;
+            const to = btn.dataset.to;
+            if (!confirm(`Remove relationship: ${from} → ${to}?`)) return;
+            // A11Y-S3-03: busy only after the confirmation; cleared before the
+            // re-render below rebuilds the row.
+            setControlBusy(btn, true);
+            try {
+                const previousType = getNpcRelationships(from).find(r => r.target === to)?.type;
+                removeRelationship(from, to);
+                recordRelationshipChanges([{ kind: 'edge', action: 'removed', from, to, previousType }], 'manual');
+                state._graphData = null; // invalidate cached layout
+                try { await syncRelationshipsToLorebook(from); } catch { /* ignore */ }
+            } finally {
+                if (btn.isConnected) setControlBusy(btn, false);
+            }
+            renderNpcsSubTab();
+        });
+    });
+
+    el.querySelector('#kt-rel-sync-all')?.addEventListener('click', async () => {
+        const btn = el.querySelector('#kt-rel-sync-all');
+        try {
+            setControlBusy(btn, true); btn.textContent = '⏳ Syncing…';
+            const result = await syncAllRelationshipsToLorebooks();
+            ktSetStatus(`Synced ${result.synced} lorebook(s). ${result.failed > 0 ? result.failed + ' failed.' : ''}`, result.failed > 0 ? 'warning' : 'success');
+        } catch (err) {
+            ktSetStatus(`Sync failed: ${err.message}`, 'error');
+        } finally {
+            setControlBusy(btn, false); btn.innerHTML = '<span aria-hidden="true">💾</span> Sync to Lorebooks';
+        }
+    });
+}
+
+export {
+    addNotificationEntry,
+    removeNotificationEntry,
+    initNotificationPanel,
+    hideNotificationPanel,
+    importNpcs,
+    importFromLorebooks,
+    openGrowthProfileModal,
+};

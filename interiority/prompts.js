@@ -1,0 +1,634 @@
+/**
+ * interiority/prompts.js — System prompt and JSON output contract.
+ *
+ * Leaf module — no interiority imports.
+ */
+
+import { buildTag, wrapTag, truncateText } from '../core/prompt.js';
+
+/**
+ * INTERIORITY-06: Maximum character caps for ledger fields used in injection
+ * and prompt contexts. Thoughts already have MAX_THOUGHT_LENGTH; the ledger
+ * fields (npc name, action, trigger, since, wakeHint) had no caps at all,
+ * so an unbounded model-generated or user-edited entry made the
+ * `<mwt_npc_intentions>` payload grow without limit every turn.
+ */
+const MAX_LEDGER_NAME = 120;
+const MAX_LEDGER_FIELD = 500;
+const MAX_LEDGER_SINCE = 100;
+
+/**
+ * Inline header prepended to <knowledge_entry> whenever intentions are part
+ * of the call. Live-use reports: the model mined plan-shaped ledger lines
+ * ("intends to ambush the caravan", possibly recorded many turns earlier)
+ * for "new" intentions that <recent_messages> did not support, resurrecting
+ * stale plans as fresh intentions. The system prompt carries the full
+ * contract (the NEW INTENTIONS REQUIRE CURRENT EVIDENCE rule in
+ * buildSystemPrompt); this one-liner keeps the reminder next to the data it
+ * constrains. Thoughts-only calls skip it — there <knowledge_entry> IS the
+ * fact source by design (§15 input partition).
+ */
+const KNOWLEDGE_BACKGROUND_HEADER = '(Background evidence — what this NPC knew, as of when it was recorded. May inform motive; NOT proof of any current plan.)';
+
+/** Cap a string to a maximum length, trimming if needed. */
+function cap(text, max) {
+    return truncateText(String(text ?? ''), max);
+}
+
+/**
+ * Lifecycle v2 annotations (spec §1/§4) shared by the open-intentions prompt
+ * lines and the narrator injection: the user-set priority (skipped for the
+ * 'normal' default) and the in-world "no longer plausible once" expiry label.
+ * Kept short and parenthesised — the response contract is unchanged; these
+ * fields only give the model the user's urgency and expiry judgments.
+ *
+ * @param {object} entry - ledger entry
+ * @returns {string} '' or ', priority: high' / ', no longer plausible once: X' fragments
+ */
+function _lifecycleAnnotations(entry) {
+    const parts = [];
+    const priority = String(entry?.priority ?? '').trim().toLowerCase();
+    if (priority && priority !== 'normal') parts.push(`priority: ${priority}`);
+    if (entry?.expiresOn) parts.push(`no longer plausible once: ${cap(entry.expiresOn, MAX_LEDGER_FIELD)}`);
+    return parts.length > 0 ? ` (${parts.join('; ')})` : '';
+}
+
+/**
+ * Build the system prompt for the interiority generation call.
+ *
+ * The prompt is assembled dynamically so that only the requested features
+ * (thoughts and/or intentions) are described to the model. When a feature
+ * is disabled the model is never asked for it, which keeps responses lean
+ * and avoids confusion.
+ *
+ * House style: ABSOLUTE RULES, JSON only, no fences — matching the
+ * knowledge/world state scanner prompts.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.thoughts=true]  - include the reaction/thought contract
+ * @param {boolean} [opts.intentions=true] - include the intention evaluation contract
+ * @returns {string}
+ */
+export function buildSystemPrompt({ thoughts = true, intentions = true } = {}) {
+    const wantThoughts = thoughts !== false;
+    const wantIntentions = intentions !== false;
+
+    const purposeLine = (() => {
+        if (wantThoughts && wantIntentions) {
+            return 'You are an interiority engine for a role-playing story. You generate the private thoughts and hidden intentions of NPCs (non-player characters).';
+        }
+        if (wantThoughts) {
+            return 'You are an interiority engine for a role-playing story. You generate the private thoughts of NPCs (non-player characters).';
+        }
+        return 'You are an interiority engine for a role-playing story. You generate grounded private intentions for NPCs (non-player characters) and evaluate their existing plans.';
+    })();
+
+    const contextLine = wantIntentions
+        ? 'You will receive, for each NPC: their knowledge ledger / dossier entry (background evidence only — never sufficient on its own to justify a new intention), their current open intentions, any plans they have already scheduled, and a window of recent story messages.'
+        : 'You will receive, for each NPC: their knowledge ledger / dossier entry and a window of recent story messages.';
+
+    // ── Rules ──
+    const rules = [];
+    let n = 0;
+
+    rules.push(`${++n}. Output ONLY valid JSON. No markdown fences, no prose before or after.`);
+
+    // Shared actor/witness partition for <recent_messages>. The window comes
+    // from getStrippedRecentMessages(), which PRESERVES the sealed Off-Screen
+    // Events block by default (it is real in-world history), so EVERY call
+    // that reasons from the window needs this rule — not just thoughts.
+    // runSplitCall runs intentions as its own call with no thought rules;
+    // without the partition here, its "NEW INTENTIONS REQUIRE CURRENT
+    // EVIDENCE" rule would read an unwitnessed off-screen log line as a valid
+    // motivating event for any roster NPC — the same leak class the thoughts
+    // side sealed, closed on the intention-creation side too.
+    rules.push(`${++n}. Events inside an Off-Screen Events module block (a details block titled "Off-Screen Events") happened only for the NPC who performed the logged action and any NPCs the line explicitly names as witnesses — to every other NPC they did not happen, and they are NEVER valid evidence for any judgment about them.`);
+
+    if (wantThoughts) {
+        rules.push(`${++n}. Each NPC may react ONLY to events they could personally witness in <recent_messages>. Facts are limited to their <knowledge_entry> and witnessed events.`);
+        rules.push(`${++n}. An NPC may NEVER reference, know, or allude to another NPC's thoughts, secrets, or hidden intentions. Each NPC's mind is sealed.`);
+    }
+
+    if (wantIntentions) {
+        // Split calls have no thoughts task to prompt creative inference. Merely
+        // calling this a tracker and listing rejection rules can turn the call
+        // into extraction, despite the later permission to keep decisions private.
+        rules.push(`${++n}. GENERATE AS WELL AS TRACK: For each NPC, consider a private next action that serves an ongoing motive or responds to a current need or opportunity, supported by events they experienced or witnessed in <recent_messages>. Use their dossier to ground the motive. You may create that unspoken future decision; it need not already appear in dialogue or narration. Private plans can be ordinary, caring, practical, or self-protective — they need not be deceptive or dramatic. Creating a grounded future decision is allowed; inventing past events, knowledge, or completed actions is not. Check each candidate against the rules below.`);
+        rules.push(`${++n}. Evaluate each open intention from the <open_intentions> list. The DEFAULT outcome is "open" (carry forward) — only mark "executed" or "dropped" when there is clear, unmistakable evidence:`);
+        rules.push(`   - "executed": ONLY if the recent messages show the NPC has ALREADY COMPLETED the action in full — either enacted in narrative prose or logged as completed in an Off-Screen Events module block (a details block titled "Off-Screen Events"). Discussing, planning, preparing for, deciding to do, or beginning the action is NOT execution. The action must be done.`);
+        rules.push(`   - "dropped": ONLY if the NPC has EXPLICITLY abandoned or cancelled the intention (said so, or clearly changed their mind), OR if its user-defined expiresOn condition ("no longer plausible once …") is unmistakably satisfied by the recent events. When dropping for expiresOn, cite that condition in the reason. A changed situation, a delay, a new complication, or the trigger not arriving yet is NOT a drop unless it unmistakably satisfies expiresOn — the intention waits.`);
+        rules.push(`   - "open" (default): if there is ANY doubt whether the action is completed or the intention is truly abandoned, leave it open. Do not list it. It carries forward automatically.`);
+        rules.push(`   - When in doubt between open and executed/dropped: choose open.`);
+        // [P1] Evidence is required for the MOTIVATION, not the decision:
+        // demanding the plan be visibly formed or committed on-screen turned
+        // Interiority into explicit-plan extraction and suppressed genuinely
+        // hidden intentions. The motive needs CURRENT support in the window,
+        // but may be ongoing: requiring a NEW motivating event also suppresses
+        // private follow-through on an established need or opportunity.
+        // The decision itself may stay private.
+        // The mere passage of time never counts — waking already-scheduled
+        // intentions for approaching dates is the dormant poll's job (§20).
+        //
+        // Lifecycle plan Tier 1 item 1: the old single-paragraph rule carried
+        // the motivation requirement but never told the model to check the
+        // FINAL message for the action already being done — the exact shape
+        // of the reported regression (the story completes an installation and
+        // the intentions call re-proposes it, slightly reworded). Replaced
+        // with short sequential candidate checks plus one contrastive
+        // example, because small/flash-tier models follow ordered checks far
+        // better than compound paragraphs.
+        //
+        // The prompt deliberately states NO numeric cap: a 4B local model
+        // anchored on "at most two" and returned two intentions for every NPC,
+        // restating dossier lines. validateAndApply's maxNewIntentionsPerNpc
+        // is the authoritative cap; the prompt only asks for restraint.
+        // Check 4 (the quoted "evidence") is verified code-side against the
+        // message window — see validateAndApply.
+        rules.push(`${++n}. NEW INTENTIONS — for each candidate, run these checks in order and propose it ONLY if it passes all four:`);
+        rules.push(`   1. A current situation, unmet need, or opportunity in <recent_messages> must support the plan. An ongoing motive can qualify when the recent messages show it is still relevant; a brand-new event or changed situation is NOT required. The decision may remain entirely private — the NPC need not announce, show, or decide anything on-screen.`);
+        rules.push(`   2. Check the final message of the supplied window: if the candidate's action has already been carried out there (or earlier in the window), it is not a plan. Never re-propose a completed action.`);
+        rules.push(`   3. Do not repeat an existing plan from <open_intentions> or <already_scheduled>, and do not repeat another proposal for the same NPC.`);
+        rules.push(`   4. Quote your evidence: copy 4-20 words verbatim from <recent_messages> into "evidence" — the line that shows the situation supporting the plan. The quote must come from <recent_messages>, never from <knowledge_entry>. If you cannot quote such a line, do not propose the plan.`);
+        rules.push(`   <knowledge_entry> is BACKGROUND EVIDENCE ONLY: it may explain a motive, but never restate or paraphrase a plan-shaped line from it as a new intention. The mere passage of time (a deadline or festival drawing near) does not motivate a plan; already-scheduled intentions are woken by a separate system, never re-proposed here.`);
+        rules.push(`   Example (one scene, final message: "the courier hands over a sealed parcel"): "hand over the sealed parcel" is NOT a new plan — that action is already done; "open the sealed parcel in private before dawn" CAN be one — a future action newly motivated by the delivery.`);
+        rules.push(`   Example (ongoing concern, recent messages: "the student worries their source will be challenged before submitting the paper"): "reread the original letter before handing in the paper" CAN be a private plan even though the deadline and worry were established earlier. Do not merely list the public submission appointment.`);
+        rules.push(`   Most NPCs on most turns should get no new intention — propose one only when a quoted line genuinely motivates it, and never pad. Zero new intentions is a normal, expected result.`);
+        rules.push(`${++n}. New intentions require BOTH a concrete "action" AND a specific "trigger" condition (the event or circumstance when the NPC will act). Vague triggers like "soon" or "when the time is right" are not acceptable — use concrete, verifiable conditions.`);
+        rules.push(`${++n}. INTENTION HORIZON — for each new intention, classify when it will fire:`);
+        rules.push(`   - "immediate": the trigger could be met any turn now (e.g. "next time Jonah leaves the house"). Use for event-conditional or situational triggers.`);
+        rules.push(`   - "event": the trigger is tied to a specific upcoming event that is near (within a turn or two).`);
+        rules.push(`   - "scheduled": the trigger is tied to a specific future date, festival, or scheduled occasion that is far off (many turns away). Requires a "wake_hint" — the event/date the scan should watch for (e.g. "harvest festival", "Day 12").`);
+        rules.push(`   - When unsure or the horizon is unclear, use "immediate". Event-conditional triggers ("next time X") CANNOT be scheduled — you can't predict when they fire.`);
+        rules.push(`${++n}. <already_scheduled> lists plans this NPC has ALREADY made. Do NOT propose a new intention that restates one of them, even in different words — a rephrasing of an existing plan is not a new plan. These have no ids on purpose: you cannot mark them executed or dropped. Treat them as settled and propose only genuinely NEW intentions.`);
+        rules.push(`${++n}. SHARED PLANS are not intentions. A public, shared appointment ("we'll all go to the festival") is a calendar item — it belongs in world state, NOT the ledger. Only PRIVATE plans — an NPC's hidden intention to act — are intentions.`);
+    }
+
+    if (wantThoughts) {
+        rules.push(`${++n}. "reaction" may be null if nothing noteworthy happened. Do not produce filler or boilerplate reactions.`);
+    }
+
+    rules.push(`${++n}. Wrong guesses are allowed. Invented facts are forbidden.`);
+
+    if (wantThoughts) {
+        rules.push(`${++n}. Keep thoughts concise (1-3 sentences) and in the NPC's own voice.`);
+    }
+
+    rules.push(`${++n}. NEVER produce a block for the player character (the human user). If a name is given in <player_character>, that person is the user, not an NPC — exclude them entirely, even if they are present in the scene.`);
+
+    // ── Output contract ──
+    const npcFields = [];
+    npcFields.push('      "name": "Mara"');
+    if (wantThoughts) {
+        npcFields.push('      "reaction": { "re": "the witnessed event this turn", "thought": "..." }');
+    }
+    if (wantIntentions) {
+        npcFields.push('      "executed": ["i-3f9a"]');
+        npcFields.push('      "dropped": [{ "id": "i-77c2", "reason": "in-voice one-liner" }]');
+        npcFields.push('      "new_intentions": [{ "action": "...", "trigger": "...", "horizon": "immediate|event|scheduled", "evidence": "verbatim quote from <recent_messages>", "wake_hint": "ONLY when horizon is scheduled; omit otherwise" }]');
+    }
+
+    const notes = [];
+    if (wantThoughts) notes.push('- "reaction" may be null.');
+    if (wantIntentions) {
+        notes.push('- "executed" and "dropped" may be empty arrays.');
+        notes.push('- "new_intentions" may be an empty array.');
+    }
+    notes.push('- Only include NPCs from the provided roster.');
+
+    return `\
+${purposeLine}
+
+${contextLine}
+
+ABSOLUTE RULES:
+${rules.join('\n')}
+
+OUTPUT CONTRACT (JSON only):
+{
+  "npcs": [
+    {
+${npcFields.join(',\n')}
+    }
+  ]
+}
+
+Notes:
+${notes.join('\n')}`;
+}
+
+/**
+ * Build the user-content message for the interiority API call.
+ *
+ * INTERIORITY-07: NPC names interpolated into tag *attributes* and all body
+ * content interpolated into tag *content* are now escaped via the shared
+ * `core/prompt.js` helpers (`buildTag` / `wrapTag`). Without this, a name or
+ * body containing `<`, `&`, or `"` could close the structural boundary early.
+ *
+ * @param {object} opts
+ * @param {Array<object>} opts.npcBlocks - per-NPC assembled context blocks
+ *   [{ name, knowledgeEntry, openIntentions, scheduledIntentions }]
+ * @param {string} opts.recentMessages - stripped recent message window
+ * @param {string} [opts.worldTime] - in-world time label from world state
+ * @param {string} [opts.playerName] - the human user's persona name, so the
+ *   model can exclude them (they are never an NPC)
+ * @returns {string} assembled user content
+ */
+export function buildUserContent({ npcBlocks, recentMessages, worldTime, playerName, includeIntentions = true }) {
+    const parts = [];
+
+    if (playerName) {
+        parts.push(wrapTag('player_character', playerName));
+        parts.push('');
+    }
+    // The <open_intentions> block below shows each entry's `since` label and
+    // asks the model to judge whether the trigger has fired *now*. Without the
+    // current in-world time there is no "now" to compare against, so those
+    // labels are uninterpretable. buildThoughtsUserContent and
+    // buildDormantPollUserContent both emit this; this builder accepted
+    // worldTime and dropped it, so the batched/strict paths reasoned about
+    // elapsed in-world time strictly worse than the split-thoughts path.
+    if (worldTime) {
+        parts.push(wrapTag('world_time', worldTime));
+        parts.push('');
+    }
+
+    for (const npc of npcBlocks) {
+        parts.push(buildTag('npc', { name: npc.name }));
+        if (npc.knowledgeEntry) {
+            // Prepend the background-evidence header whenever intentions are
+            // in play, so a plan-shaped ledger line cannot masquerade as a
+            // plan the NPC is forming now.
+            const body = includeIntentions !== false
+                ? `${KNOWLEDGE_BACKGROUND_HEADER}\n${npc.knowledgeEntry}`
+                : npc.knowledgeEntry;
+            parts.push(wrapTag('knowledge_entry', body));
+        } else {
+            parts.push(wrapTag('knowledge_entry', '(No knowledge tracker entry for this NPC.)'));
+        }
+        if (includeIntentions !== false) {
+            if (npc.openIntentions && npc.openIntentions.length > 0) {
+                const lines = npc.openIntentions.map(e =>
+                    // INTERIORITY-06: cap every prompt path, not just the
+                    // narrator injection / dormant poll. Lifecycle v2: the
+                    // line carries the user's priority/expiry annotations.
+                    `- [${e.id}] ${cap(e.action, MAX_LEDGER_FIELD)} → trigger: ${cap(e.trigger, MAX_LEDGER_FIELD)} (since ${e.since ? cap(e.since, MAX_LEDGER_SINCE) : 'unknown'})${_lifecycleAnnotations(e)}`
+                );
+                parts.push(wrapTag('open_intentions', lines.join('\n')));
+            } else {
+                parts.push(wrapTag('open_intentions', '(None.)'));
+            }
+            // Lifecycle v2 (spec §3): a stale-evaluation note when this NPC's
+            // evidence boundary lags the current turn — events since their
+            // last successful intentions evaluation may not have been judged,
+            // so completion/abandonment evidence deserves extra care.
+            if (npc.evaluationNote) {
+                parts.push(wrapTag('evaluation_note', npc.evaluationNote));
+            }
+            // Scheduled intentions, deliberately WITHOUT ids: the model needs
+            // to know these plans already exist so it stops re-proposing them,
+            // but it must not be able to mark them executed or dropped — a
+            // scheduled intention is evaluated when it wakes, not every turn.
+            if (npc.scheduledIntentions && npc.scheduledIntentions.length > 0) {
+                const lines = npc.scheduledIntentions.map(e =>
+                    `- ${cap(e.action, MAX_LEDGER_FIELD)} → trigger: ${cap(e.trigger, MAX_LEDGER_FIELD)}${e.wakeHint ? ` (watching for: ${cap(e.wakeHint, MAX_LEDGER_FIELD)})` : ''}`
+                );
+                parts.push(wrapTag('already_scheduled', lines.join('\n')));
+            }
+        }
+        parts.push('</npc>');
+        parts.push('');
+    }
+
+    parts.push(wrapTag('recent_messages', recentMessages));
+    parts.push('');
+    parts.push('='.repeat(60));
+    parts.push('Generate interiority for each NPC. Output only JSON per the contract.');
+
+    return parts.join('\n');
+}
+
+// ─── v2 Thoughts-call prompt + user content (§17, §19) ───────────────────────
+
+/**
+ * Build the system prompt for the dedicated THOUGHTS call (split mode only).
+ *
+ * This is the craft prompt — it replaces the v1 one-liner thought section with
+ * real voice guidance, a type taxonomy, and the input-partition rule (§15) that
+ * binds facts to <knowledge_entry> and voice to <character_core>.
+ *
+ * Only used when splitThoughts is ON and this is the thoughts-side call. The
+ * v1 unified call (splitThoughts off) is untouched — see buildSystemPrompt.
+ *
+ * House style: ABSOLUTE RULES, JSON only, no fences.
+ *
+ * @returns {string}
+ */
+export function buildThoughtsSystemPrompt() {
+    const rules = [];
+    let n = 0;
+
+    rules.push(`${++n}. Output ONLY valid JSON. No markdown fences, no prose before or after.`);
+
+    rules.push(`${++n}. INPUT PARTITION (load-bearing):`);
+    rules.push(`   - Facts may come ONLY from <knowledge_entry> and events the NPC personally witnessed in <recent_messages>.`);
+    rules.push(`   - Voice, tone, and disposition come ONLY from <character_core>.`);
+    rules.push(`   - An NPC may NEVER reference, know, or allude to another NPC's thoughts, secrets, hidden intentions, or inner state. Each NPC's mind is sealed.`);
+    rules.push(`   - Off-Screen Events module blocks (details blocks titled "Off-Screen Events") are SEALED logs, not shared history. A logged line happened ONLY for the NPC who performed the action and any NPCs the line explicitly names as witnesses — to every other NPC it did not happen. Only the acting NPC or a named witness may react to, reference, or be affected by a sealed event.`);
+
+    rules.push(`${++n}. Each NPC gets at most ONE thought. "thought" may be null if nothing noteworthy is happening inside them (Omission Over Filler — silence beats a caption).`);
+
+    rules.push(`${++n}. THOUGHT TYPES — choose the one that fits what is actually happening inside them:`);
+    rules.push(`   - "reaction": a direct response to something they witnessed THIS turn. Requires "re" (the witnessed event).`);
+    rules.push(`   - "rumination": turning something over — a worry, a grudge, a question with no immediate answer. No "re" needed.`);
+    rules.push(`   - "memory": the past surfacing — something they are reminded of. No "re" needed.`);
+    rules.push(`   - "anticipation": looking forward or dreading — a plan, a coming event, a reckoning. No "re" needed.`);
+
+    rules.push(`${++n}. CRAFT — the thought must sound like THIS NPC, not a narrator:`);
+    rules.push(`   - Free indirect style, first person, present tense ("Third night he can't look at me." — not "She thought that he couldn't look at her.").`);
+    rules.push(`   - Concrete and specific — a sensory detail, a name, a bodily sensation. Never a summary.`);
+    rules.push(`   - The thought must REVEAL something the narration does not — a hidden fear, a private calculation, an unspoken grudge. If the thought only restates what happened, omit it (null).`);
+    rules.push(`   - Never summarize the scene or caption the action.`);
+    rules.push(`   - BANNED OPENINGS (filler — the code drops these, so do not write them): "I wonder...", "I need to be careful...", "Something feels off...", "Only time will tell...".`);
+
+    rules.push(`${++n}. INNER STATE — one line (max ~200 chars) capturing this NPC's current mood/disposition:`);
+    rules.push(`   - If an <inner_state> block is provided: update it ONLY based on this turn's events. If nothing material changed, output the prior line VERBATIM (do not reword — rewording is drift).`);
+    rules.push(`   - If no <inner_state> block is provided: produce a fresh one-line state from the current context.`);
+
+    rules.push(`${++n}. WRONG GUESSES are allowed. INVENTED FACTS are forbidden. Never state a fact that is not in <knowledge_entry> or witnessed on-screen.`);
+
+    rules.push(`${++n}. NEVER produce a block for the player character (named in <player_character>). They are the user, not an NPC.`);
+
+    return `\
+You are an interiority engine for a role-playing story. You write the private thoughts of NPCs (non-player characters) — the inner life the narration never shows.
+
+You will receive, for each NPC:
+- <character_core>: WHO they are — voice, disposition, personality. The authority for HOW they think and sound.
+- <knowledge_entry>: WHAT they know — background, secrets, agenda, facts. The ONLY source of facts you may use.
+- <relationships>: WHERE they stand — this NPC's outbound feelings toward others in the scene.
+- <recent_thoughts>: their own last few thoughts — continue this inner life; let worries evolve and suspicions build.
+- <inner_state>: their current one-line mood/state (when provided).
+- <open_intentions>: their active plans (anticipation material).
+- <recent_messages>: the shared story window — what they could personally witness.
+
+ABSOLUTE RULES:
+${rules.join('\n')}
+
+OUTPUT CONTRACT (JSON only):
+{
+  "npcs": [
+    {
+      "name": "Mara",
+      "thought": { "type": "rumination", "re": "optional — the witnessed event (required only for reaction)", "text": "Third night he can't look at me." },
+      "inner_state": "wary of Jonah since the dinner; the guilt about the letter is getting louder"
+    }
+  ]
+}
+
+Notes:
+- "thought" may be null (Omission Over Filler — prefer silence over a caption).
+- "re" is required ONLY for type "reaction"; omit it for rumination/memory/anticipation.
+- "inner_state" is always present (one line).
+- Only include NPCs from the provided roster.`;
+}
+
+/**
+ * Build the user-content message for the THOUGHTS call (split mode).
+ *
+ * Emits the richer per-NPC block set from §17: <character_core>,
+ * <knowledge_entry>, <relationships>, <recent_thoughts>, <inner_state>,
+ * <open_intentions>. Each block is omitted when empty so the prompt stays lean.
+ *
+ * INTERIORITY-07: All interpolated values are escaped via `buildTag`/`wrapTag`.
+ *
+ * @param {object} opts
+ * @param {Array<object>} opts.npcBlocks - per-NPC assembled rich blocks:
+ *   [{ name, characterCore, knowledgeEntry, relationships, recentThoughts,
+ *      innerState, openIntentions }]
+ * @param {string} opts.recentMessages - stripped recent message window
+ * @param {string} [opts.worldTime]
+ * @param {string} [opts.playerName]
+ * @returns {string}
+ */
+export function buildThoughtsUserContent({ npcBlocks, recentMessages, worldTime, playerName }) {
+    const parts = [];
+
+    if (playerName) {
+        parts.push(wrapTag('player_character', playerName));
+        parts.push('');
+    }
+    if (worldTime) {
+        parts.push(wrapTag('world_time', worldTime));
+        parts.push('');
+    }
+
+    for (const npc of npcBlocks) {
+        parts.push(buildTag('npc', { name: npc.name }));
+
+        // <character_core> — who they are (profile or identity fields)
+        if (npc.characterCore) {
+            parts.push(wrapTag('character_core', npc.characterCore));
+        }
+
+        // <knowledge_entry> — what they know (remainder after identity split)
+        if (npc.knowledgeEntry) {
+            parts.push(wrapTag('knowledge_entry', npc.knowledgeEntry));
+        } else {
+            parts.push(wrapTag('knowledge_entry', '(No knowledge tracker entry for this NPC.)'));
+        }
+
+        // <relationships> — outbound edges filtered to roster (sealed minds)
+        if (npc.relationships) {
+            parts.push(wrapTag('relationships', npc.relationships));
+        }
+
+        // <recent_thoughts> — interior memory (continue, don't repeat)
+        if (npc.recentThoughts) {
+            parts.push(wrapTag('recent_thoughts', npc.recentThoughts));
+        }
+
+        // <inner_state> — prior mood line (when available)
+        if (npc.innerState) {
+            parts.push(wrapTag('inner_state', npc.innerState));
+        }
+
+        // <open_intentions> — anticipation material
+        if (npc.openIntentions && npc.openIntentions.length > 0) {
+            const lines = npc.openIntentions.map(e =>
+                // INTERIORITY-06: cap every prompt path (same as buildUserContent).
+                `- ${cap(e.action, MAX_LEDGER_FIELD)} → trigger: ${cap(e.trigger, MAX_LEDGER_FIELD)} (since ${e.since ? cap(e.since, MAX_LEDGER_SINCE) : 'unknown'})`
+            );
+            parts.push(wrapTag('open_intentions', lines.join('\n')));
+        }
+
+        parts.push('</npc>');
+        parts.push('');
+    }
+
+    parts.push(wrapTag('recent_messages', recentMessages));
+    parts.push('');
+    parts.push('='.repeat(60));
+    parts.push('Write each NPC\'s thought and inner_state. Output only JSON per the contract.');
+
+    return parts.join('\n');
+}
+
+/**
+ * Build the injection header for the narrator-facing intentions block.
+ * This is the bracket header that goes inside the <mwt_npc_intentions> tag.
+ *
+ * Departure exception: completing an exit in the same response that answers
+ * the player (e.g. a thank-you) left them no chance to reply. A present NPC
+ * whose action would end a conversation the player has not ended starts it
+ * on-screen and finishes it next turn. The evaluation prompt already treats a
+ * begun action as "open", so the entry stays live until the exit happens.
+ */
+export const INJECTION_HEADER = `[NPC intentions ledger — live, hidden NPC plans. For every entry whose trigger condition is met, that NPC MUST complete the action this turn, fully committed. If the NPC is present in the current scene, perform it on-screen. The one exception to completing it this turn: if the action would take a present NPC out of a conversation the player character has not ended (leaving, going back to work, heading home), the NPC begins it on-screen — says so or starts to move — and the response ends while they are still present; next turn they finish it, unless the player character's reply gives them a reason to stay. Beginning a departure this way is acting this turn, not deferring. If the NPC is elsewhere, execute it off-screen and log the completed action in the Off-Screen Events module block at the end of the response (a details block titled "Off-Screen Events") instead of cutting away in prose — if no such block exists yet, create one; that log line is the receipt proving the action happened, and an off-screen action with no log line leaves no evidence and will be demanded again next turn. Never execute invisibly, never cut away in prose, never defer. Do not narrate these entries, reference them, or let other characters know them — they surface ONLY as the owning NPC's actions (on-screen) or as an off-screen log line. If an entry describes something that has already occurred in the story, treat it as stale bookkeeping — ignore it silently; never mention, re-perform, or correct it.]`;
+
+/**
+ * Format the ledger into the flat arrow-notation lines for injection.
+ *
+ * Dormant entries (§20) are filtered out — the narrator never spends
+ * attention on a trigger that cannot be met yet.
+ *
+ * INTERIORITY-06: Each field is capped to a maximum character length so a
+ * runaway model-generated or user-edited entry cannot make the
+ * `<mwt_npc_intentions>` payload grow without limit every turn.
+ *
+ * Example output:
+ *   - Mara → search the study drawer → next time Jonah leaves the house (since Tue evening)
+ *   - Tomas → move the ledger → tonight (since Wed noon)
+ *
+ * @param {Array<object>} ledger
+ * @returns {string}
+ */
+export function formatLedgerForInjection(ledger) {
+    if (!ledger || !ledger.length) return '';
+    // §20: dormant entries are excluded; M5-6: at most MAX_INJECTED_INTENTIONS,
+    // chosen by selectInjectedIntentions(). The omission is reported to the
+    // user (panel + diagnostics), never here: an instruction inside the
+    // narrator prompt would only be echoed into the story.
+    const { kept } = selectInjectedIntentions(ledger);
+    if (kept.length === 0) return '';
+    const lines = kept.map(e => {
+        // INTERIORITY-06: Cap each field so unbounded entries don't bloat
+        // the narrator injection every turn. Lifecycle v2: the line carries
+        // the user's priority/expiry annotations (spec §1/§4).
+        const npc = cap(e.npc, MAX_LEDGER_NAME);
+        const action = cap(e.action, MAX_LEDGER_FIELD);
+        const trigger = cap(e.trigger, MAX_LEDGER_FIELD);
+        const since = e.since ? ` (since ${cap(e.since, MAX_LEDGER_SINCE)})` : '';
+        return `- ${npc} → ${action} → ${trigger}${since}${_lifecycleAnnotations(e)}`;
+    });
+    return lines.join('\n');
+}
+
+/**
+ * How many active intentions the narrator block carries. A bounded body keeps
+ * an unbounded number of mandatory actions from crowding out the rest of the
+ * prompt (M5-6).
+ */
+export const MAX_INJECTED_INTENTIONS = 20;
+
+const INJECTION_PRIORITY_RANK = Object.freeze({ urgent: 3, high: 2, normal: 1, low: 0 });
+
+/**
+ * Choose which active (non-dormant) intentions reach the narrator. Under the
+ * cap every one does; over it, the highest priority wins, then the most
+ * recently declared — the ledger is append-only, so a later position is a
+ * newer intention. The kept entries keep their ledger order, so the block
+ * still reads chronologically.
+ *
+ * @param {Array<object>} ledger
+ * @returns {{ kept: Array<object>, omitted: number }}
+ */
+export function selectInjectedIntentions(ledger) {
+    const active = (Array.isArray(ledger) ? ledger : []).filter(e => e && e.status !== 'dormant');
+    if (active.length <= MAX_INJECTED_INTENTIONS) return { kept: active, omitted: 0 };
+    const rank = e => INJECTION_PRIORITY_RANK[e.priority] ?? INJECTION_PRIORITY_RANK.normal;
+    const chosen = new Set(active
+        .map((entry, index) => ({ entry, index }))
+        .sort((a, b) => rank(b.entry) - rank(a.entry) || b.index - a.index)
+        .slice(0, MAX_INJECTED_INTENTIONS)
+        .map(({ entry }) => entry));
+    return { kept: active.filter(e => chosen.has(e)), omitted: active.length - chosen.size };
+}
+
+// ─── Dormant poll prompt (v2 §20) ────────────────────────────────────────────
+
+/**
+ * Build the system prompt for the dormant-intentions lazy poll.
+ *
+ * Fires every {@link DORMANT_POLL_INTERVAL} turns when there are dormant
+ * entries. A cheap, focused question: is the trigger near? The poll wakes
+ * entries early — when the event is "tomorrow," not when it starts — so the
+ * NPC gets a turn or two of anticipatory behavior and the narrator receives
+ * the demand while it's relevant.
+ *
+ * @returns {string}
+ */
+export function buildDormantPollSystemPrompt() {
+    return `\
+You are a scheduling assistant for a role-playing story. You decide whether scheduled (dormant) NPC intentions should wake — i.e., whether their trigger condition is near enough that the intention should become active.
+
+For each dormant intention, you receive:
+- The NPC's action and trigger.
+- The wake_hint (the event/date to watch for).
+- The current in-world time (when available).
+- A window of recent story messages.
+
+DECIDE for each intention:
+- "wake": the trigger's time is near (within a turn or two) or the event has started appearing in the story.
+- "sleep": the trigger is still far off or has not surfaced yet.
+
+ABSOLUTE RULES:
+1. Output ONLY valid JSON. No markdown fences, no prose before or after.
+2. Wake EARLY — when the event is "tomorrow," not when it starts.
+3. When unsure, choose "sleep" (false alarms are cheap; a missed wake is not).
+4. Never invent events. If the wake_hint hasn't surfaced in time or messages, keep sleeping.
+
+OUTPUT CONTRACT (JSON only):
+{
+  "intentions": [
+    { "id": "i-3f9a", "wake": false }
+  ]
+}`;
+}
+
+/**
+ * Build the user-content message for the dormant poll.
+ *
+ * INTERIORITY-06: Ledger fields are capped via `cap()` and INTERIORITY-07:
+ * interpolated content is escaped via `wrapTag`.
+ *
+ * @param {Array<object>} dormantEntries - ledger entries with status 'dormant'
+ * @param {string} recentMessages - stripped recent message window
+ * @param {string} [worldTime] - current in-world time
+ * @returns {string}
+ */
+export function buildDormantPollUserContent({ dormantEntries, recentMessages, worldTime }) {
+    const parts = [];
+
+    if (worldTime) {
+        parts.push(wrapTag('world_time', worldTime));
+        parts.push('');
+    }
+
+    const lines = dormantEntries.map(e => {
+        const npc = cap(e.npc, MAX_LEDGER_NAME);
+        const action = cap(e.action, MAX_LEDGER_FIELD);
+        const trigger = cap(e.trigger, MAX_LEDGER_FIELD);
+        const lineParts = [`- [${e.id}] ${npc} → ${action} → trigger: ${trigger}`];
+        if (e.wakeHint) lineParts.push(`  wake_hint: ${cap(e.wakeHint, MAX_LEDGER_FIELD)}`);
+        if (e.since) lineParts.push(`  since: ${cap(e.since, MAX_LEDGER_SINCE)}`);
+        return lineParts.join('\n');
+    });
+    parts.push(wrapTag('dormant_intentions', lines.join('\n')));
+    parts.push('');
+
+    parts.push(wrapTag('recent_messages', recentMessages));
+    parts.push('');
+    parts.push('='.repeat(60));
+    parts.push('For each dormant intention, decide wake or sleep. Output only JSON per the contract.');
+
+    return parts.join('\n');
+}

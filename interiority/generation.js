@@ -1,0 +1,2067 @@
+/**
+ * interiority/generation.js — Context assembly, API call, roster building,
+ * validation, and ledger mutation.
+ *
+ * Implements the "runScan" pattern from world_state/knowledge modules:
+ *   resolveApiCall → fetchFn → normaliseOutput → parseJsonLenient → validate
+ *
+ * Strict mode is a loop around the same builder.
+ */
+
+import {
+    getChatMeta, getContextSafe, getRecentMessages, getUserNames,
+    resolveApiCall, normaliseOutput, parseJsonLenient,
+    getCurrentWorldStateScene, wholePhraseRegex,
+    assertSameScope, isCancellation,
+} from '../core/index.js';
+
+import { quoteMatchesMessage } from '../core/quote_match.js';
+import { REGISTRY_KEY } from '../knowledge/state.js';
+// Static, unlike the registry ACCESSORS below (which stay dynamic so the
+// interiority module does not pull the knowledge store into its load path).
+// isUnambiguousNpcAlias is pure string logic with no store dependency, and
+// resolveRosterName is synchronous — it cannot await an import. One shared
+// rule is the point: roster matching and registry matching must not drift.
+import { isUnambiguousNpcAlias } from '../knowledge/registry.js';
+
+import {
+    buildSystemPrompt, buildUserContent,
+    buildThoughtsSystemPrompt, buildThoughtsUserContent,
+    buildDormantPollSystemPrompt, buildDormantPollUserContent,
+} from './prompts.js';
+// Lifecycle plan Tier 1 item 4 — generation-scoped intentions capture. Leaf
+// module; every note* helper is a no-op unless a capture is in flight.
+import { noteIntentionsCaptureCall, noteIntentionsCaptureDecision } from './capture.js';
+// Deferred lifecycle work (spec §2–§5): bounded lifecycle history, cross-turn
+// closure dedup, evidence boundaries, per-NPC controls. One layer ABOVE
+// data.js (same rule as this module) — never imported by data.js.
+import {
+    recordLifecycleEvent, findRecentClosureMatch, checkProposalAllowed,
+    noteProposalAccepted, expireOverdueEngineEntries, stampEvidenceBoundary,
+    getEvidenceBoundariesSnapshot, getLifecycleHistorySnapshot, getNpcControl,
+    getNpcControlWatermarksSnapshot,
+    getEvidenceBoundary, PRIVACY_WITHHELD_NOTE,
+} from './lifecycle.js';
+import {
+    getSettings, hasValidSettings,
+    getInteriorityData,
+    addLedgerEntry, removeLedgerEntries, hasDuplicateIntention, hasDuplicateIntentionIn,
+    setPerMessage, getLedgerEntriesForNpc,
+    getOrCreateMsgKeyForIndex,
+    getRecentThoughtsForNpc,
+    getInnerState, setInnerStateGuarded, getInnerStatesSnapshot,
+    getLedger, getDormantLedger, wakeLedgerEntry,
+    getTurnCounter,
+    MAX_THOUGHT_LENGTH, getWorldTime, incrementLedgerAges,
+} from './data.js';
+
+// ─── Scene roster (§6) ────────────────────────────────────────────────────────
+
+/**
+ * Build the NPC roster for this turn.
+ *
+ * NPCs with live ledger entries are added first and are EXEMPT from the
+ * `maxNpcs` cap — their intentions must be evaluated (executed/dropped)
+ * every turn, or they linger in the injection forever demanding actions
+ * from NPCs the generator never processes.
+ *
+ * Scene NPCs then fill up to `maxNpcs` slots, resolved via priority chain:
+ *   1. Parse `Present:` from the current world state document.
+ *   2. Fallback: Knowledge Tracker registry names in recent messages.
+ *   3. Fallback: `{{char}}` name only.
+ *
+ * Player names are always excluded. Only {{user}} (name1) is excluded —
+ * {{char}} (name2) and group-chat members are valid NPC targets.
+ *
+ * @returns {Promise<string[]>} NPC names
+ */
+/**
+ * Load the knowledge registry's name canonicalizer, or a pass-through when the
+ * knowledge module is unavailable.
+ *
+ * Roster names from `Present:` and from the model use different name forms
+ * ("Mara" vs "Mara Vance"). Canonicalizing to the registry key at roster-build
+ * time prevents forking the NPC's inner-state, recent-thoughts, and ledger
+ * stores — each form would otherwise get its own independent line.
+ *
+ * @returns {Promise<(name: string) => string>}
+ */
+async function _getCanonicalizer() {
+    let reg = null;
+    let resolveKey = null;
+    try {
+        const knowledgeRegistry = await import('../knowledge/registry.js');
+        reg = knowledgeRegistry.getRegistry();
+        resolveKey = knowledgeRegistry.resolveRegistryKey;
+    } catch { /* knowledge module unavailable — names stay as-is */ }
+
+    return (name) => {
+        const n = String(name || '').trim();
+        if (!n || !reg || !resolveKey) return n;
+        const key = resolveKey(reg, n);
+        return key || n; // fall back to raw name when no registry entry
+    };
+}
+
+/**
+ * Every name form that refers to the human user, lower-cased.
+ *
+ * {{user}} alone is not enough. The roster canonicalizes each candidate through
+ * the knowledge registry BEFORE testing it, and the registry is keyed on
+ * whatever the knowledge tracker first recorded — often a fuller name. With
+ * {{user}} = "Alex" and a registry entry "Alex Blackwell", `canonicalize("Alex")`
+ * returned "Alex Blackwell", which matched nothing in the exclusion set, and
+ * the player character walked onto the roster under their own canonical name.
+ * From there they got intentions, and the injection started demanding the
+ * narrator act for the player — which is exactly the hijack this filter exists
+ * to prevent.
+ *
+ * Widening it through the SAME resolver the roster uses keeps the match
+ * precise: it is not first-name guessing, it is "whatever entry the registry
+ * says this person is". `resolveRegistryKey` already refuses ambiguous
+ * given-name matches, so a different NPC who happens to share the user's given
+ * name resolves to null and is left alone.
+ *
+ * @returns {Promise<Set<string>>} lower-cased user name forms
+ */
+export async function resolveUserNames() {
+    const names = getUserNames({ lower: true });
+    const canonicalize = await _getCanonicalizer();
+    for (const n of [...names]) {
+        const canon = canonicalize(n);
+        if (canon) names.add(canon.toLowerCase().trim());
+    }
+    return names;
+}
+
+/**
+ * Does `candidate` name the human user?
+ *
+ * {@link resolveUserNames} widens {{user}} in ONE direction — through the
+ * knowledge registry, which turns a short persona into the fuller name the
+ * tracker recorded ("Alex" → "Alex Blackwell"). The inverse never resolves:
+ * with {{user}} = "Alex Hiro" and a scene that says "Alex", there is no
+ * registry entry to bridge them, *because the player character is deliberately
+ * never recorded in the registry*. The one bridge the old code had is the one
+ * the PC structurally cannot have.
+ *
+ * So test the shorthand directly, with the same unambiguous-alias rule the
+ * registry uses — and with the same refusal: if another candidate in the scene
+ * also answers to "Alex", the shorthand is ambiguous and nobody is excluded,
+ * so a real NPC never loses their interiority to a name collision.
+ *
+ * @param {string} candidate — a roster candidate or ledger owner
+ * @param {Set<string>} userNamesLower — from {@link resolveUserNames}
+ * @param {string[]} [population] — every other name visible in this context
+ * @returns {boolean}
+ */
+export function isUserName(candidate, userNamesLower, population = []) {
+    const c = String(candidate || '').toLowerCase().trim();
+    if (!c) return false;
+    if (userNamesLower.has(c)) return true;
+    for (const userName of userNamesLower) {
+        if (isUnambiguousNpcAlias(userName, c, population)) return true;
+    }
+    return false;
+}
+
+export async function buildSceneRoster(virtuallyActiveIds = []) {
+    const settings = getSettings();
+    const maxNpcs = Math.max(1, settings.maxNpcs || 4);
+    // Only exclude the human user. {{char}} and other AI characters are valid
+    // NPC targets for interiority generation.
+    const userNames = await resolveUserNames();
+    const canonicalize = await _getCanonicalizer();
+
+    // Test BOTH forms. Canonicalization can map a name INTO the user's registry
+    // identity ("Alex" → "Alex Blackwell") or the scene can name the user in a
+    // form the persona field never used; testing only one of them lets the
+    // other through. `population` (filled in below, before any candidate is
+    // tested) is what keeps the shorthand match honest.
+    const population = [];
+    const excluded = [];
+    const exclude = (raw, canon) => {
+        const a = String(raw || '').toLowerCase().trim();
+        const b = String(canon || '').toLowerCase().trim();
+        if (!a && !b) return true;
+        if (isUserName(a, userNames, population) || isUserName(b, userNames, population)) {
+            if (!excluded.includes(canon || raw)) excluded.push(canon || raw);
+            return true;
+        }
+        return false;
+    };
+
+    // 1. Read the shared Current Scene contract. The core parser owns field
+    //    boundaries and Present annotation normalization.
+    let sceneNames = [];
+    const scene = getCurrentWorldStateScene();
+    if (scene?.section || scene?.legacy) sceneNames = scene.present || [];
+
+    // 2. UNION in Knowledge Tracker registry names that appear in recent
+    //    messages. This now runs ALWAYS, not only when `Present:` is empty.
+    //    The world-state tracker regularly writes an INCOMPLETE `Present:`
+    //    line (e.g. names only the card's primary NPC), which used to strand
+    //    every other in-scene NPC: they have a knowledge record but never make
+    //    the roster, so they never get thoughts/intentions. Appended AFTER the
+    //    `Present:` names so that if the cap is hit the authoritative
+    //    world-state names win the slots.
+    const registryPresent = [];
+    try {
+        // Canonical keys come from the legacy chat-metadata mirror; the
+        // user-approved alias list (TODO §1 identity service) lives ONLY in
+        // the live lorebook-store registry, so the store is consulted too —
+        // an NPC whose scene presence is only ever spelled by an alias
+        // ("The Vixen" for "Mara Vance") must still reach the roster, under
+        // the canonical name. Matching a form pushes the canonical KEY;
+        // addUnique() re-canonicalizes regardless.
+        const nameForms = new Map(); // canonical registry key → Set<name form>
+        const addForms = (name, forms) => {
+            const key = String(name ?? '').trim();
+            if (!key) return;
+            const set = nameForms.get(key) ?? new Set();
+            for (const form of forms) {
+                const f = String(form ?? '').trim();
+                if (f) set.add(f);
+            }
+            nameForms.set(key, set);
+        };
+        for (const name of Object.keys(getChatMeta(REGISTRY_KEY) ?? {})) addForms(name, [name]);
+        try {
+            const { getRegistry } = await import('../knowledge/registry.js');
+            for (const [name, record] of Object.entries(getRegistry() ?? {})) {
+                const aliases = Array.isArray(record?.aliases) ? record.aliases : [];
+                addForms(name, [name, ...aliases]);
+            }
+        } catch { /* live registry unavailable — mirror keys only */ }
+
+        if (nameForms.size > 0) {
+            const recent = getRecentMessages({ maxMessages: 10, maxChars: 50000 });
+            if (recent) {
+                // NOTE: aliases are free text (addAlias imposes no shape
+                // rules) and this match is high-confidence evidence BY
+                // DESIGN — a single generic word ("Boss") pulls its owner
+                // onto the roster off any mention of that word, consuming a
+                // roster slot every turn. Distinctive aliases keep that
+                // power meaningful. Edge-derived boundaries
+                // (wholePhraseRegex): punctuation-edged aliases ("A.J.",
+                // "(Vixen)") never match under unconditional `\b`s, so the
+                // same forms would also fail scene detection here.
+                for (const [name, forms] of nameForms) {
+                    const present = [...forms].some(form =>
+                        wholePhraseRegex(form).test(recent));
+                    if (present) registryPresent.push(name);
+                }
+            }
+        }
+    } catch { /* knowledge module data unavailable */ }
+
+    // 3. Fallback: {{char}} name only — used only when nothing else resolved.
+    if (sceneNames.length === 0 && registryPresent.length === 0) {
+        const ctx = getContextSafe();
+        if (ctx?.name2) sceneNames.push(ctx.name2);
+    }
+
+    const roster = [];
+    const addUnique = (name) => {
+        const n = canonicalize(name);
+        if (exclude(name, n)) return;
+        if (!roster.some(r => r.toLowerCase() === n.toLowerCase())) roster.push(n);
+    };
+
+    // Every name this turn could put in front of the model, gathered BEFORE
+    // the first exclusion test. `exclude` judges a shorthand ("Alex") against
+    // this list, so an incomplete list would let an ambiguous shorthand read as
+    // unambiguous — the one way this filter could silence a real NPC.
+    const virtualIds = new Set(virtuallyActiveIds);
+    const ledgerNames = getLedger()
+        .filter(entry => entry.status !== 'dormant' || virtualIds.has(entry.id))
+        .map(entry => entry.npc);
+    const rawCandidates = [...ledgerNames, ...sceneNames, ...registryPresent];
+    // Canonicalized forms join the raw ones in the population. The registry's
+    // answer for a shorthand is a NAME too, even when no raw list holds it:
+    // with {{user}} = "Alex Hiro", a registry NPC "Alex Blackwell", and
+    // `Present: Alex`, canonicalize("Alex") IS "Alex Blackwell" — a distinct
+    // full identity. Judged against raw names only, "Alex" read as an
+    // unambiguous alias of the user and the NPC was silently excluded. The
+    // canonical form joins the clique check, the shorthand reads as
+    // ambiguous, and the registry's distinct identity keeps its interiority.
+    population.push(...rawCandidates, ...rawCandidates.map(canonicalize));
+
+    // Active ledger NPCs first — always included, never capped. A dormant entry
+    // proposed by this turn's poll is virtually active too: it must be present
+    // in the intentions request before the proposal can be committed.
+    // NPCs are exempt from injection and evaluation (§20), so they should not
+    // consume a roster slot every turn (item 3 fix). They still join normally
+    // via `Present:` when actually in scene, and the dormant poll wakes their
+    // intentions on schedule regardless of roster membership.
+    for (const entry of ledgerNames) addUnique(entry);
+    const ledgerCount = roster.length;
+
+    // Scene NPCs fill the capped slots (cap counts scene additions only).
+    // Order: `Present:` names first (authoritative), then registry-derived
+    // names (gap-fill). addUnique() dedupes case-insensitively and applies the
+    // player-character exclusion, so overlap between the two lists is harmless.
+    const presentCanonLower = new Set(sceneNames.map(s => canonicalize(s).toLowerCase()));
+    for (const n of [...sceneNames, ...registryPresent]) {
+        if (roster.length - ledgerCount >= maxNpcs) break;
+        addUnique(n);
+    }
+
+    // Diagnostic: name the NPCs the registry union rescued from an incomplete
+    // `Present:` line — this is exactly the failure this union addresses, so
+    // make it visible in the log instead of silently working.
+    if (sceneNames.length > 0) {
+        const rescued = roster
+            .slice(ledgerCount)
+            .filter(r => !presentCanonLower.has(r.toLowerCase()));
+        if (rescued.length > 0) {
+            console.log(`[MWT:Interiority] Roster union rescued ${rescued.join(', ')} — present in the scene (knowledge registry + recent messages) but missing from the world-state Present: line.`);
+        }
+    }
+
+    // Say so when the player character was filtered out. This used to be
+    // silent, so when the filter missed a name form there was nothing in the
+    // log to explain how the PC ended up with intentions.
+    if (excluded.length > 0) {
+        console.log(
+            `[MWT:Interiority] Excluded the player character from the roster: ${excluded.join(', ')}.`
+        );
+    }
+
+    return roster;
+}
+
+// ─── Context assembly (§7) ───────────────────────────────────────────────────
+
+/**
+ * Load the knowledge entry for an NPC from the Knowledge Tracker registry.
+ * Uses dynamic import to avoid a hard dependency on the knowledge module.
+ *
+ * @param {string} npcName
+ * @returns {Promise<string|null>} stripped knowledge entry content, or null
+ */
+async function loadNpcKnowledge(npcName) {
+    try {
+        const { getRegistry, resolveRegistryKey } = await import('../knowledge/registry.js');
+        const { loadEntryContent } = await import('../knowledge/lorebook.js');
+        const { stripRelationshipBlock } = await import('../knowledge/relationships.js');
+        const reg = getRegistry();
+        // Roster names come from the world state `Present:` line and need not
+        // match the registry's key form. An exact lookup silently costs the NPC
+        // their entire dossier on BOTH calls. registry.js owns the resolution
+        // rules (one owner of the format).
+        const key = resolveRegistryKey(reg, npcName);
+        const info = key != null ? reg[key] : null;
+        if (!info || info.uid == null) return null;
+        // Label-verified against the canonical key: a stale uid must not hand
+        // another NPC's dossier to this roster member as context.
+        const content = await loadEntryContent(info.uid, key);
+        if (!content) return null;
+        return stripRelationshipBlock(content);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Assemble the per-NPC context blocks for the API call.
+ *
+ * Dormant entries (§20) stay out of `openIntentions`: that list is the
+ * EVALUATION list, and the whole point of dormancy is that a scheduled
+ * intention is not evaluated per turn.
+ *
+ * They are still sent, separately, as `scheduledIntentions`. The intentions
+ * call does two jobs — it evaluates existing intentions AND proposes new ones —
+ * and dropping dormant entries entirely was only correct for the first. For the
+ * second it meant the model could not see that Ezra already plans to call
+ * Dorothy on Monday, so it re-proposed that plan from unchanged story context
+ * every single turn. Exact-string dedup caught the re-proposals that came back
+ * word for word and nothing else, so the ledger accumulated near-duplicate
+ * paraphrases of one intention — and deleting them just freed the slot to be
+ * filled again next turn.
+ *
+ * The scheduled list carries NO ids, which is what keeps §20 intact: the model
+ * can see these intentions but has no handle to mark them executed or dropped.
+ * It is a "you already know about these" list, not an evaluable one.
+ *
+ * @param {string[]} roster
+ * @param {Iterable<string>} [virtuallyActiveIds] - dormant IDs proposed by the
+ *   current poll. They are evaluable for this call without becoming persistent
+ *   until validation accepts the whole turn.
+ * @returns {Promise<Array<{name, knowledgeEntry, openIntentions, scheduledIntentions}>>}
+ */
+export async function assembleNpcBlocks(roster, virtuallyActiveIds = []) {
+    const virtualIds = new Set(virtuallyActiveIds);
+    const blocks = [];
+    const turnNow = getTurnCounter();
+    for (const name of roster) {
+        // Per-NPC privacy control (spec §5): the dossier is withheld BEFORE
+        // assembly — the lorebook is never even consulted for an excluded NPC,
+        // so their knowledge entry cannot reach ANY batched/strict intentions
+        // call. Intentions tracking and the actor/witness rules are untouched.
+        const privacyExcluded = getNpcControl(name).privacyExcluded === true;
+        const knowledgeEntry = privacyExcluded ? PRIVACY_WITHHELD_NOTE : await loadNpcKnowledge(name);
+        const entries = getLedgerEntriesForNpc(name);
+        // §20: dormant entries stay out of normal evaluation, except for a
+        // wake proposed by THIS turn's poll. That proposal is virtual until the
+        // main result passes validation, but the model must be able to resolve
+        // it in the same turn rather than receiving a stale demand next turn.
+        const openIntentions = entries.filter(e => e.status !== 'dormant' || virtualIds.has(e.id));
+        const scheduledIntentions = entries.filter(e => e.status === 'dormant' && !virtualIds.has(e.id));
+        // Lifecycle v2 (spec §3): the evidence-boundary payoff — when this
+        // NPC's last successful intentions evaluation lags the current turn,
+        // tell the model so un-judged events get extra scrutiny. The rolling
+        // window itself is deliberately unchanged (plan §1 failure-mode 6).
+        const boundary = getEvidenceBoundary(name);
+        const evaluationGap = boundary ? turnNow - (Number(boundary.turn) || 0) : null;
+        const evaluationNote = evaluationGap !== null && evaluationGap >= 2
+            ? `This NPC's intentions were last successfully evaluated ${evaluationGap} turns ago (story turn ${boundary.turn}). Events since then may not have been judged yet — check for completed or abandoned plans in the supplied window with extra care.`
+            : null;
+        blocks.push({ name, knowledgeEntry, openIntentions, scheduledIntentions, evaluationNote });
+    }
+    return blocks;
+}
+
+// ─── Thoughts-call context assembly (v2 §17) ─────────────────────────────────
+
+/**
+ * Assemble the richer per-NPC context blocks for the dedicated thoughts call.
+ *
+ * Unlike the lean v1 {@link assembleNpcBlocks}, this loads interpretive layers
+ * that the input-partition rule (§15) permits ONLY on the thoughts side:
+ * growth profile, relationships from data, recent thoughts (interior memory).
+ *
+ * The intentions call NEVER sees these — it stays on {@link assembleNpcBlocks}.
+ *
+ * @param {string[]} roster
+ * @returns {Promise<Array<object>>} rich blocks keyed by §17 block names
+ */
+/**
+ * Format one NPC's `<recent_thoughts>` block (§17 interior memory).
+ *
+ * Shared by the normal and privacy-excluded paths: recent thoughts are
+ * interiority's OWN layer, not dossier text, so a privacy-excluded NPC keeps
+ * them — and must keep them in the SAME shape, or a batched call would carry
+ * one NPC's block formatted unlike every sibling's.
+ *
+ * @param {string} npcName
+ * @returns {string} formatted thought lines, or '' if none
+ */
+function _formatRecentThoughts(npcName) {
+    const recent = getRecentThoughtsForNpc(npcName, 4);
+    if (recent.length === 0) return '';
+    return recent.map(r => {
+        const label = r.msgIdx != null ? ` (msg ${r.msgIdx})` : '';
+        return `- "${r.thought}"${label}`;
+    }).join('\n');
+}
+
+async function _assembleThoughtsNpcBlocks(roster) {
+    // Dynamic imports — knowledge module is an optional dependency. Cached by
+    // the ES module system, so repeated calls resolve to the same namespace.
+    const knowledgeLorebook = await import('../knowledge/lorebook.js').catch(() => null);
+    const knowledgeGrowth = await import('../knowledge/growth.js').catch(() => null);
+    const knowledgeRelationships = await import('../knowledge/relationships.js').catch(() => null);
+
+    const blocks = [];
+    for (const name of roster) {
+        const block = {
+            name,
+            characterCore: '',
+            knowledgeEntry: '',
+            relationships: '',
+            recentThoughts: '',
+            innerState: getInnerState(name), // §18: prior mood line fed to the thoughts call
+            openIntentions: getLedgerEntriesForNpc(name),
+        };
+
+        // Per-NPC privacy control (spec §5): every dossier-derived layer is
+        // withheld on the thoughts side too — one control, ALL interiority
+        // calls. Interiority's OWN layers (inner state, recent thoughts, the
+        // intention lists) are not dossier text and stay; the actor/witness
+        // rules are untouched.
+        if (getNpcControl(name).privacyExcluded === true) {
+            block.knowledgeEntry = PRIVACY_WITHHELD_NOTE;
+            block.characterCore = PRIVACY_WITHHELD_NOTE;
+            block.relationships = PRIVACY_WITHHELD_NOTE;
+            block.recentThoughts = _formatRecentThoughts(name);
+            blocks.push(block);
+            continue;
+        }
+
+        // Load raw knowledge entry (already relationship-stripped by loadNpcKnowledge)
+        const rawKnowledge = await loadNpcKnowledge(name);
+
+        // Partition identity fields from the remainder so <character_core>
+        // and <knowledge_entry> carry different content (no overlap, per §17).
+        let identityFields = {};
+        let knowledgeRemainder = rawKnowledge || '';
+        if (rawKnowledge && knowledgeLorebook?.extractIdentityFields) {
+            const split = knowledgeLorebook.extractIdentityFields(rawKnowledge);
+            identityFields = split.fields;
+            knowledgeRemainder = split.remainder;
+        }
+        block.knowledgeEntry = knowledgeRemainder;
+
+        // <character_core> — growth profile (primary), else identity fields (fallback)
+        if (knowledgeGrowth?.loadProfile) {
+            try {
+                const profile = await knowledgeGrowth.loadProfile(name);
+                if (profile) block.characterCore = profile;
+            } catch { /* profile unavailable */ }
+        }
+        if (!block.characterCore && Object.keys(identityFields).length > 0) {
+            block.characterCore = Object.entries(identityFields)
+                .map(([k, v]) => `${k}: ${v}`)
+                .join('\n');
+        }
+
+        // <relationships> — outbound edges filtered to roster (sealed minds)
+        if (knowledgeRelationships?.getNpcRelationships) {
+            block.relationships = _formatRelationshipsForRoster(
+                name, roster, knowledgeRelationships.getNpcRelationships
+            );
+        }
+
+        // <recent_thoughts> — interior memory (continue, don't repeat)
+        block.recentThoughts = _formatRecentThoughts(name);
+
+        blocks.push(block);
+    }
+    return blocks;
+}
+
+/**
+ * Format an NPC's outbound relationships, filtered to roster members.
+ *
+ * Implements the sealed-minds rule structurally: Mara's block gets only
+ * Mara→Jonah edges, never Jonah's edge about her.
+ *
+ * Edge targets resolve through {@link resolveRosterName} rather than an exact
+ * lowercase lookup: a legacy or un-repaired edge spelling the old name
+ * ("Jonah" for roster "Jonah Reyes") used to drop the line from the prompt
+ * entirely. Lines are emitted under the roster's spelling, matching every
+ * other name the prompt shows.
+ *
+ * Edge `notes` are deliberately NOT rendered, matching the same rule in
+ * knowledge/relationships.js formatRelationshipBlock(). A note is up to 280
+ * chars of extractor prose ("APEX freight/receiving; starts Monday"), stored
+ * as evidence for the editor and the graph view. Roster filtering bounds this
+ * list by cast size, not by note length, so the notes were the one part of it
+ * that could grow without limit — paid on every interiority call, several
+ * times per turn in split mode. The structural claim is what the generator
+ * reasons over; the prose was context it never asked for.
+ *
+ * @param {string} npcName
+ * @param {string[]} roster
+ * @param {function} getNpcRelationships - from knowledge/relationships.js
+ * @returns {string} formatted relationship lines, or '' if none
+ */
+function _formatRelationshipsForRoster(npcName, roster, getNpcRelationships) {
+    try {
+        const rels = getNpcRelationships(npcName);
+        if (!rels || rels.length === 0) return '';
+        // Exact matches stay exact (resolveRosterName's step 1); the
+        // unambiguous given-name heuristic is the only addition. A target
+        // that resolves to nobody — or to two members — still drops, so the
+        // sealed-minds filter keeps its shape. Two spellings resolving to the
+        // same member collapse to one line.
+        const seen = new Set();
+        const filtered = [];
+        for (const r of rels) {
+            const target = resolveRosterName(roster, String(r?.target ?? '').trim());
+            if (target == null) continue;
+            const key = String(target).toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            filtered.push({ ...r, target });
+        }
+        if (filtered.length === 0) return '';
+        return filtered.map(r => `- ${npcName} → ${r.target}: ${r.type}`).join('\n');
+    } catch {
+        return '';
+    }
+}
+
+// ─── API call ────────────────────────────────────────────────────────────────
+
+/**
+ * Private shared implementation for all batched API calls.
+ *
+ * @param {string[]} roster
+ * @param {object} [opts] - override which features are requested (used by split mode)
+ * @param {boolean|null} [opts.thoughts] - force thoughts on/off; null = use settings
+ * @param {boolean|null} [opts.intentions] - force intentions on/off; null = use settings
+ * @param {string} [opts.label] - log label for the call
+ * @returns {Promise<object|null>} parsed JSON result, or null on failure
+ */
+async function _runCall(roster, {
+    thoughts = null, intentions = null, label = 'batched', useRichThoughtsContext = false,
+    virtuallyActiveIds = [], trigger = null,
+} = {}) {
+    if (!hasValidSettings()) {
+        console.warn(`[MWT:Interiority] No API connection configured (${label}).`);
+        return null;
+    }
+
+    const settings = getSettings();
+    const wantThoughts = thoughts !== null ? thoughts : settings.generateThoughts !== false;
+    const wantIntentions = intentions !== null ? intentions : settings.generateIntentions !== false;
+    if (!wantThoughts && !wantIntentions) {
+        console.warn(`[MWT:Interiority] Both thoughts and intentions are disabled — skipping ${label} call.`);
+        return null;
+    }
+
+    // §21: thoughts connection profile — when set, route the (expensive)
+    // thoughts call through a separate connection profile so a better model
+    // can be pointed at voice without paying for it on bookkeeping. The
+    // intentions call stays on the module connection. Only applies to the
+    // rich-thoughts (split) call; the unified call uses the module connection.
+    const apiSettings = useRichThoughtsContext && settings.thoughtsConnectionProfileId
+        ? { ...settings, connectionProfileId: settings.thoughtsConnectionProfileId }
+        : settings;
+
+    // Rich thoughts context (v2 §17) uses the dedicated craft prompt + richer
+    // per-NPC blocks. The v1 unified call and the intentions-side split call
+    // stay on the lean blocks + unified prompt.
+    const npcBlocks = useRichThoughtsContext
+        ? await _assembleThoughtsNpcBlocks(roster)
+        : await assembleNpcBlocks(roster, virtuallyActiveIds);
+    const windowSize = Math.max(1, settings.messageWindow || 8);
+
+    // Get stripped recent messages
+    const recentMessages = getStrippedRecentMessages(windowSize);
+    if (!recentMessages) {
+        console.warn(`[MWT:Interiority] No recent messages to process (${label}).`);
+        return null;
+    }
+
+    const worldTime = getWorldTime();
+    const playerName = [...getUserNames({ lower: false })][0] || '';
+
+    let systemPrompt, userContent;
+    if (useRichThoughtsContext) {
+        systemPrompt = buildThoughtsSystemPrompt();
+        userContent = buildThoughtsUserContent({
+            npcBlocks,
+            recentMessages,
+            worldTime,
+            playerName,
+        });
+    } else {
+        systemPrompt = buildSystemPrompt({ thoughts: wantThoughts, intentions: wantIntentions });
+        userContent = buildUserContent({
+            npcBlocks,
+            recentMessages,
+            worldTime,
+            playerName,
+            includeIntentions: wantIntentions,
+        });
+    }
+
+    // Lifecycle plan Tier 1 item 4: attach this call to the in-flight
+    // generation capture (inert unless one began). `kind` marks whether THIS
+    // call carries the intentions contract — the unified call (when
+    // intentions are on) and the split/strict intentions calls do; the split
+    // thoughts side and a thoughts-only unified call do not. The capture's
+    // commit rule reads it: a thoughts-only generation must never overwrite
+    // stored intentions evidence.
+    const capture = noteIntentionsCaptureCall({
+        kind: wantIntentions ? 'intentions' : 'thoughts',
+        label,
+        systemPrompt,
+        userContent,
+    });
+
+    return fetchAndParse(systemPrompt, userContent, apiSettings, { trigger, capture });
+}
+
+/**
+ * Make a single batched interiority API call for all roster NPCs.
+ * v1 path — reads feature flags from settings (thoughts + intentions together).
+ *
+ * @param {string[]} roster
+ * @param {object} [opts]
+ * @param {string[]} [opts.virtuallyActiveIds]
+ * @param {string|null} [opts.trigger] - diagnostics: what caused this turn.
+ * @returns {Promise<object|null>} parsed JSON result, or null on failure
+ */
+export async function runBatchedCall(roster, { virtuallyActiveIds = [], trigger = null } = {}) {
+    return _runCall(roster, { virtuallyActiveIds, trigger });
+}
+
+// ─── Split-call mode (v2 §16) ────────────────────────────────────────────────
+
+/**
+ * Run the two split batched calls — one for intentions only, one for thoughts
+ * only — and return both results. Each call is independently error-isolated:
+ * a failure in one returns null without affecting the other.
+ *
+ * Both calls are ISSUED together (one Promise.all) but the coordinator's
+ * per-module limit serializes the wire calls one-at-a-time — both occupy the
+ * interiority module lane. §16's original "two parallel calls" design predates
+ * the coordinator; one-outbound-call-per-module is the deliberate contract
+ * now, so the split is about prompt/context separation, not transport-level
+ * parallelism.
+ *
+ * Both calls see the SAME message window and roster. The thoughts call sees
+ * the pre-mutation ledger (including dormant entries once §20 ships); the
+ * intentions call evaluates and mutates it. Because validation happens later
+ * in validateAndApply (after both calls complete), neither call mutates
+ * shared state during execution — concurrent issuance is safe.
+ *
+ * §21 cost dials apply to the thoughts side only (intentions always run):
+ *  - `thoughtsInterval` (N): skip the thoughts call on turns where
+ *    `turnCounter % N !== 0`. 1 = every turn (default).
+ *  - `thoughtsProfiledOnly`: restrict the rich-thoughts roster to NPCs that
+ *    have a growth profile; unprofiled NPCs are dropped for that turn.
+ *
+ * When thoughts are skipped, `thoughtsResult` is null — the caller runs the
+ * intentions call alone and validateAndApply applies only ledger mutations
+ * (no reactions), exactly as if the thoughts feature were disabled.
+ *
+ * @param {string[]} roster
+ * @param {object} [opts]
+ * @param {boolean} [opts.force=false] - user-initiated generation: bypass the
+ *   `thoughtsInterval` throttle. The interval throttles automatic per-turn
+ *   thoughts; it must never refuse a generation the user explicitly asked for.
+ *   `thoughtsProfiledOnly` is NOT bypassed — that dial is a scope choice about
+ *   which NPCs get rich thoughts, not a cost throttle.
+ * @returns {Promise<{intentionsResult: object|null, thoughtsResult: object|null}>}
+ */
+export async function runSplitCall(roster, { force = false, virtuallyActiveIds = [], trigger = null } = {}) {
+    const settings = getSettings();
+
+    // Respect the feature toggles. Split mode runs two specialized calls, but
+    // each call is still gated by the user's "generate thoughts" / "generate
+    // intentions" panel setting. Forcing the flags into _runCall (which it
+    // uses to pick a prompt) previously bypassed these toggles entirely,
+    // burning API calls and grace-period budget on features the user turned off.
+    const wantThoughts = settings.generateThoughts !== false;
+    const wantIntentions = settings.generateIntentions !== false;
+
+    // §21: thoughtsInterval — skip the thoughts call on off-turns (auto only).
+    const interval = Math.max(1, Number(settings.thoughtsInterval) || 1);
+    const turn = getTurnCounter();
+    const skipThoughtsThisTurn = !force && interval > 1 && (turn % interval !== 0);
+    if (skipThoughtsThisTurn) {
+        console.log(`[MWT:Interiority] Thoughts call skipped this turn (${turn} % ${interval} !== 0) — running intentions only.`);
+    } else if (force && interval > 1 && (turn % interval !== 0)) {
+        console.log(`[MWT:Interiority] Thoughts call forced on an off-turn (user-initiated) — interval ${interval} bypassed.`);
+    }
+
+    // §21: thoughtsProfiledOnly — filter the thoughts roster to profiled NPCs.
+    let thoughtsRoster = roster;
+    if (!skipThoughtsThisTurn && wantThoughts && settings.thoughtsProfiledOnly === true) {
+        // _filterToProfiledNpcs logs a detailed diagnostic when it empties the
+        // roster — the bare "nobody has a profile" message can't distinguish
+        // "no profiles saved yet" from "roster names don't match the registry".
+        thoughtsRoster = await _filterToProfiledNpcs(roster);
+    }
+    const runThoughts = wantThoughts && !skipThoughtsThisTurn && thoughtsRoster.length > 0;
+
+    const [intentionsRes, thoughtsRes] = await Promise.all([
+        wantIntentions
+            ? _runCall(roster, {
+                thoughts: false, intentions: true, label: 'intentions', virtuallyActiveIds, trigger,
+            })
+                .catch(err => {
+                    // Coordinator cancellation (chat switch / explicit cancel)
+                    // is a quiet discard like every other adoption site —
+                    // isCancellation() covers the marked JobCancelledError
+                    // and the native mid-wire AbortError.
+                    if (isCancellation(err)) {
+                        console.log('[MWT:Interiority] Intentions call cancelled (coordinator) — discarded.');
+                        return null;
+                    }
+                    console.error('[MWT:Interiority] Intentions call failed:', err);
+                    return null;
+                })
+            : Promise.resolve(null),
+        runThoughts
+            ? _runCall(thoughtsRoster, { thoughts: true, intentions: false, label: 'thoughts', useRichThoughtsContext: true, trigger })
+                .catch(err => {
+                    // See the intentions catch above — quiet cancellation.
+                    if (isCancellation(err)) {
+                        console.log('[MWT:Interiority] Thoughts call cancelled (coordinator) — discarded.');
+                        return null;
+                    }
+                    console.error('[MWT:Interiority] Thoughts call failed:', err);
+                    return null;
+                })
+            : Promise.resolve(null),
+    ]);
+    return { intentionsResult: intentionsRes, thoughtsResult: thoughtsRes };
+}
+
+/**
+ * Filter a roster down to NPCs that have a growth profile in the knowledge
+ * module's registry (`profileUid` set). Used by the §21 `thoughtsProfiledOnly`
+ * dial. The knowledge module is an optional dependency; if unavailable, the
+ * roster is returned unchanged (fail-open so a missing module never silently
+ * kills the thoughts call).
+ *
+ * @param {string[]} roster
+ * @returns {Promise<string[]>}
+ */
+async function _filterToProfiledNpcs(roster) {
+    try {
+        const { getRegistry, resolveRegistryKey } = await import('../knowledge/registry.js');
+        const reg = getRegistry();
+        if (!reg) return roster; // no registry — fail open
+        const filtered = roster.filter(name => {
+            const key = resolveRegistryKey(reg, name);
+            return key != null && reg[key]?.profileUid != null;
+        });
+
+        // Diagnostic: an empty result has two very different causes, and the
+        // fix differs. Name both the roster and the NPCs that actually carry a
+        // profileUid so the log distinguishes "no profiles saved yet" from
+        // "roster names don't match any registry entry".
+        if (filtered.length === 0 && roster.length > 0) {
+            const profiled = Object.keys(reg).filter(k => reg[k]?.profileUid != null);
+            const known = Object.keys(reg);
+            console.log(
+                '[MWT:Interiority] "Profiled NPCs only" is ON but no roster NPC has a saved growth profile — skipping thoughts call.\n' +
+                `  Roster this turn: ${roster.join(', ') || '(empty)'}\n` +
+                `  Registry entries WITH a saved profile: ${profiled.join(', ') || '(none)'}\n` +
+                `  Registry entries total: ${known.join(', ') || '(none)'}\n` +
+                '  Note: profileUid is set only when a generated growth profile is SAVED to the ' +
+                '"NPC Profiles" lorebook — generating or psychoanalyzing alone does not set it. ' +
+                'Otherwise turn "Profiled NPCs only" off.'
+            );
+        }
+        return filtered;
+    } catch {
+        return roster; // knowledge module unavailable — fail open
+    }
+}
+
+/**
+ * Merge the two split-call results into a single unified result object that
+ * the EXISTING validateAndApply can process unchanged.
+ *
+ * The intentions result carries `executed`/`dropped`/`new_intentions` per NPC;
+ * the thoughts result carries `reaction` per NPC. Neither carries the other's
+ * fields (the prompt only asked for what was requested). Merge by NPC name,
+ * combining fields from both sources.
+ *
+ * NPCs present in one result but not the other (e.g. an NPC that had no
+ * reaction, so the thoughts call omitted it) are still included — the missing
+ * side contributes nothing for that NPC.
+ *
+ * @param {object|null} intentionsResult
+ * @param {object|null} thoughtsResult
+ * @param {string[]} roster - canonical NPC name list (preserves order)
+ * @param {object|null} [aliasIndex] - roster member (lowercased) → its
+ *   user-approved aliases, from collectRosterAliases(). Lets a split call
+ *   answered with an alias spelling ("The Vixen" for roster "Mara Vance")
+ *   merge instead of being dropped here as unresolvable.
+ * @returns {{npcs: Array<object>}} unified result; empty npcs if both inputs null
+ */
+export function mergeSplitResults(intentionsResult, thoughtsResult, roster, aliasIndex = null) {
+    // Build name → entry maps from both results. Keys are RESOLVED against the
+    // roster via resolveRosterName (the same unambiguous alias rules
+    // validateAndApply uses), so a thoughts call answering "Charlotte Simpson"
+    // for roster "Charlotte" still merges — an exact case-insensitive key
+    // lookup would silently drop her thought block here before validation
+    // ever saw it. Unresolvable names are skipped; validateAndApply would
+    // discard them anyway.
+    const intentionsMap = new Map();
+    const thoughtsMap = new Map();
+
+    if (intentionsResult && Array.isArray(intentionsResult.npcs)) {
+        for (const npc of intentionsResult.npcs) {
+            const name = String(npc?.name || '').trim();
+            if (!name) continue;
+            const canon = resolveRosterName(roster, name, aliasIndex);
+            if (canon != null) intentionsMap.set(canon.toLowerCase(), npc);
+        }
+    }
+    if (thoughtsResult && Array.isArray(thoughtsResult.npcs)) {
+        for (const npc of thoughtsResult.npcs) {
+            const name = String(npc?.name || '').trim();
+            if (!name) continue;
+            const canon = resolveRosterName(roster, name, aliasIndex);
+            if (canon != null) thoughtsMap.set(canon.toLowerCase(), npc);
+        }
+    }
+
+    // Merge by roster name. validateAndApply discards non-roster NPCs anyway,
+    // so we only emit roster members here (cleaner + avoids the discard log).
+    const mergedNpcs = [];
+    const seen = new Set();
+    for (const name of roster) {
+        const lower = name.toLowerCase();
+        if (seen.has(lower)) continue;
+        seen.add(lower);
+
+        const intEntry = intentionsMap.get(lower) || {};
+        const thoughtEntry = thoughtsMap.get(lower) || {};
+
+        const merged = { name };
+        // v1 shape: reaction comes from the thoughts call only
+        if (thoughtEntry.reaction !== undefined) merged.reaction = thoughtEntry.reaction;
+        // v2 shape: thought + inner_state come from the thoughts call only
+        if (thoughtEntry.thought !== undefined) merged.thought = thoughtEntry.thought;
+        if (thoughtEntry.inner_state !== undefined) merged.inner_state = thoughtEntry.inner_state;
+        // Intentions come from the intentions call only
+        if (intEntry.executed !== undefined) merged.executed = intEntry.executed;
+        if (intEntry.dropped !== undefined) merged.dropped = intEntry.dropped;
+        if (intEntry.new_intentions !== undefined) merged.new_intentions = intEntry.new_intentions;
+
+        mergedNpcs.push(merged);
+    }
+
+    return { npcs: mergedNpcs };
+}
+
+/**
+ * Run one API call per NPC (strict mode).
+ * Returns the merged result as if it were a single batched response.
+ *
+ * @param {string[]} roster
+ * @param {string[]} [virtuallyActiveIds]
+ * @param {object} [opts]
+ * @param {string|null} [opts.trigger]
+ * @param {object|null} [opts.aliasIndex] — the turn's roster alias index from
+ *   {@link collectRosterAliases}, threaded from generateForCurrentMessage so
+ *   the turn never pays a duplicate dynamic import + registry scan; collected
+ *   here only when a direct caller (tests, manual entry points) omits it
+ * @returns {Promise<object|null>}
+ */
+export async function runStrictCalls(roster, virtuallyActiveIds = [], { trigger = null, aliasIndex = null } = {}) {
+    if (!hasValidSettings()) {
+        console.warn('[MWT:Interiority] No API connection configured.');
+        return null;
+    }
+
+    const settings = getSettings();
+    const wantThoughts = settings.generateThoughts !== false;
+    const wantIntentions = settings.generateIntentions !== false;
+    if (!wantThoughts && !wantIntentions) {
+        console.warn('[MWT:Interiority] Both thoughts and intentions are disabled — skipping API call.');
+        return null;
+    }
+
+    // TODO §1: the per-NPC evaluation check below resolves each answer
+    // against its singleton roster slice; the explicit-alias index keeps a
+    // title/nickname answer ("The Vixen") counting as an evaluation too.
+    const rosterAliases = aliasIndex ?? (await collectRosterAliases(roster));
+
+    const windowSize = Math.max(1, settings.messageWindow || 8);
+    const recentMessages = getStrippedRecentMessages(windowSize);
+    if (!recentMessages) {
+        console.warn('[MWT:Interiority] No recent messages to process.');
+        return null;
+    }
+
+    const worldTime = getWorldTime();
+    const playerName = [...getUserNames({ lower: false })][0] || '';
+    const allNpcs = [];
+    const intentionsEvaluatedRoster = [];
+    const systemPrompt = buildSystemPrompt({ thoughts: wantThoughts, intentions: wantIntentions });
+
+    for (const name of roster) {
+        const npcBlocks = await assembleNpcBlocks([name], virtuallyActiveIds);
+        const userContent = buildUserContent({
+            npcBlocks,
+            recentMessages,
+            worldTime,
+            playerName,
+            includeIntentions: wantIntentions,
+        });
+
+        // Tier 1 generation capture: one call record per strict NPC. The
+        // label carries the member so a generation's constituent calls stay
+        // attributable even after the results are merged into one array.
+        const capture = noteIntentionsCaptureCall({
+            kind: wantIntentions ? 'intentions' : 'thoughts',
+            label: `strict:${name}`,
+            npc: name,
+            systemPrompt,
+            userContent,
+        });
+
+        const result = await fetchAndParse(systemPrompt, userContent, settings, { trigger, capture });
+        if (result && Array.isArray(result.npcs)) {
+            allNpcs.push(...result.npcs);
+            // Alias-aware: the per-NPC call may be answered with a fuller
+            // spelling ("Charlotte Simpson" for roster "Charlotte") — that
+            // still counts as this NPC having been evaluated. Resolved
+            // against the FULL roster, not a [name] singleton: with two
+            // roster members claiming the same imported alias, each singleton
+            // slice counted that alias as ITS successful evaluation, so both
+            // dormant entries were confirmed and awakened even though
+            // full-roster validation (validateAndApply) rejects the ambiguous
+            // blocks. The resolution must land on this loop's member to
+            // count — the same ambiguity rule every other consumer uses.
+            if (wantIntentions && result.npcs.some(npc => resolveRosterName(roster, String(npc?.name || '').trim(), rosterAliases) === name)) {
+                intentionsEvaluatedRoster.push(name);
+            }
+        }
+    }
+
+    return { npcs: allNpcs, intentionsEvaluatedRoster };
+}
+
+// ─── Dormant poll (v2 §20) ────────────────────────────────────────────────────
+
+/**
+ * Run the dormant-intentions lazy poll.
+ *
+ * Fires every {@link DORMANT_POLL_INTERVAL} turns when there are dormant
+ * entries. Asks the model a cheap, focused question: is each dormant
+ * intention's trigger near? If so, wake it (flip to active + stamp age).
+ *
+ * Wake semantics (§20): wake EARLY — when the event is "tomorrow," not when
+ * it starts — so the NPC gets a turn or two of anticipatory behavior and the
+ * narrator receives the demand while it's relevant.
+ *
+ * Failure isolation: the poll never blocks the main generation. A parse
+ * failure or API error is logged and swallowed.
+ *
+ * @returns {Promise<string[]>} IDs proposed for waking; proposals are committed
+ *   by the orchestrator only after the main generation validates successfully.
+ */
+export async function runDormantPoll({ trigger = null } = {}) {
+    const dormant = getDormantLedger();
+    if (dormant.length === 0) return [];
+
+    if (!hasValidSettings()) {
+        console.warn('[MWT:Interiority] Dormant poll skipped — no API connection configured.');
+        return [];
+    }
+
+    const settings = getSettings();
+    const windowSize = Math.max(1, settings.messageWindow || 8);
+    const recentMessages = getStrippedRecentMessages(windowSize);
+    if (!recentMessages) return [];
+
+    const worldTime = getWorldTime();
+    const systemPrompt = buildDormantPollSystemPrompt();
+    const userContent = buildDormantPollUserContent({
+        dormantEntries: dormant,
+        recentMessages,
+        worldTime,
+    });
+
+    // The poll is a second call inside the SAME turn, so it carries the turn's
+    // trigger with a suffix rather than a cause of its own — otherwise a turn
+    // that polls looks like two unrelated spends in the telemetry.
+    // Tier 1 generation capture: the poll joins the turn's generation under
+    // its own kind — it never satisfies the intentions-evidence commit rule.
+    const capture = noteIntentionsCaptureCall({
+        kind: 'dormant_poll',
+        label: 'dormant_poll',
+        systemPrompt,
+        userContent,
+    });
+    const result = await fetchAndParse(systemPrompt, userContent, settings, {
+        trigger: trigger ? `${trigger}:dormant_poll` : null,
+        capture,
+        responseArray: 'intentions',
+    });
+    if (!result || !Array.isArray(result.intentions)) {
+        console.warn('[MWT:Interiority] Dormant poll returned no valid result.');
+        return [];
+    }
+
+    const validIds = new Set(dormant.map(e => e.id));
+    const proposedIds = [];
+
+    for (const item of result.intentions) {
+        if (!item || typeof item.wake !== 'boolean') continue;
+        const id = String(item.id || '').trim();
+        if (!id || !validIds.has(id)) continue; // unknown id — ignore
+        if (item.wake) {
+            proposedIds.push(id);
+            console.log(`[MWT:Interiority] Dormant intention ${id} proposed for wake by poll.`);
+        }
+    }
+
+    if (proposedIds.length > 0) {
+        console.log(`[MWT:Interiority] Dormant poll proposed ${proposedIds.length} intention wake(s).`);
+    }
+    return proposedIds;
+}
+
+// ─── Core fetch + parse with retry-once ──────────────────────────────────────
+
+/**
+ * Fetch from the API, normalise, parse JSON, and return the result.
+ * Retries once on parse or response-contract failure (the "runScan" pattern).
+ *
+ * @param {string} systemPrompt
+ * @param {string} userContent
+ * @param {object} settings
+ * @param {object} [opts]
+ * @param {string|null} [opts.trigger]
+ * @param {string} [opts.responseArray='npcs'] - required response-envelope array
+ * @param {object|null} [opts.capture] - Tier 1 generation-capture recorder
+ *   from noteIntentionsCaptureCall(); records each wire attempt's raw and
+ *   normalised text plus the final parse outcome. Inert when null.
+ * @returns {Promise<object|null>}
+ */
+async function fetchAndParse(systemPrompt, userContent, settings, { trigger = null, capture = null, responseArray = 'npcs' } = {}) {
+    const resolved = resolveApiCall({ moduleSettings: settings });
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        let raw = '';
+        let cleaned = '';
+        try {
+            raw = await resolved.fetchFn({
+                systemPrompt,
+                userContent,
+                settings: resolved.settings,
+                retries: 1,
+                // Rides down to captureApiCall so the api_call telemetry names
+                // what caused the spend, not just that a spend happened.
+                trigger,
+            });
+            cleaned = normaliseOutput(raw);
+            const result = parseJsonLenient(cleaned);
+            // A JSON parse alone does not prove this call returned its contract.
+            // In split mode an unrelated object used to count as a successful
+            // intentions response, then merge away silently while thoughts
+            // continued working. Retry malformed envelopes through the same
+            // bounded path as parse failures; an empty contract array is valid.
+            if (!result || !Array.isArray(result[responseArray])) {
+                throw new Error(`Interiority response must contain a "${responseArray}" array.`);
+            }
+            // Record the wire attempt exactly once, AFTER the parse outcome is
+            // known: the PRODUCTION parser throws on unparseable output (the
+            // Vitest stub returns null), and recording ok:true before the
+            // parse made the catch below re-record the SAME wire response as
+            // failed — one attempt, two entries, the per-call attempt cap
+            // eaten twice as fast. Record success only after the envelope check.
+            capture?.attempt({ ok: true, rawResponse: raw, normalisedResponse: cleaned });
+            capture?.finish({ parsed: result != null });
+            return result;
+        } catch (err) {
+            // Coordinator cancellation (TODO §1): the call was aborted on
+            // purpose (chat switch / explicit cancel) — rethrow immediately;
+            // a retry would queue a fresh request the coordinator just
+            // retired. Recognized by the caller's quiet-discard path.
+            // isCancellation() covers both the marked JobCancelledError and
+            // the NATIVE AbortError fetch() rejects with — the marker-only
+            // check used to mistake the latter for a parse failure and spend
+            // a second (fresh-epoch, uncancellable) attempt on the old
+            // chat's prompt.
+            if (isCancellation(err)) {
+                capture?.finish({ cancelled: true });
+                throw err;
+            }
+            capture?.attempt({
+                ok: false,
+                rawResponse: raw,
+                normalisedResponse: cleaned,
+                error: String(err?.message || err),
+            });
+            console.warn(`[MWT:Interiority] API/parse attempt ${attempt} failed: ${err.message}`);
+            if (cleaned) {
+                console.warn(`[MWT:Interiority] Normalised output that failed to parse (first 800 chars):\n${cleaned.slice(0, 800)}`);
+            }
+            if (attempt >= 2) {
+                console.error('[MWT:Interiority] Giving up after 2 attempts.');
+                capture?.finish({ parsed: false });
+                return null;
+            }
+        }
+    }
+    return null;
+}
+
+// ─── Validation (§8) ─────────────────────────────────────────────────────────
+
+/**
+ * Resolve a model-returned NPC name against the roster.
+ *
+ * Mirrors resolveRegistryKey's matching rules against the roster list — the
+ * roster is canonicalized through the knowledge registry at build time, but a
+ * name can still legitimately miss it: the roster may carry a registry-less
+ * name from the world-state `Present:` line, and the model may answer with a
+ * fuller spelling of it. Matching runs strictest-first:
+ *   1. exact / case-insensitive membership → the roster's own spelling;
+ *   2. explicit user-approved alias (TODO §1 identity service) — when an
+ *      `aliasIndex` is supplied, a spelling that exactly matches an alias the
+ *      user approved for exactly ONE roster member resolves to it. This is
+ *      the step titles and nicknames need: "The Vixen" for roster "Mara
+ *      Vance" shares no token with it, so the given-name heuristic below
+ *      could never prove the match. Two claimants is genuinely ambiguous and
+ *      resolves to null — mirroring resolveRegistryKey's alias step;
+ *   3. {@link isUnambiguousNpcAlias} alias match, both directions — ONLY when
+ *      unambiguous in the surrounding same-given-name roster population.
+ *
+ * Step 3 is what used to be the only alias handling: a response naming
+ * "Charlotte Simpson" for roster "Charlotte" was discarded whole — thoughts
+ * AND intentions — even though it unambiguously identified that NPC.
+ * Ambiguity still resolves to null (two roster members sharing a given name
+ * or an alias), and so does a name that is merely a same-given-name stranger
+ * ("Mara Chen" against roster "Mara Vance"): no entry is always safer than
+ * the wrong entry.
+ *
+ * @param {string[]} roster — canonical roster names
+ * @param {string} name — the name to resolve (model output)
+ * @param {object|null} [aliasIndex] — roster member (lowercased) → its
+ *   user-approved aliases, from {@link collectRosterAliases}. Optional so
+ *   sync/pure callers keep the heuristic-only behaviour.
+ * @returns {string|null} the roster's spelling of the matched member, or null
+ */
+export function resolveRosterName(roster, name, aliasIndex = null) {
+    const wanted = String(name ?? '').trim();
+    if (!wanted || !Array.isArray(roster) || roster.length === 0) return null;
+    const wantedLower = wanted.toLowerCase().trim();
+    // 1. Exact / case-insensitive membership — the roster's spelling wins so
+    // every downstream store keys on the canonical form.
+    for (const r of roster) {
+        if (String(r).toLowerCase().trim() === wantedLower) return r;
+    }
+    // 2. Explicit user-approved alias (TODO §1): exact normalized match
+    //    against the aliases the user approved for each roster member. The
+    //    index is keyed by the member's lowercased roster spelling.
+    if (aliasIndex && typeof aliasIndex === 'object') {
+        const claimants = roster.filter(r => {
+            const aliases = aliasIndex[String(r).toLowerCase().trim()];
+            return Array.isArray(aliases)
+                && aliases.some(a => String(a ?? '').toLowerCase().trim() === wantedLower);
+        });
+        if (claimants.length === 1) return claimants[0];
+        if (claimants.length > 1) {
+            console.warn(
+                `[MWT:Interiority] NPC name "${wanted}" is an ambiguous roster alias — claimed by: ` +
+                `${claimants.join(', ')}. Using no roster entry rather than risk attributing one ` +
+                `character's interiority to another. Remove the duplicate alias to disambiguate.`
+            );
+            return null;
+        }
+    }
+    // 3. Heuristic alias match, both directions ("Charlotte" ↔ "Charlotte
+    //    Simpson"), using the SAME shared rule the knowledge registry uses.
+    //    Not a bare first-token comparison: that resolved "Mara Chen" to
+    //    roster "Mara Vance" whenever Vance was the only "Mara" present,
+    //    attributing one character's thoughts and intentions to another.
+    const candidates = roster.filter(r => isUnambiguousNpcAlias(r, wanted, roster));
+    if (candidates.length === 1) return candidates[0];
+    return null;
+}
+
+/**
+ * Build the explicit-alias index for {@link resolveRosterName}: each roster
+ * member's user-approved registry aliases, keyed by the member's lowercased
+ * roster spelling (TODO §1 identity service).
+ *
+ * The roster is canonicalized through the knowledge registry at build time,
+ * so each member resolves back to its registry record; members with no
+ * registry entry (a registry-less `Present:` name) simply contribute nothing.
+ * The knowledge module is an optional dependency — on failure the index is
+ * empty and matching falls back to the given-name heuristic, exactly as
+ * before the alias list existed.
+ *
+ * @param {string[]} roster — canonical roster names
+ * @returns {Promise<object>} `{ [rosterNameLower]: string[] }`
+ */
+export async function collectRosterAliases(roster) {
+    if (!Array.isArray(roster) || roster.length === 0) return {};
+    try {
+        const { getRegistry, resolveRegistryKey } = await import('../knowledge/registry.js');
+        const reg = getRegistry();
+        if (!reg || Object.keys(reg).length === 0) {
+            // Same ambiguity as collectRegistryAliasGroups: an unhydrated
+            // store reads exactly like "no records", and the first turn after
+            // a chat switch can hit that race. Surface it so alias-blind name
+            // resolution is reportable instead of invisible.
+            console.warn(
+                '[MWT:Interiority] collectRosterAliases: the knowledge registry read empty — ' +
+                'either this chat has no NPC records or the store has not hydrated yet. ' +
+                'Falling back to heuristic name matching for this pass.'
+            );
+            return {};
+        }
+        const index = {};
+        for (const member of roster) {
+            const key = resolveRegistryKey(reg, member);
+            const aliases = key != null ? reg[key]?.aliases : null;
+            if (Array.isArray(aliases) && aliases.length > 0) {
+                index[String(member).toLowerCase().trim()]
+                    = aliases.filter(a => typeof a === 'string' && a.trim());
+            }
+        }
+        return index;
+    } catch (err) {
+        console.warn(
+            '[MWT:Interiority] collectRosterAliases failed — falling back to heuristic name matching.',
+            err
+        );
+        return {};
+    }
+}
+
+/**
+ * Validate and apply the interiority result to the ledger and per-message store.
+ *
+ * All validation is code-side, not prompt-side:
+ *   - name must be in roster
+ *   - executed/dropped ids must exist in ledger
+ *   - new_intentions require both action + trigger
+ *   - length caps on thoughts
+ *   - dedup new intentions against open ones and the pre-mutation snapshot
+ *     (lifecycle plan Tier 2 — same-response replay guard)
+ *   - max 1 reaction per NPC per turn
+ *
+ * @param {object} result - parsed JSON from the API
+ * @param {string[]} roster - the NPC roster for this turn
+ * @param {number} msgIdx - chat-array index of the message (for ledger
+ *   entries' declaredMsgIdx metadata)
+ * @param {object} [scopeToken] - optional scope token captured before the API
+ *   call. When provided, the validator asserts scope immediately after its
+ *   `resolveUserNames()` await and before any persistent mutation (INTERIORITY-02).
+ *   The caller still asserts after the return; this covers the gap inside.
+ * @param {Array<object>} [preTurnLedgerSnapshot] - rollback snapshot captured
+ *   by the caller BEFORE this turn's dormant poll ran. The poll's wakes are
+ *   part of this turn's ledger mutations, so a swipe must roll them back too;
+ *   a snapshot taken here (after the poll) would bake the woken state into
+ *   the rollback record and the wake would survive the swipe. Callers that
+ *   run no poll may omit it — the validator captures its own.
+ * @param {string[]} [confirmedWakeIds] - dormant entry ids the intentions
+ *   call actually evaluated (committed as wakes once the result validates).
+ * @param {object|null} [aliasIndex] - roster member (lowercased) → its
+ *   user-approved registry aliases, from collectRosterAliases() (TODO §1).
+ *   Threads the explicit-alias step of resolveRosterName so a block answered
+ *   with an alias spelling ("The Vixen" for roster "Mara Vance") applies
+ *   instead of being discarded as "not in roster".
+ * @param {string[]|null} [evaluatedNpcNames] - roster NPCs whose intentions
+ *   this pass actually evaluated (deferred lifecycle work, spec §3). The
+ *   orchestrator threads its per-mode computation here (strict uses
+ *   result.intentionsEvaluatedRoster; batched/split use the resolved response
+ *   names). Null falls back to the result's own evidence — the reported
+ *   intentionsEvaluatedRoster when present, else the resolved block names —
+ *   matching getEvaluatedNpcNames' default. These names, and only these, get
+ *   their evidence boundary stamped.
+ * @returns {Promise<object|null>} { reactions: [], ledgerChanged: boolean }, or
+ *   null when the scope changed during the await (caller should discard).
+ */
+export async function validateAndApply(result, roster, msgIdx, scopeToken, preTurnLedgerSnapshot, confirmedWakeIds = [], aliasIndex = null, evaluatedNpcNames = null) {
+    const data = getInteriorityData();
+    const settings = getSettings();
+    const wantThoughts = settings.generateThoughts !== false;
+    const wantIntentions = settings.generateIntentions !== false;
+
+    // Resolve the stable perMessage key for this message. We use the
+    // create-or-get variant because this is a STORE path: stamping a UUID
+    // here ensures all future reads (which use the read-only getMsgKeyForIndex)
+    // resolve to the same key. perMessage is keyed by UUID (not chat index)
+    // so thoughts survive chat-array shifts caused by summarisation tools
+    // like Inline Summary.
+    const msgKey = getOrCreateMsgKeyForIndex(msgIdx);
+
+    // Take a snapshot of the ledger BEFORE mutations (for rollback). When the
+    // caller ran the dormant poll this turn it passes the snapshot it captured
+    // before the poll, so a wake justified by a message that is then swiped
+    // away rolls back to dormant with everything else.
+    const ledgerSnapshot = Array.isArray(preTurnLedgerSnapshot)
+        ? preTurnLedgerSnapshot
+        : JSON.parse(JSON.stringify(data.ledger));
+
+    // Snapshot the inner-state store BEFORE this turn's thoughts call
+    // rewrites it (§18 rollback). Without this, a swipe would roll back
+    // Mara's intentions but leave her mood from the abandoned timeline.
+    const innerStatesSnapshot = getInnerStatesSnapshot();
+
+    // Deferred lifecycle work (spec §2/§3): rollback snapshots for the
+    // lifecycle history and evidence boundaries, captured before EVERY ledger
+    // mutation of this turn (wakes, ages, expiries, closures) — the same
+    // "before all mutations" rule the ledger snapshot follows. A swipe that
+    // discards this generation truncates the engine records written here and
+    // restores the pre-turn boundaries; user records survive (ownership rule).
+    const lifecycleHistorySnapshot = getLifecycleHistorySnapshot();
+    const evidenceBoundariesSnapshot = getEvidenceBoundariesSnapshot();
+    const npcControlWatermarksSnapshot = getNpcControlWatermarksSnapshot();
+
+    // Defense-in-depth: also reject the user even if they somehow made it into
+    // the roster (e.g. a stale ledger entry from before this fix, which is
+    // seeded back into the roster every turn by getActiveLedger).
+    const userNamesLower = await resolveUserNames();
+
+    // INTERIORITY-02: The resolveUserNames() await above can cross a chat
+    // switch (it resolves the knowledge registry via dynamic import). Assert
+    // scope immediately after it and BEFORE any persistent mutation. If the
+    // chat changed, return null so the caller discards the result without
+    // committing thoughts/intentions/ledger/inner-state to the wrong chat.
+    if (scopeToken && !assertSameScope(scopeToken).ok) {
+        console.log('[MWT:Interiority] validateAndApply aborted — chat changed during resolveUserNames().');
+        return null;
+    }
+
+    const gracePeriod = Math.max(0, settings.intentionGracePeriod || 0);
+
+    // ── Grace-period design note (lifecycle plan Tier 3) ───────────────
+    // The grace period trades "premature erasure" for "stale demands".
+    // For `dropped` marks that trade is kept whole (see the drop handler).
+    //
+    // For `executed` marks, blanket rejection produced the reported failure
+    // class: the narrator performs a demanded action on-screen, the
+    // executed-mark bounces off the grace gate, the entry stays open, and
+    // the injection keeps demanding an already-completed action every turn
+    // after. Tier 3 splits completion from abandonment: an executed mark may
+    // close an in-grace entry ONLY when the entry is engine-created AND was
+    // declared before the story message being evaluated
+    // (`entry.declaredMsgIdx !== null && entry.declaredMsgIdx < msgIdx`).
+    // The declaration index is a story-time fact; `turnsOpen` is a call
+    // counter that regeneration and swipes pump without proving a new story
+    // message elapsed, so it must never carry this decision — and using it
+    // (`turnsOpen >= 1`) would admit guessed ids for entries created in the
+    // current validation pass.
+    //
+    // Edge policies (resolved here, pinned in test/interiority_swipe_turns):
+    //  - Manual (panel-authored) entries carry `declaredMsgIdx: null`, so
+    //    they are NOT engine-executable through this exception; they remain
+    //    closable once genuinely out of grace by age, as before. A user EDIT
+    //    of an engine entry keeps its original declaredMsgIdx: correcting
+    //    the wording does not erase when the plan was declared, so edited
+    //    engine entries remain closable through the exception.
+    //  - Woken scheduled entries retain their original declaration index,
+    //    which predates the evaluated wake turn — so the wake turn DOES
+    //    permit immediate execution through the gate. Deliberate: the wake
+    //    itself certified the occasion arrived. For executed marks this
+    //    policy no longer depends on wakeLedgerEntry's turnsOpen floor
+    //    (which still governs drops of woken entries).
+    //  - Known limitation: the gate proves elapsed story time, not that the
+    //    action truly completed; a model can still mislabel preparation or
+    //    an attempt as execution. That is semantic quality — deliberately
+    //    out of scope for Tier 3.
+    // ────────────────────────────────────────────────────────────────────
+
+    const reactions = [];
+    const worldTime = getWorldTime();
+    let ledgerChanged = false;
+
+    if (!result || !Array.isArray(result.npcs)) {
+        console.warn(`[MWT:Interiority] Result has no "npcs" array — parsed keys: [${result ? Object.keys(result).join(', ') : 'null'}]. Nothing applied.`);
+        // Store empty reactions but still snapshot
+        if (msgKey) {
+            setPerMessage(msgKey, {
+                reactions: [],
+                ledgerSnapshot,
+                innerStatesSnapshot,
+                lifecycleHistorySnapshot,
+                evidenceBoundariesSnapshot,
+                npcControlWatermarksSnapshot,
+                // Pre-turn value: the caller increments only after this returns.
+                turnCounterAtSnapshot: getTurnCounter(),
+                generatedAt: Date.now(),
+            });
+        }
+        return { reactions: [], ledgerChanged: false };
+    }
+
+    // Commit only proposals whose owning NPC was actually presented to a
+    // successful intentions call. A syntactically-valid thoughts-only result,
+    // an empty strict result for a failed NPC, or a disabled intentions feature
+    // must never promote an unreviewed dormant demand into the injection.
+    // Lifecycle v2 (spec §2): each committed wake is an audited event.
+    for (const id of new Set(confirmedWakeIds)) {
+        const woken = wakeLedgerEntry(id, gracePeriod);
+        if (woken) {
+            recordLifecycleEvent({
+                npc: woken.npc,
+                action: woken.action,
+                trigger: woken.trigger,
+                entryId: woken.id,
+                outcome: 'woken',
+                source: 'engine',
+                reason: 'Wake proposed by the dormant poll and confirmed by a successful intentions evaluation.',
+            });
+        }
+    }
+
+    // Increment the age of every open intention — AFTER the shape check so a
+    // garbage parse doesn't burn a turn of grace period off every open
+    // intention (item 8a fix). This is the first step of the grace-period
+    // mechanism: intentions that haven't survived enough turns since being
+    // declared are protected from premature execution/dropping.
+    incrementLedgerAges();
+
+    // Deferred lifecycle work (spec §4): turn-aging expiry, AFTER the age
+    // increment so this turn's age is included. Engine entries close at the
+    // intentionMaxTurnsOpen cap; manual entries only at their own explicit
+    // per-entry limit; every close is an audited 'expired' record.
+    const expiredEntries = expireOverdueEngineEntries(msgIdx);
+    if (expiredEntries.length > 0) ledgerChanged = true;
+
+    // Build a map of ledger entry ids for quick lookup.
+    // §20: dormant entries are excluded from executed/dropped evaluation —
+    // they never appear in the prompt's <open_intentions>, so any reference
+    // to a dormant id is a hallucination that should be ignored.
+    // Reads hand out detached working copies, so re-read AFTER the wake and
+    // age mutators above committed — the pre-turn copy taken at the top of
+    // this function still shows woken entries as 'dormant' and their ages
+    // pre-increment.
+    const postWakeLedger = getInteriorityData().ledger;
+    const ledgerIds = new Set(
+        postWakeLedger.filter(e => e.status !== 'dormant').map(e => e.id)
+    );
+    // Dormant siblings of ledgerIds: ids that exist but never appear in the
+    // prompt's <open_intentions>. Distinguishing them from plain unknown ids
+    // matters diagnostically — a dormant reference is a §20 hallucination, an
+    // unknown one the model invented outright. Both are ignored below, but the
+    // capture records WHICH (ignored:dormant-id / ignored:unknown-id), so the
+    // evidence can tell an absent proposal from a silently ignored id.
+    const dormantLedgerIds = new Set(
+        postWakeLedger.filter(e => e.status === 'dormant').map(e => e.id)
+    );
+
+    // Build a lookup from id → turnsOpen for grace-period enforcement.
+    // The model frequently declares and executes/drops an intention in the
+    // same turn — or one turn later — before the trigger has had a chance
+    // to arrive. The grace period forces intentions to survive at least
+    // N turns before they can be removed.
+    const ledgerAgeMap = new Map(
+        postWakeLedger.filter(e => e.status !== 'dormant')
+            .map(e => [e.id, e.turnsOpen || 0])
+    );
+
+    // id → entry object, for the Tier 3 completion gate: grace enforcement
+    // of executed marks needs the entry's DECLARATION index (a story-time
+    // fact), not just its call-count age. Map copies are fine even after
+    // later blocks remove entries — declaredMsgIdx never mutates.
+    const ledgerEntryById = new Map(postWakeLedger.map(e => [e.id, e]));
+
+    // Owner-scoped candidates (lifecycle plan Tier 1 item 2): the shared id
+    // set above accepted executed/dropped ids from ANY NPC block, so in a
+    // multi-NPC response one NPC's block could close another NPC's entry —
+    // Derek "completing" Mara's plan silently removed her demand from the
+    // injection while her own block said nothing about it. Each entry's
+    // owner is resolved through the SAME roster rules as response names
+    // (exact → user-approved alias → unambiguous given-name), and only that
+    // owner's block may close it. Entries whose owner is not on this turn's
+    // roster are closable by no block this turn — an owner must be evaluated
+    // for its own plan to complete or lapse. `ledgerIds`/`ledgerAgeMap`
+    // above stay global: they answer "does this id exist non-dormant at all"
+    // and "how old is it", which is what distinguishes a wrong-owner id from
+    // an unknown or hallucinated one below.
+    const ownedLedgerIds = new Map();
+    for (const e of postWakeLedger) {
+        if (e.status === 'dormant') continue;
+        const owner = resolveRosterName(roster, String(e.npc || ''), aliasIndex);
+        if (!owner) continue;
+        const key = owner.toLowerCase();
+        let ids = ownedLedgerIds.get(key);
+        if (!ids) {
+            ids = new Set();
+            ownedLedgerIds.set(key, ids);
+        }
+        ids.add(e.id);
+    }
+
+    const seenNpcs = new Set();
+    for (const npcResult of result.npcs) {
+        const rawName = String(npcResult.name || '').trim();
+        // Resolve the model's spelling against the roster with the SAME
+        // unambiguous alias rules the knowledge registry uses (exact →
+        // case-insensitive → user-approved alias → unambiguous given-name).
+        // The old exact case-insensitive membership test discarded "Charlotte
+        // Simpson" for roster "Charlotte" whole — thoughts, inner state, and
+        // intentions. `name` is the ROSTER's spelling from here on, so
+        // every downstream store keys on the canonical form.
+        const name = resolveRosterName(roster, rawName, aliasIndex);
+        if (!rawName || !name) {
+            // Unknown name — discard
+            console.warn(`[MWT:Interiority] Discarding NPC block "${rawName}" — not in roster [${roster.join(', ')}].`);
+            noteIntentionsCaptureDecision({ npc: rawName, kind: 'block', outcome: 'ignored', reason: 'not-in-roster' });
+            continue;
+        }
+        if (isUserName(name, userNamesLower, roster)) {
+            // The player character must never get thoughts or ledger entries.
+            // Reaching here means the roster filter let them through, which is
+            // worth saying out loud — an intention for the PC makes the
+            // injection demand the narrator act for the player.
+            console.warn(
+                `[MWT:Interiority] Discarding block for "${name}" — that is the player character. ` +
+                `They should not have been on the roster; please report this.`
+            );
+            noteIntentionsCaptureDecision({ npc: name, kind: 'block', outcome: 'ignored', reason: 'player-character' });
+            continue;
+        }
+        if (seenNpcs.has(name.toLowerCase())) {
+            // Model emitted the same NPC twice — first block wins
+            noteIntentionsCaptureDecision({ npc: name, kind: 'block', outcome: 'ignored', reason: 'duplicate-block' });
+            continue;
+        }
+        seenNpcs.add(name.toLowerCase());
+
+        // ── Thought / Reaction (display-only, max 1 per NPC per turn) ──
+        // Skipped entirely when the thoughts feature is disabled.
+        // Handles BOTH shapes:
+        //   v1: reaction: { re, thought }
+        //   v2: thought: { type, re?, text } + inner_state
+        if (wantThoughts) {
+            // ── Inner state (§18) — persist BEFORE building the reaction ──
+            // The inner_state field is a sibling of `thought` in the v2
+            // contract, so it must be persisted even when the thought itself
+            // is dropped (boilerplate/null). setInnerStateGuarded applies the
+            // drift backstop: if the returned line is near-identical to the
+            // prior, the prior is kept verbatim. The return value is the line
+            // now stored (prior or new), which the reaction entry should
+            // display so the UI matches the persistent state.
+            let storedInnerState = undefined;
+            const isV2Shape = npcResult.thought !== undefined || npcResult.inner_state !== undefined;
+            if (isV2Shape) {
+                const rawInnerState = String(npcResult.inner_state || '').trim();
+                if (rawInnerState) {
+                    storedInnerState = setInnerStateGuarded(name, rawInnerState);
+                }
+            }
+
+            let reactionEntry = null;
+
+            if (npcResult.thought && typeof npcResult.thought === 'object') {
+                // v2 thoughts-call shape — type taxonomy + optional re
+                const t = npcResult.thought;
+                const validTypes = ['reaction', 'rumination', 'memory', 'anticipation'];
+                const type = validTypes.includes(t.type) ? t.type : 'reaction';
+                const text = String(t.text || '').trim();
+                const re = String(t.re || '').trim();
+                // reaction requires re; rumination/memory/anticipation don't.
+                // Drop empty/boilerplate (Omission Over Filler).
+                if (text && !isBoilerplate(text) && (type !== 'reaction' || re)) {
+                    reactionEntry = {
+                        npc: name,
+                        type,
+                        re: re || undefined,
+                        thought: text.slice(0, MAX_THOUGHT_LENGTH),
+                        innerState: storedInnerState || undefined,
+                    };
+                }
+            } else if (npcResult.reaction && typeof npcResult.reaction === 'object') {
+                // v1 unified-call shape — implicitly type "reaction"
+                const re = String(npcResult.reaction.re || '').trim();
+                const thought = String(npcResult.reaction.thought || '').trim();
+                if (re && thought && !isBoilerplate(thought)) {
+                    reactionEntry = {
+                        npc: name,
+                        re: re.slice(0, 300),
+                        thought: thought.slice(0, MAX_THOUGHT_LENGTH),
+                    };
+                }
+            }
+
+            if (reactionEntry) reactions.push(reactionEntry);
+        }
+
+        // The executed/dropped/new_intentions blocks mutate the ledger, so
+        // they are skipped entirely when the intentions feature is disabled.
+        if (!wantIntentions) continue;
+
+        // Tier 1 item 2: this block may only close entries owned by this NPC.
+        const ownedIds = ownedLedgerIds.get(name.toLowerCase()) || new Set();
+
+        // ── Executed intentions ──
+        // Grace period: intentions that haven't survived enough turns are
+        // protected from premature removal. The model often sees an NPC
+        // talking about or preparing for an action and marks it executed
+        // before the action is actually completed on-screen.
+        if (Array.isArray(npcResult.executed)) {
+            const validIds = npcResult.executed.filter(id => {
+                if (!ownedIds.has(id)) {
+                    // Known to the ledger but owned by another NPC — the
+                    // cross-NPC closure the owner check exists to stop. Unknown
+                    // and dormant ids are ignored too (the §20 hallucination
+                    // guard) — but never silently: every ignored id is recorded
+                    // with a reason so the capture can distinguish an absent
+                    // proposal from a hallucinated one.
+                    if (ledgerIds.has(id)) {
+                        console.log(`[MWT:Interiority] ${name}: ignoring executed id ${id} — the entry belongs to another NPC.`);
+                        noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'ignored', reason: 'wrong-owner' });
+                    } else if (id && dormantLedgerIds.has(id)) {
+                        console.log(`[MWT:Interiority] ${name}: ignoring executed id ${id} — the entry is dormant (never shown in <open_intentions>).`);
+                        noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'ignored', reason: 'dormant-id' });
+                    } else if (id) {
+                        noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'ignored', reason: 'unknown-id' });
+                    }
+                    return false;
+                }
+                const age = ledgerAgeMap.get(id) || 0;
+                const entry = ledgerEntryById.get(id);
+                // Same-message protection, independent of age. Every
+                // successful validation increments turnsOpen — including
+                // repeated manual generation of the SAME message — so age
+                // can reach the grace threshold with no story message
+                // elapsing. Once age >= gracePeriod the in-grace gate below
+                // no longer runs, so without this standing guard an age pump
+                // (regeneration) would let the declaring message's own
+                // response close the entry it declared. An engine entry whose
+                // declaredMsgIdx equals the evaluated msgIdx is therefore
+                // never closable in that evaluation, at any age and at any
+                // grace setting (grace 0 included). Manual/legacy entries
+                // (declaredMsgIdx null/undefined) never compare equal and are
+                // unaffected here.
+                if (entry != null && entry.declaredMsgIdx === msgIdx) {
+                    console.log(`[MWT:Interiority] ${name}: intention ${id} executed but declared by message ${msgIdx} itself (no story message elapsed; age ${age}) — kept open.`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'rejected', reason: 'same-message' });
+                    return false;
+                }
+                if (age < gracePeriod) {
+                    // Lifecycle plan Tier 3 — completion is separable from
+                    // abandonment: an executed mark may close an in-grace
+                    // entry ONLY when it is engine-created and was declared
+                    // before the story message being evaluated, i.e. real
+                    // story time elapsed with the plan live. Age is NOT the
+                    // test (see the design note above). A missing/undefined
+                    // declaredMsgIdx (manual or legacy entries) fails the
+                    // comparison and stays grace-protected.
+                    const declaredBeforeEvaluatedMsg =
+                        entry != null
+                        && entry.declaredMsgIdx !== null
+                        && entry.declaredMsgIdx < msgIdx;
+                    if (!declaredBeforeEvaluatedMsg) {
+                        console.log(`[MWT:Interiority] ${name}: intention ${id} executed but still in grace period (age ${age} < ${gracePeriod}) and not declared before message ${msgIdx} — kept open.`);
+                        noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'rejected', reason: 'grace-period' });
+                        return false;
+                    }
+                    console.log(`[MWT:Interiority] ${name}: intention ${id} executed inside grace period (age ${age} < ${gracePeriod}) but declared before message ${msgIdx} — completion accepted (lifecycle Tier 3).`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'accepted', reason: 'grace-declared-before' });
+                    return true;
+                }
+                noteIntentionsCaptureDecision({ npc: name, kind: 'executed', id, outcome: 'accepted' });
+                return true;
+            });
+            if (validIds.length > 0) {
+                removeLedgerEntries(validIds);
+                // Lifecycle v2 (spec §2): each engine completion is an audited
+                // occurrence record — occurrence-specific, so a later
+                // legitimately re-motivated repetition of the same plan is not
+                // blocked forever (unlike user tombstones).
+                for (const id of validIds) {
+                    const closed = ledgerEntryById.get(id);
+                    if (!closed) continue;
+                    recordLifecycleEvent({
+                        npc: closed.npc,
+                        action: closed.action,
+                        trigger: closed.trigger,
+                        entryId: closed.id,
+                        outcome: 'completed',
+                        source: 'engine',
+                        reason: 'Completed on-screen and marked executed by the intentions call.',
+                    });
+                }
+                validIds.forEach(id => {
+                    ledgerIds.delete(id);
+                    ownedIds.delete(id);
+                });
+                ledgerChanged = true;
+                console.log(`[MWT:Interiority] ${name}: executed ${validIds.length} intention(s).`);
+            }
+        }
+
+        // ── Dropped intentions ──
+        // Same grace period applies — models drop intentions too eagerly
+        // when a minor situation change occurs, before the trigger has
+        // had a chance to arrive. Tier 1 item 2: the id must ALSO be owned
+        // by this NPC's block. Lifecycle Tier 3 grants drops NO
+        // declaration-based exception: elapsed story time can prove a plan
+        // old enough to have been completed, but it cannot prove the NPC's
+        // resolve lapsed — blanket grace stays the drop policy.
+        if (Array.isArray(npcResult.dropped)) {
+            const validIds = [];
+            for (const drop of npcResult.dropped) {
+                if (drop && drop.id && ownedIds.has(drop.id)) {
+                    const age = ledgerAgeMap.get(drop.id) || 0;
+                    if (age < gracePeriod) {
+                        console.log(`[MWT:Interiority] ${name}: intention ${drop.id} dropped but still in grace period (age ${age} < ${gracePeriod}) — kept open.`);
+                        noteIntentionsCaptureDecision({ npc: name, kind: 'dropped', id: drop.id, outcome: 'rejected', reason: 'grace-period' });
+                        continue;
+                    }
+                    validIds.push(drop.id);
+                    ledgerIds.delete(drop.id);
+                    ownedIds.delete(drop.id);
+                    // Lifecycle v2 (spec §2): audited engine drop, carrying the
+                    // model's own reason verbatim (the readable "abandoned"
+                    // record the panel shows).
+                    const closed = ledgerEntryById.get(drop.id);
+                    if (closed) {
+                        recordLifecycleEvent({
+                            npc: closed.npc,
+                            action: closed.action,
+                            trigger: closed.trigger,
+                            entryId: closed.id,
+                            outcome: 'dropped',
+                            source: 'engine',
+                            reason: String(drop.reason || '').trim() || 'Abandoned per the intentions call.',
+                        });
+                    }
+                    console.log(`[MWT:Interiority] ${name}: dropped intention ${drop.id} (${String(drop.reason || '').slice(0, 80)}).`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'dropped', id: drop.id, outcome: 'accepted' });
+                } else if (drop && drop.id && ledgerIds.has(drop.id)) {
+                    console.log(`[MWT:Interiority] ${name}: ignoring dropped id ${drop.id} — the entry belongs to another NPC.`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'dropped', id: drop.id, outcome: 'ignored', reason: 'wrong-owner' });
+                } else if (drop && drop.id && dormantLedgerIds.has(drop.id)) {
+                    console.log(`[MWT:Interiority] ${name}: ignoring dropped id ${drop.id} — the entry is dormant (never shown in <open_intentions>).`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'dropped', id: drop.id, outcome: 'ignored', reason: 'dormant-id' });
+                } else if (drop && drop.id) {
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'dropped', id: drop.id, outcome: 'ignored', reason: 'unknown-id' });
+                }
+            }
+            if (validIds.length > 0) {
+                removeLedgerEntries(validIds);
+                ledgerChanged = true;
+            }
+        }
+
+        // ── New intentions ──
+        // Per-NPC accepted-proposal cap (lifecycle plan Tier 1 item 3): the
+        // reported failure class was a flash-tier model dumping several
+        // near-identical proposals for one NPC. The cap limits CREATION
+        // only — executed/dropped handling above has already run for this
+        // block by the time we get here — and it is enforced AFTER field
+        // validation and dedup, so malformed or duplicate proposals never
+        // consume another candidate's slot. 0 disables new proposals
+        // entirely (temporary reporter-facing diagnostic setting;
+        // user-authored entries never pass through this path, so nothing
+        // user-made is evicted or suppressed by it).
+        const maxNewPerNpc = Math.max(0, Math.min(20, Number(settings.maxNewIntentionsPerNpc ?? 2) || 0));
+        let acceptedNewCount = 0;
+        if (Array.isArray(npcResult.new_intentions)) {
+            // Recomputed here (not threaded through the call chain): the window
+            // is the same one the call saw — scope was asserted above — and an
+            // empty window fails open in judgeIntentionEvidence.
+            const evidenceWindow = getStrippedRecentMessages(Math.max(1, settings.messageWindow || 8));
+            for (const ni of npcResult.new_intentions) {
+                if (!ni) continue;
+                const action = String(ni.action || '').trim();
+                const trigger = String(ni.trigger || '').trim();
+                if (!action || !trigger) {
+                    console.warn(`[MWT:Interiority] ${name}: discarding new intention missing action/trigger — got keys: [${Object.keys(ni).join(', ')}].`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason: 'missing-action-or-trigger' });
+                    continue;
+                }
+
+                // Evidence gate: a quoted line that is not in the window means
+                // the plan came from the dossier/ledger, not the scene. Checked
+                // before dedup and the cap so a rejected proposal never
+                // consumes another candidate's slot.
+                const evidence = String(ni.evidence || '').trim();
+                const evidenceVerdict = judgeIntentionEvidence(evidence, evidenceWindow, settings.requireIntentionEvidence === true);
+                const evidenceCheck = !evidenceWindow ? 'no-window' : evidenceVerdict === 'ok' && !evidence ? 'omitted' : evidenceVerdict;
+                if (evidenceVerdict !== 'ok') {
+                    const reason = evidenceVerdict === 'missing' ? 'missing-evidence' : 'evidence-not-in-window';
+                    console.log(`[MWT:Interiority] ${name}: rejecting new intention "${action.slice(0, 60)}" (${reason}).`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason, evidence, evidenceCheck });
+                    continue;
+                }
+
+                // Dedup: never declare the same intention twice
+                if (hasDuplicateIntention(name, action, trigger)) {
+                    console.log(`[MWT:Interiority] ${name}: skipping duplicate intention "${action.slice(0, 60)}".`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason: 'duplicate' });
+                    continue;
+                }
+
+                // Lifecycle plan Tier 2 — same-response replay guard. The
+                // executed/dropped handlers above have ALREADY removed this
+                // pass's accepted ids from the live ledger, and engine removals
+                // deliberately leave no tombstone (an NPC who completes a plan
+                // may legitimately re-declare it in a LATER turn). So the live
+                // check above cannot see an entry removed moments ago in this
+                // same response: a model that executes an intention and
+                // re-proposes it verbatim would land it straight back as
+                // brand-new. The pre-mutation ledgerSnapshot — captured at the
+                // top of this function, before the wake, the age increment, and
+                // every removal — still holds the entry, so consulting it
+                // blocks the replay. Cross-turn re-declaration stays allowed:
+                // the snapshot is per-validation-pass, not closure history, and
+                // matching remains exact-string (paraphrases are the prompt
+                // contract's and capture's problem, per plan non-goals).
+                // Ownership must resolve through the SAME roster rules the
+                // executed/dropped owner check uses (exact → user-approved
+                // alias → unambiguous given-name). A snapshot entry stored or
+                // user-edited under an alias ("The Vixen" for roster "Mara
+                // Vance") is closable by its canonical owner's block, so an
+                // exact-string npc compare here would let that entry's
+                // verbatim replay slip past the guard and be re-created.
+                // data.js is a leaf module — it cannot import the resolver,
+                // so the caller supplies it (same pattern as
+                // purgeUserLedgerEntries' userNames).
+                if (hasDuplicateIntentionIn(ledgerSnapshot, name, action, trigger,
+                    (npcName) => resolveRosterName(roster, npcName, aliasIndex))) {
+                    console.log(`[MWT:Interiority] ${name}: skipping replayed intention "${action.slice(0, 60)}" — executed or dropped earlier in this same response.`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason: 'replayed-this-response' });
+                    continue;
+                }
+
+                // Deferred lifecycle work (spec §2): conservative cross-turn
+                // closure guard. The Tier 2 replay check above covers this
+                // SAME response; this one covers PREVIOUS turns — the plan the
+                // engine completed two messages ago, re-proposed with the
+                // wording shuffled. Matching is conservative (canonical NPC +
+                // near-exact action/occasion) and windowed by
+                // lifecycleDedupTurns, so an independently motivated repetition
+                // after the window stays legal — occurrence-specific, unlike
+                // the permanent user tombstones.
+                const closureMatch = findRecentClosureMatch(name, action, trigger, {
+                    resolveNpc: (npcName) => resolveRosterName(roster, npcName, aliasIndex),
+                });
+                if (closureMatch) {
+                    console.log(`[MWT:Interiority] ${name}: skipping intention "${action.slice(0, 60)}" — matches a ${closureMatch.record.outcome} closure from turn ${closureMatch.record.turn} (within the dedup window).`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason: 'recently-closed' });
+                    continue;
+                }
+
+                // Deferred lifecycle work (spec §5): per-NPC creation-only cost
+                // controls. Evaluated BEFORE the per-call cap so a gated NPC
+                // never consumes global budget; applies to ENGINE proposals
+                // only — manual panel entries never pass through this path.
+                const controlGate = checkProposalAllowed(name);
+                if (!controlGate.allowed) {
+                    console.log(`[MWT:Interiority] ${name}: new intention "${action.slice(0, 60)}" rejected by a per-NPC control (${controlGate.reason}: ${controlGate.detail}).`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason: `npc-${controlGate.reason}` });
+                    continue;
+                }
+
+                if (acceptedNewCount >= maxNewPerNpc) {
+                    console.log(`[MWT:Interiority] ${name}: new-intention cap reached (${maxNewPerNpc} accepted this call) — skipping "${action.slice(0, 60)}".`);
+                    noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', action, trigger, outcome: 'rejected', reason: 'cap-reached' });
+                    continue;
+                }
+
+                // §20: classify horizon. Scheduled → dormant; immediate/event → active.
+                // Unknown/missing horizon → active (safe default per §20).
+                const horizon = String(ni.horizon || '').toLowerCase().trim();
+                const wakeHint = String(ni.wake_hint || '').trim();
+                let entryStatus = undefined;
+                let entryWakeHint = undefined;
+                if (horizon === 'scheduled') {
+                    entryStatus = 'dormant';
+                    entryWakeHint = wakeHint;
+                }
+                // No code-side guard against a scheduled event-conditional
+                // trigger ("next time X"): the prompt forbids it, and a
+                // misclassification is user-correctable from the panel
+                // (⏰ wake / 💤 sleep) rather than silently overridden here.
+
+                const created = addLedgerEntry(
+                    { npc: name, action, trigger, status: entryStatus, wakeHint: entryWakeHint },
+                    worldTime,
+                    msgIdx,
+                );
+                acceptedNewCount += 1;
+                // Lifecycle v2 (spec §5): arm this NPC's proposal cooldown.
+                noteProposalAccepted(name);
+                noteIntentionsCaptureDecision({ npc: name, kind: 'new_intention', id: created.id, action, trigger, outcome: 'accepted', evidence, evidenceCheck });
+                ledgerChanged = true;
+            }
+        }
+    }
+
+    // Deferred lifecycle work (spec §3): stamp the per-NPC evidence boundary
+    // — ONLY now, after the whole pass validated and every mutation committed.
+    // Thoughts-only turns (wantIntentions false) stamp nothing; strict partial
+    // failures stamp only the NPCs whose per-call singleton succeeded (via the
+    // threaded evaluatedNpcNames / result.intentionsEvaluatedRoster); callers
+    // that discard this result on a scope change never reach this line.
+    if (wantIntentions) {
+        // An explicitly threaded list is authoritative — INCLUDING an empty one
+        // (split mode with a failed intentions call evaluates nobody; falling
+        // back to the merged block names there would stamp the whole roster).
+        const evaluatedList = Array.isArray(evaluatedNpcNames)
+            ? evaluatedNpcNames
+            : (Array.isArray(result.intentionsEvaluatedRoster)
+                ? result.intentionsEvaluatedRoster
+                : result.npcs.map(npc => npc?.name));
+        const turnNow = getTurnCounter();
+        const stamped = new Set();
+        for (const rawName of evaluatedList) {
+            const canonical = resolveRosterName(roster, String(rawName ?? '').trim(), aliasIndex);
+            if (canonical == null) continue;
+            const key = canonical.toLowerCase();
+            if (stamped.has(key)) continue;
+            stamped.add(key);
+            stampEvidenceBoundary(canonical, turnNow, msgIdx, msgKey);
+        }
+    }
+
+    // Store per-message reactions + ledger + inner-state snapshots
+    // (keyed by stable msgKey). Both snapshots enable swipe/edit/delete
+    // rollback — without innerStatesSnapshot, a swipe would roll back
+    // Mara's intentions but leave her mood from the abandoned timeline.
+    // turnCounterAtSnapshot is the pre-turn counter (the caller increments
+    // only after this returns) so the same rollback can un-consume the turn.
+    // Lifecycle v2: the lifecycle-history and evidence-boundary snapshots ride
+    // the same record, so one swipe restores the whole turn coherently.
+    if (msgKey) {
+        setPerMessage(msgKey, {
+            reactions,
+            ledgerSnapshot,
+            innerStatesSnapshot,
+            lifecycleHistorySnapshot,
+            evidenceBoundariesSnapshot,
+            npcControlWatermarksSnapshot,
+            turnCounterAtSnapshot: getTurnCounter(),
+            generatedAt: Date.now(),
+        });
+    }
+
+    return { reactions, ledgerChanged };
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Check if a thought is boilerplate/filler that should be dropped.
+ */
+function isBoilerplate(thought) {
+    const lower = thought.toLowerCase().trim();
+    if (lower.length < 10) return true;
+    const fillers = [
+        'i wonder what will happen',
+        'i should keep an eye',
+        'something feels off',
+        'only time will tell',
+    ];
+    return fillers.some(f => lower.includes(f));
+}
+
+/**
+ * Get recent messages, stripped of non-narrative blocks.
+ *
+ * Stripping must happen per-message BEFORE the window is joined —
+ * `<details>` tracker blocks span many lines, so line-by-line stripping
+ * of the joined text never matches them. core/context.js handles this
+ * via the `strip` option.
+ *
+ * @param {number} windowSize
+ * @returns {string}
+ */
+function getStrippedRecentMessages(windowSize) {
+    return getRecentMessages({
+        maxMessages: windowSize,
+        maxChars: 100000,
+        filterSystem: true,
+        strip: true,
+        stripAffordances: true,
+    }) || '';
+}
+
+/**
+ * Judge a new intention's quoted `evidence` against the message window.
+ *
+ * Policy (the point is catching small models that mine the dossier instead of
+ * the scene, without penalising frontier models that simply omit the field):
+ *  - no window text to check against → 'ok' (fail open; nothing to verify)
+ *  - evidence omitted → 'ok', or 'missing' when `requireEvidence` is on
+ *  - evidence present but not found in the window → 'not-found'
+ * Matching reuses core/quote_match.js (verbatim, or bigram-tolerant for a
+ * dialogue tag splitting the quote), so Knowledge, Story Planner and
+ * Interiority share one definition of "this quote is in the chat".
+ *
+ * @param {string} evidence
+ * @param {string} windowText - the stripped message window
+ * @param {boolean} requireEvidence
+ * @returns {'ok'|'missing'|'not-found'}
+ */
+export function judgeIntentionEvidence(evidence, windowText, requireEvidence = false) {
+    if (!windowText) return 'ok';
+    const quote = String(evidence || '').trim();
+    if (!quote) return requireEvidence ? 'missing' : 'ok';
+    return quoteMatchesMessage(quote, null, { mes: windowText }) ? 'ok' : 'not-found';
+}

@@ -1,0 +1,1762 @@
+/**
+ * knowledge/lorebook.js — Lorebook read/write, entry formatters, validation,
+ * scan logic, and state/NPC update workflows.
+ *
+ * The world-info script is loaded as a side-effect (top-level await) so that
+ * wiScript is available for all lorebook operations.
+ */
+
+import {
+    getChat, getPlayerNames, getUserNames,
+    resolveApiCall, normaliseOutput, parseJsonLenient,
+    getWorldStateFactual, getLatestChronicleEntry,
+    stripNonNarrative, getStableHistoryEnd,
+    isCancellation,
+} from '../core/index.js';
+
+import { buildScanSystemPrompt, STATE_UPDATE_PROMPT, NPC_UPDATE_PROMPT, DOSSIER_UPDATE_PROMPT, DOSSIER_ENRICH_PROMPT, DOSSIER_FIELD_REFRESH_PROMPT } from './prompts.js';
+import { getSettings, hasValidSettings } from './settings.js';
+import {
+    TRACKER_SENTINEL,
+    HISTORY_KEY_PREFIX,
+    state,
+} from './state.js';
+import { getRegistry, normalizeRegistryName, isSameNpcByName } from './registry.js';
+import { hasEvidenceFile } from './evidence.js';
+import { applyFieldOwnership } from './field_ownership.js';
+import { validateFields, validateFieldValue, validateKnowledgeList, validateCreationHeader } from './field_contract.js';
+import { stripRelationshipBlock } from './relationships.js';
+import { getLorebookName, getProfileLorebookName, getStateLorebookName } from './scope.js';
+import { applyStoreToWorldInfo, markStoreClean, assertHydrated, isStoreEntry, saveBookNow, STORE_SENTINEL } from './store.js';
+import { isCleanupRecoveryEntry } from './cleanup_recovery.js';
+import { hostCacheConflict, loadCleanupBook, saveCleanupBook } from './cleanup_persistence.js';
+import { findEntryUidByNpcIdentity } from './reconcile.js';
+import { validateHistoryRecords } from '../schema/secondary.js';
+// Part 7 diagnostics wiring: direct import (not the barrel) so the REAL
+// schema-event surface is used even under the test barrel→stub alias.
+import { recordSchemaEvent, schemaEventForSeverity } from '../core/schema_status.js';
+
+// ─── World-info import (side-effect) ────────────────────────────────────────
+
+try {
+    state.wiScript = await import('../../../../world-info.js');
+    console.log('[MWT:Knowledge] world-info.js loaded.');
+} catch (err) {
+    state.wiScript = null; // explicit "tried and failed" — see store.js getWiScript tri-state
+    console.warn('[MWT:Knowledge] Could not import world-info.js:', err?.message || err);
+}
+
+// ─── History ─────────────────────────────────────────────────────────────────
+//
+// History keys are namespaced by lorebook name (`kt_history_<lorebook>_<uid>`)
+// so that entries in the "Knowledge Tracker" and "State Tracker" lorebooks —
+// which independently assign UIDs starting at 0 — don't collide in
+// localStorage.  The lorebook name is passed explicitly to every call.
+
+// Part 7 (schema plan §2.2): history findings surface once per session in
+// the diagnostics ring (§9.3) — getHistory()/pushHistory() are hot paths, so
+// the core/ui.js float-position dedup pattern applies here too, with one
+// difference that matters: float positions live in ONE key, but history keys
+// are per-book-per-uid (`kt_history_<lorebook>_<uid>`). Deduping on the code
+// alone would let the first malformed record silence every other corrupted
+// key for the whole session — the event carries `store: key`, so the dedup
+// has to be keyed on the pair or all but one book/uid go unreported.
+const _reportedHistoryIssues = new Set();
+function reportHistoryIssues(issues, key) {
+    for (const issue of issues) {
+        const dedupKey = `${key}|${issue.code}`;
+        if (_reportedHistoryIssues.has(dedupKey)) continue;
+        _reportedHistoryIssues.add(dedupKey);
+        // Severity picks the event: a RETAINED finding must not be logged as
+        // schema_quarantined (see schemaEventForSeverity).
+        recordSchemaEvent(schemaEventForSeverity(issue.severity), {
+            store: key,
+            code: issue.code,
+            reasonCode: String(issue.path?.[0] ?? issue.code),
+        });
+    }
+}
+
+/**
+ * Read + validate one history key. An unparseable record (truncated quota
+ * write) reads as the root finding — an empty, quarantined live view —
+ * instead of vanishing into a bare catch. The stored raw value is left
+ * untouched (it is the recovery copy); the next push converges the key.
+ */
+function readHistoryRecords(key) {
+    let raw;
+    try {
+        raw = JSON.parse(localStorage.getItem(key) || '[]');
+    } catch { raw = null; }
+    const validated = validateHistoryRecords(raw);
+    reportHistoryIssues(validated.issues, key);
+    return validated;
+}
+
+export function pushHistory(uid, content, lorebook = getLorebookName()) {
+    if (uid === null || uid === undefined) return;
+    const key = HISTORY_KEY_PREFIX + lorebook + '_' + uid;
+    // Part 7 (schema plan §2.2): validate the stored list before rewriting
+    // it, so a malformed record converges away on this push instead of being
+    // copied forward forever. The stored key is the recovery copy.
+    const history = readHistoryRecords(key).data;
+    history.unshift({ ts: Date.now(), content, msgIdx: getChat()?.length || 0 });
+    if (history.length > 50) history.length = 50;
+    try { localStorage.setItem(key, JSON.stringify(history)); } catch { /* quota */ }
+}
+
+export function getHistory(uid, lorebook = getLorebookName()) {
+    if (uid === null || uid === undefined) return [];
+    try {
+        // Part 7: invalid records are filtered from the live view; the
+        // stored key stays untouched until the next push converges it.
+        return readHistoryRecords(HISTORY_KEY_PREFIX + lorebook + '_' + uid).data;
+    } catch { return []; }
+}
+
+// ─── Message helpers ─────────────────────────────────────────────────────────
+
+export function getRecentMessages(count = 50) {
+    const chat = getChat();
+    if (!chat || !chat.length) return null;
+    const end = getStableHistoryEnd(chat);
+    const slice = chat.slice(Math.max(0, end - count), end);
+    const filtered = slice.filter(m => m.mes && !m.is_system);
+    if (!filtered.length) return null;
+    // Strip non-narrative blocks (preset trackers, old chatter, time tags)
+    // so tracker secrets don't launder into knowledge scan context.
+    // Off-Screen Events blocks are stripped TOO (preserveOffScreen:false):
+    // the Knowledge prompts carry no actor/witness partition rules for that
+    // sealed log, so an unwitnessed off-screen event mentioning a tracked
+    // NPC must never be recorded as knowledge that NPC learned.
+    return filtered.map(m => {
+        const name = m.is_user ? (m.name || 'User') : (m.name || 'Assistant');
+        return `${name}: ${stripNonNarrative(m.mes, { preserveOffScreen: false })}`;
+    }).join('\n');
+}
+
+// ─── API fetch (delegates to shared core) ────────────────────────────────────
+
+export async function ktFetchFromApi(systemPrompt, userContent, { retries = 1, trigger = null, signal = null } = {}) {
+    const resolved = resolveApiCall({ moduleSettings: getSettings() });
+    // `trigger` rides down to the coordinator (TODO §1) so auto scans classify
+    // as background work and the api-call telemetry names the cause. `signal`
+    // (Phase 4: the cleanup review's Cancel button) is composed with the
+    // coordinator's own job signal inside core/api.js — the transport just
+    // consumes the single signal it receives.
+    return resolved.fetchFn({ systemPrompt, userContent, settings: resolved.settings, retries, trigger, signal });
+}
+
+// ─── Lorebook CRUD ───────────────────────────────────────────────────────────
+
+export async function loadStateTrackerEntry(uid) {
+    if (!state.wiScript) return null;
+    try {
+        const wi = await state.wiScript.loadWorldInfo(getStateLorebookName());
+        const entry = wi?.entries?.[uid];
+        return entry ? { content: entry.content || '', comment: entry.comment || '' } : null;
+    } catch (err) { console.warn('[MWT:Knowledge] Could not load state tracker entry:', err.message); return null; }
+}
+
+export async function writeStateTracker(uid, name, content) {
+    if (!state.wiScript) return { success: false, error: 'world-info.js not loaded' };
+    // Resolve ONCE — see writeToLorebook for the full rationale. This function
+    // straddles two awaits, and the store stamp below is the sharp edge: if the
+    // name resolved differently there than at load, one character's registry
+    // would be written into another character's book.
+    const book = getStateLorebookName();
+    if (!book) return { success: false, error: 'Knowledge lorebook name collision — no book was written.' };
+    try {
+        const wi = await state.wiScript.loadWorldInfo(book);
+        const entry = wi?.entries?.[uid];
+        if (!entry) return { success: false, error: `UID ${uid} not found in "${book}".` };
+        const comment = entry.comment || '';
+        if (!comment.startsWith(TRACKER_SENTINEL)) return { success: false, error: `UID ${uid} missing ${TRACKER_SENTINEL} sentinel.` };
+        const previousContent = entry.content || '';
+        entry.content = content;
+        applyStoreToWorldInfo(book, wi);
+        await saveBookNow(state.wiScript, book, wi);
+        // Only now has the folded-in store actually reached disk.
+        markStoreClean(book);
+        pushHistory(uid, previousContent, book);
+        return { success: true, uid };
+    } catch (err) { return { success: false, error: err.message }; }
+}
+
+export async function writeToLorebook(name, content, keywords, existingUid, { bookName, beforeWrite } = {}) {
+    if (!state.wiScript) return { success: false, content, keywords, error: 'world-info.js not loaded' };
+    // Resolve the book ONCE. Calling the resolver per save could target two
+    // different books within a single write if the scope changed mid-flight.
+    const book = bookName ?? getLorebookName();
+    if (!book) return { success: false, error: 'Knowledge lorebook name collision — no book was written.' };
+    try {
+        let wi = beforeWrite ? await loadCleanupBook(book) : await state.wiScript.loadWorldInfo(book);
+        // Cleanup guards run synchronously against the final loaded object,
+        // before any mutation, history push, auto-create, or awaited save.
+        // Unsaved host state comes first: this write is built from disk.
+        if (beforeWrite) {
+            const guard = hostCacheConflict(book, wi) || beforeWrite(wi?.entries || {});
+            if (guard) return { success: false, error: guard.error, refusal: guard };
+        }
+        // Auto-create the lorebook if it doesn't exist yet.
+        // createNewWorldInfo returns a boolean on the Aikobots v4 fork (and some
+        // ST versions), not the world-info object. Always re-load after creating
+        // and fall back to { entries: {} } if that still fails.
+        if (!wi || !wi.entries) {
+            if (typeof state.wiScript.createNewWorldInfo === 'function') {
+                await state.wiScript.createNewWorldInfo(book);
+            }
+            wi = await state.wiScript.loadWorldInfo(book);
+            if (!wi || !wi.entries) {
+                wi = { entries: {} };
+            }
+        }
+        const entries = wi.entries;
+        // A registry uid is only meaningful for the book it was recorded in. A
+        // stale one (imported registry, hand-deleted entries, a scope switch)
+        // can point at an unrelated entry, and the update branch below would
+        // silently overwrite it. The store entry is the unambiguous case —
+        // never let an NPC be written over the module's own bookkeeping.
+        if (existingUid !== null && existingUid !== undefined
+            && (isStoreEntry(entries[existingUid]) || isCleanupRecoveryEntry(entries[existingUid]))) {
+            console.warn(
+                `[MWT:Knowledge] Registry uid ${existingUid} for "${name}" points at the ` +
+                `${STORE_SENTINEL} entry in "${book}" — the uid is stale. Creating a new entry instead.`
+            );
+            existingUid = null;
+        }
+        if (existingUid !== null && existingUid !== undefined && entries[existingUid]) {
+            // KNOWLEDGE-01: Verify the entry's identity before overwriting it.
+            // A stale uid can point at an unrelated NPC's entry (imported
+            // registry, uid reuse after a hand-delete, etc.). The import path
+            // already content-verifies; normal updates were LESS protected.
+            const existingComment = entries[existingUid].comment || '';
+            const expectedName = String(name || '');
+            // KNOWLEDGE-01 (follow-up): compare through the shared NPC identity
+            // rule, not an exact string. A case/whitespace gap, an unambiguous
+            // alias spelling ("Sophie Simpson" for registry key "Sophie", which
+            // importFromLorebooks legitimately links), OR a registry-proven
+            // alias ("The Vixen" for "Mara" after a rename — the spellings
+            // share no token, but the registry links both to one record) is
+            // the same NPC. An exact-only check detached valid uids and
+            // re-created the duplicate this guard exists to prevent; a
+            // heuristic-only check still did after an arbitrary rename. An
+            // empty comment is unlabelled, not a mismatch, so it still adopts.
+            const commentN = normalizeRegistryName(existingComment);
+            if (commentN && !isSameNpcByName(existingComment, expectedName,
+                Object.values(entries).map(entry => entry?.comment))) {
+                console.warn(
+                    `[MWT:Knowledge] Registry uid ${existingUid} for "${expectedName.trim()}" points at ` +
+                    `an entry labelled "${existingComment.trim()}" in "${book}" — the uid is stale (wrong NPC). ` +
+                    `Detaching the stale uid and creating a new entry instead.`
+                );
+                existingUid = null;
+            }
+        }
+        // ADOPT BEFORE CREATE — the duplicate-entry backstop.
+        //
+        // Every path that lands here would otherwise add a SECOND entry beside
+        // one this book already holds under the same label: an orphan (uid-less)
+        // registry record, a registry that was empty when the scan ran, and the
+        // stale-uid guard above, which detaches the bad uid and falls straight
+        // through. That is what produced four entries labelled "Sophie" in the
+        // reported book — identical labels, so not an alias fork.
+        //
+        // Adoption turns the create into an update of the entry that is already
+        // there. The update branch pushes history first, so the previous text is
+        // always recoverable if the incoming proposal is thinner. Enrichment
+        // (enrichStagingItem) normally resolves this earlier and merges properly;
+        // this is the last line of defence for paths that skip it.
+        //
+        // assertHydrated runs BEFORE the lookup: this is the would-be-create
+        // path, so it must keep the same hydration guarantee a create had —
+        // adopting must not become a way to write against an un-hydrated store.
+        if (existingUid === null || existingUid === undefined || !entries[existingUid]) {
+            assertHydrated(book, `create a lorebook entry for "${name}"`);
+            const adopted = findEntryUidByNpcIdentity(entries, name);
+            if (adopted) {
+                console.warn(
+                    `[MWT:Knowledge] "${String(name).trim()}" already exists in "${book}" as uid ` +
+                    `${adopted.uid} (labelled "${adopted.label}")${adopted.exact ? '' : ' — an alias spelling'}. ` +
+                    `Updating that entry instead of creating a duplicate.` +
+                    (adopted.duplicates > 1
+                        ? ` NOTE: ${adopted.duplicates} entries share this label; adopting the lowest uid. ` +
+                          `Run MWT.npcs.auditDuplicates() to review and prune the rest.`
+                        : '')
+                );
+                existingUid = adopted.uid;
+            }
+        }
+        if (existingUid !== null && existingUid !== undefined && entries[existingUid]) {
+            const previousContent = entries[existingUid].content || '';
+            pushHistory(existingUid, previousContent, book);
+            entries[existingUid].content = content;
+            // Cleanup owns content, not keywords edited during review.
+            if (!beforeWrite) entries[existingUid].key = keywords;
+            entries[existingUid].comment = name;
+            applyStoreToWorldInfo(book, wi);
+            if (beforeWrite) await saveCleanupBook(book, wi);
+            else await saveBookNow(state.wiScript, book, wi);
+            markStoreClean(book);
+            return { success: true, uid: existingUid };
+        } else {
+            // Creating an entry against an un-hydrated store is the duplicate
+            // bug in miniature: an empty registry reports every NPC as new, so
+            // a scan would rebuild the whole book alongside itself. Refuse.
+            // (The adopt-before-create block above already asserted this for
+            // every path that reaches here; kept so the create branch does not
+            // depend on a distant guard for its own safety property.)
+            assertHydrated(book, `create a lorebook entry for "${name}"`);
+            const existingUids = Object.keys(entries).map(Number).filter(n => !isNaN(n));
+            const newUid = existingUids.length > 0 ? existingUids.reduce((a, b) => a > b ? a : b, -1) + 1 : 0;
+            entries[newUid] = {
+                uid: newUid, key: keywords, keysecondary: [], comment: name, content, enabled: true,
+                selective: false, constant: false, order: 100, position: 0, disable: false, addMemo: true,
+                group: '', groupOverride: false, groupWeight: 100, sticky: null, cooldown: null, delay: null,
+                probability: 100, useProbability: true, depth: 4, selectiveLogic: 0, excludeRecursion: false,
+                preventRecursion: false, delayUntilRecursion: false, scanDepth: null, caseSensitive: null,
+                matchWholeWords: null, useGroupScoring: null, automationId: '', role: null, vectorized: false,
+                displayIndex: newUid,
+            };
+            applyStoreToWorldInfo(book, wi);
+            await saveBookNow(state.wiScript, book, wi);
+            markStoreClean(book);
+            return { success: true, uid: newUid };
+        }
+    } catch (err) { return { success: false, content, keywords, error: err.message }; }
+}
+
+/**
+ * Relabel a lorebook entry (comment ± keywords) WITHOUT touching its content —
+ * the identity service's rename/merge seam (TODO §1).
+ *
+ * writeToLorebook cannot serve this purpose: its KNOWLEDGE-01 guard verifies
+ * the entry's label against the NAME it is given, so a genuine rename
+ * ("Sophie" → "Countess Beaumont") would read as a stale uid, detach it, and
+ * create the exact duplicate the guard exists to prevent. This function
+ * verifies the label against the OLD name and then writes the NEW one.
+ *
+ * @param {string} bookName — the book holding the entry (Knowledge or NPC
+ *   Profiles book — resolution belongs to the caller)
+ * @param {number} uid — entry UID
+ * @param {string} newLabel — the new comment/label
+ * @param {string|null} [expectedName] — the label the entry must currently
+ *   carry (same contextual NPC-alias verification as the write paths); null
+ *   skips the check for callers that have already verified identity
+ * @param {string[]|null} [keywords] — replacement primary keywords, when given
+ * @returns {Promise<{success:boolean, uid?:number, error?:string}>}
+ */
+export async function relabelLorebookEntry(bookName, uid, newLabel, expectedName = null, keywords = null) {
+    if (!state.wiScript) return { success: false, error: 'world-info.js not loaded' };
+    if (!Number.isInteger(uid) || uid < 0) return { success: false, error: `Invalid uid ${uid}.` };
+    const label = String(newLabel ?? '').trim();
+    if (!label) return { success: false, error: 'New label must be a non-empty string.' };
+    try {
+        const wi = await state.wiScript.loadWorldInfo(bookName);
+        const entry = wi?.entries?.[uid];
+        if (!entry) return { success: false, error: `UID ${uid} not found in "${bookName}".` };
+        if (isStoreEntry(entry) || isCleanupRecoveryEntry(entry)) {
+            return { success: false, error: `UID ${uid} is module bookkeeping (${STORE_SENTINEL} or ${'[MWT:cleanup-recovery]'}) — refusing to relabel it.` };
+        }
+        if (expectedName !== null && expectedName !== undefined) {
+            const comment = entry.comment || '';
+            // Same NPC identity rule as the write paths: an alias spelling of
+            // the expected name still verifies — including a registry-proven
+            // alias, so a relabel retried after a partially applied rename
+            // (the entry already carries the new spelling) is idempotent; an
+            // empty comment is unlabelled, not a mismatch, and adopts.
+            if (comment && !isSameNpcByName(comment, expectedName,
+                Object.values(wi.entries).map(candidate => candidate?.comment))) {
+                return { success: false, error: `UID ${uid} is labelled "${comment}", not "${expectedName}" — refusing to relabel another NPC's entry.` };
+            }
+        }
+        entry.comment = label;
+        if (Array.isArray(keywords) && keywords.length > 0) entry.key = keywords;
+        applyStoreToWorldInfo(bookName, wi);
+        await saveBookNow(state.wiScript, bookName, wi);
+        markStoreClean(bookName);
+        return { success: true, uid };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+}
+
+/**
+ * Load an NPC entry's content from the Knowledge Tracker lorebook.
+ *
+ * @param {number} uid — entry UID
+ * @param {string} [expectedName] — when provided, the entry's label (comment)
+ *   must match this NPC — same normalization as writeToLorebook's
+ *   KNOWLEDGE-01 identity check — or the load is REFUSED. A uid is just a
+ *   number: stale or duplicated registry identities can point it at a
+ *   different NPC's entry, and every caller that displays or merges content
+ *   would then present one character's dossier under another's name (the
+ *   Mikhail/Marcus symptom). Returning null blocks the display/merge; callers
+ *   already treat null as "no content".
+ * @returns {Promise<string|null>}
+ */
+export async function loadEntryContent(uid, expectedName) {
+    if (!state.wiScript) return null;
+    try {
+        const wi = await state.wiScript.loadWorldInfo(getLorebookName());
+        const entry = wi?.entries?.[uid];
+        if (!entry) return null;
+        if (expectedName !== undefined && expectedName !== null) {
+            // Same NPC identity rule as writeToLorebook's KNOWLEDGE-01: an
+            // alias spelling of the canonical key ("Sophie Simpson" for
+            // "Sophie") — or a registry-proven alias ("The Vixen" for "Mara"
+            // after a rename) — still verifies, but a genuinely different NPC
+            // — the Mikhail/Marcus symptom — is refused.
+            if (!isSameNpcByName(entry.comment, expectedName,
+                Object.values(wi?.entries || {}).map(candidate => candidate?.comment))) {
+                console.warn(
+                    `[MWT:Knowledge] Refusing to load uid ${uid} for "${String(expectedName).trim()}" — ` +
+                    `that entry is labelled "${String(entry.comment || '').trim()}" in "${getLorebookName()}". ` +
+                    `The uid points at a different NPC; treating it as missing. ` +
+                    `Repair it with "📚 From Lorebooks" (or MWT.npcs.reconcile()); ` +
+                    `MWT.npcs.auditDuplicates() reviews the registry read-only.`
+                );
+                return null;
+            }
+        }
+        return entry.content ?? null;
+    } catch { return null; }
+}
+
+/**
+ * List every NPC entry in the Knowledge Tracker lorebook (read-only).
+ *
+ * Same shape as listProfileEntries(). Used by the non-destructive duplicate
+ * audit (MWT.npcs.auditDuplicates) so alias entries that exist physically in
+ * the book — even when the registry never recorded them — are visible.
+ *
+ * @returns {Promise<Array<{uid:number, name:string, chars:number, preview:string}>>}
+ */
+export async function listKnowledgeEntries() {
+    if (!state.wiScript) return [];
+    try {
+        const wi = await state.wiScript.loadWorldInfo(getLorebookName());
+        const entries = wi?.entries || {};
+        return Object.keys(entries)
+            .filter(k => !isStoreEntry(entries[k]) && !isCleanupRecoveryEntry(entries[k]))
+            .map(k => {
+                const e = entries[k];
+                const content = String(e?.content || '');
+                return {
+                    uid: Number(e?.uid ?? k),
+                    name: String(e?.comment || '').trim(),
+                    chars: content.length,
+                    preview: content.slice(0, 80).replace(/\s+/g, ' '),
+                };
+            })
+            .filter(e => Number.isFinite(e.uid))
+            .sort((a, b) => a.name.localeCompare(b.name) || a.uid - b.uid);
+    } catch (err) {
+        console.warn('[MWT:Knowledge] Could not list knowledge entries:', err);
+        return [];
+    }
+}
+
+// ─── NPC Profiles lorebook (Slice 2 — non-injected growth profiles) ──────────
+//
+// The "NPC Profiles" lorebook holds evidence-derived personality profiles.
+// Its entries have the NPC name as `comment` (label) and NO keywords
+// (`key: []`), so ST's world-info system never keyword-matches them — they
+// are never injected. This is the "default OFF" position, achieved
+// structurally (empty keywords) rather than via a toggle. If a user later
+// wants the profile injected, they can add keywords manually; the module
+// does not do it for them.
+//
+// See NPC_GROWTH_BLUEPRINT.md §"Profile storage & injection".
+
+/**
+ * Write (or overwrite) an NPC's growth profile in the NPC Profiles lorebook.
+ *
+ * @param {string} name — NPC name (used as entry comment/label)
+ * @param {string} content — profile prose
+ * @param {number|null} [existingUid] — existing profile UID to overwrite
+ * @returns {Promise<{success:boolean, uid?:number, error?:string}>}
+ */
+export async function writeProfileToLorebook(name, content, existingUid) {
+    if (!state.wiScript) return { success: false, error: 'world-info.js not loaded' };
+    // Resolve ONCE — see writeToLorebook. This one spans a load, a create and a
+    // re-load before it saves, so it has the most await boundaries to cross.
+    const book = getProfileLorebookName();
+    // SillyTavern's load/create/save all no-op on a falsy name, so without
+    // this the write below would "succeed" into an in-memory book.
+    if (!book) return { success: false, error: 'Knowledge lorebook name collision — no book was written.' };
+    try {
+        let wi = await state.wiScript.loadWorldInfo(book);
+        // Auto-create the lorebook if it doesn't exist yet (same pattern as
+        // writeToLorebook — createNewWorldInfo may return boolean, so re-load).
+        if (!wi || !wi.entries) {
+            if (typeof state.wiScript.createNewWorldInfo === 'function') {
+                await state.wiScript.createNewWorldInfo(book);
+            }
+            wi = await state.wiScript.loadWorldInfo(book);
+            if (!wi || !wi.entries) {
+                wi = { entries: {} };
+            }
+        }
+        const entries = wi.entries;
+        // KNOWLEDGE-01: Verify the entry's identity before overwriting it.
+        // Same fix as writeToLorebook — a stale profileUid can point at an
+        // unrelated NPC's profile entry.
+        if (existingUid !== null && existingUid !== undefined && entries[existingUid]) {
+            const existingComment = entries[existingUid].comment || '';
+            const expectedName = String(name || '');
+            // KNOWLEDGE-01 (follow-up): same shared NPC identity rule as
+            // writeToLorebook — a case/whitespace difference, an unambiguous
+            // alias spelling of the registry key, OR a registry-proven alias
+            // ("The Vixen" entry for a save that spells "Mara" after a
+            // rename) is the same NPC, not a stale uid. An empty comment is
+            // unlabelled, not a mismatch.
+            const commentN = normalizeRegistryName(existingComment);
+            if (commentN && !isSameNpcByName(existingComment, expectedName,
+                Object.values(entries).map(entry => entry?.comment))) {
+                console.warn(
+                    `[MWT:Knowledge] Profile uid ${existingUid} for "${expectedName.trim()}" points at ` +
+                    `an entry labelled "${existingComment.trim()}" in "${book}" — the uid is stale (wrong NPC). ` +
+                    `Detaching the stale uid and creating a new entry instead.`
+                );
+                existingUid = null;
+            }
+        }
+        if (existingUid !== null && existingUid !== undefined && entries[existingUid]) {
+            entries[existingUid].content = content;
+            entries[existingUid].comment = name;
+            entries[existingUid].key = []; // no keywords → never injected
+            await saveBookNow(state.wiScript, book, wi);
+            return { success: true, uid: existingUid };
+        } else {
+            const existingUids = Object.keys(entries).map(Number).filter(n => !isNaN(n));
+            const newUid = existingUids.length > 0 ? existingUids.reduce((a, b) => a > b ? a : b, -1) + 1 : 0;
+            entries[newUid] = {
+                uid: newUid,
+                key: [],           // no keywords → ST world-info never injects this
+                keysecondary: [],
+                comment: name,
+                content,
+                enabled: true,
+                selective: false, constant: false, order: 100, position: 0,
+                disable: false, addMemo: true, group: '', groupOverride: false,
+                groupWeight: 100, sticky: null, cooldown: null, delay: null,
+                probability: 100, useProbability: true, depth: 4, selectiveLogic: 0,
+                excludeRecursion: false, preventRecursion: false, delayUntilRecursion: false,
+                scanDepth: null, caseSensitive: null, matchWholeWords: null,
+                useGroupScoring: null, automationId: '', role: null, vectorized: false,
+                displayIndex: newUid,
+            };
+            await saveBookNow(state.wiScript, book, wi);
+            return { success: true, uid: newUid };
+        }
+    } catch (err) { return { success: false, error: err.message }; }
+}
+
+/**
+ * Load an NPC's profile content from the NPC Profiles lorebook.
+ *
+ * @param {number} uid — profile lorebook UID
+ * @returns {Promise<string|null>}
+ */
+export async function loadProfileContent(uid) {
+    if (!state.wiScript || uid == null) return null;
+    try {
+        const wi = await state.wiScript.loadWorldInfo(getProfileLorebookName());
+        return wi?.entries?.[uid]?.content ?? null;
+    } catch { return null; }
+}
+
+/**
+ * List every entry in the NPC Profiles lorebook.
+ *
+ * Read-only. Used by the duplicate audit: a lost `profileUid` pointer makes the
+ * next save create a second entry for the same NPC instead of overwriting, so
+ * the lorebook is the only place those orphans are visible.
+ *
+ * @returns {Promise<Array<{uid:number, name:string, chars:number, preview:string}>>}
+ */
+export async function listProfileEntries() {
+    if (!state.wiScript) return [];
+    try {
+        const wi = await state.wiScript.loadWorldInfo(getProfileLorebookName());
+        const entries = wi?.entries || {};
+        return Object.keys(entries).map(k => {
+            const e = entries[k];
+            const content = String(e?.content || '');
+            return {
+                uid: Number(e?.uid ?? k),
+                name: String(e?.comment || '').trim(),
+                chars: content.length,
+                preview: content.slice(0, 80).replace(/\s+/g, ' '),
+            };
+        }).sort((a, b) => a.name.localeCompare(b.name) || a.uid - b.uid);
+    } catch (err) {
+        console.warn('[MWT:Knowledge] Could not list profile entries:', err);
+        return [];
+    }
+}
+
+/**
+ * Delete entries from the NPC Profiles lorebook by uid.
+ *
+ * Destructive and deliberately dumb: it deletes exactly the uids it is given
+ * and decides nothing on its own. Callers are responsible for never passing a
+ * uid the registry still points at.
+ *
+ * @param {number[]} uids — profile lorebook UIDs to delete
+ * @returns {Promise<{success:boolean, deleted:number[], error?:string}>}
+ */
+export async function deleteProfileEntries(uids) {
+    if (!state.wiScript) return { success: false, deleted: [], error: 'world-info.js not loaded' };
+    if (!Array.isArray(uids) || uids.length === 0) return { success: true, deleted: [] };
+    // Resolve ONCE — see writeToLorebook. Deleting from one book and saving to
+    // another would drop the deletions and leave the originals in place.
+    const book = getProfileLorebookName();
+    try {
+        const wi = await state.wiScript.loadWorldInfo(book);
+        if (!wi || !wi.entries) return { success: false, deleted: [], error: 'profile lorebook not found' };
+        const deleted = [];
+        for (const uid of uids) {
+            if (wi.entries[uid] !== undefined) {
+                delete wi.entries[uid];
+                deleted.push(uid);
+            }
+        }
+        if (deleted.length > 0) await saveBookNow(state.wiScript, book, wi);
+        return { success: true, deleted };
+    } catch (err) {
+        return { success: false, deleted: [], error: err.message };
+    }
+}
+
+// ─── Entry formatters ────────────────────────────────────────────────────────
+
+export function formatMinorEntry(data) {
+    data = validateCreationHeader(data).data;
+    return [`${data.name || 'Unknown'} | ${data.species || 'Unknown'} | ${data.descriptor || ''}`,
+        `Tone: ${data.tone || 'unknown'}`, `Perceived as: ${data.perceived_as || 'unknown'}`,
+        `First seen: ${data.first_seen || 'unknown'}`].join('\n');
+}
+
+export function formatMajorEntry(data) {
+    data = validateCreationHeader(data).data;
+    const lines = [`${data.name || 'Unknown'} | ${data.species || 'Unknown'} | ${data.descriptor || ''}`,
+        `Tone: ${data.tone || 'unknown'}`, `Perceived as: ${data.perceived_as || 'unknown'}`,
+        `First seen: ${data.first_seen || 'unknown'}`, '', 'Knowledge Ledger:'];
+    const knowledge = data.initial_knowledge || data.new_knowledge || [];
+    if (knowledge.length > 0) knowledge.forEach(k => lines.push(formatLedgerLine(k)));
+    else lines.push('- (no entries yet)');
+    return lines.join('\n');
+}
+
+export function isHeaderLine(line) { return /\|/.test(line) && line.split('|').length >= 3 && !/^\s*-/.test(line); }
+export function findHeaderLineIdx(lines) { return lines.findIndex(isHeaderLine); }
+
+// ─── Knowledge Ledger section ────────────────────────────────────────────────
+
+/** Matches the ledger section header on an already-trimmed line. */
+const LEDGER_HEADER_RE = /^knowledge ledger:/i;
+/** The empty-ledger placeholder written by formatMajorEntry/buildPromotedContent. */
+const LEDGER_PLACEHOLDER = '- (no entries yet)';
+
+/** One ledger line: "- <fact> via <source> — <date>". */
+function formatLedgerLine(k) {
+    return `- ${k.fact} via ${k.source || 'unknown'}${k.date ? ' — ' + k.date : ''}`;
+}
+
+/**
+ * Index of every line that belongs to the ledger section, in order.
+ *
+ * The section is the run of "- " items following the header. Blank lines
+ * inside it are tolerated; it ends at the first non-blank line that is not an
+ * item — which is what keeps a trailing relationship block (or any later
+ * section) out of it. Same convention as buildDemotedContent.
+ */
+function ledgerItemIndices(lines, headerIdx) {
+    const idxs = [];
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (t === '') continue;
+        if (!t.startsWith('- ')) break;
+        idxs.push(i);
+    }
+    return idxs;
+}
+
+/**
+ * Insert new ledger lines at the end of the LEDGER SECTION — not the end of
+ * the entry.
+ *
+ * THE BUG THIS FIXES: both mergers used to `lines.push(...)`, which appends to
+ * the end of the array. That is the end of the ledger only when the ledger is
+ * the last thing in the entry. As soon as an entry carries a managed
+ * relationships block (relationship auto-extract, or any manual relationship
+ * edit that syncs one), new facts landed BELOW
+ * `<!-- mwt:relationships:end -->` — outside the section, where the Knowledge
+ * Ledger looks untouched to anyone reading the entry.
+ *
+ * The per-NPC paths (runNpcUpdate/runNpcEnrich/runDossierFieldRefresh) never
+ * showed the symptom because they stripRelationshipBlock() first, which is
+ * exactly why "hit Update on the Major tab" worked while the auto-scan did not.
+ *
+ * @param {string[]} lines — entry lines
+ * @param {Array<{fact:string, source?:string, date?:string}>} newKnowledge
+ * @returns {string[]} a new array; `lines` is not mutated
+ */
+export function appendLedgerLines(lines, newKnowledge) {
+    if (!newKnowledge?.length) return lines;
+    // Phase 1 seam S6 backstop: the seams S1–S5 pre-validate, but every
+    // ledger append funnels through here, so an invalid item from any future
+    // caller is dropped whole with a surfaced reason rather than corrupting
+    // the section.
+    const { items: safeKnowledge, rejected } = validateKnowledgeList(newKnowledge);
+    if (rejected.length > 0) {
+        console.warn('[MWT:Knowledge] field contract dropped invalid ledger items:',
+            rejected.map(r => `[${r.index}] ${r.reason}`).join('; '));
+    }
+    if (!safeKnowledge.length) return lines;
+    const formatted = safeKnowledge.map(formatLedgerLine);
+    const headerIdx = lines.findIndex(l => LEDGER_HEADER_RE.test(l.trim()));
+    // No section yet — start one at the end of the entry.
+    if (headerIdx === -1) return [...lines, '', 'Knowledge Ledger:', ...formatted];
+
+    const itemIdxs = ledgerItemIndices(lines, headerIdx);
+    const out = [...lines];
+    // "- (no entries yet)" describes an EMPTY ledger. Real facts replace it
+    // rather than stacking underneath it and contradicting it in the prompt.
+    if (itemIdxs.length === 1 && out[itemIdxs[0]].trim().toLowerCase() === LEDGER_PLACEHOLDER) {
+        out.splice(itemIdxs[0], 1, ...formatted);
+        return out;
+    }
+    const insertAt = (itemIdxs.length ? itemIdxs[itemIdxs.length - 1] : headerIdx) + 1;
+    out.splice(insertAt, 0, ...formatted);
+    return out;
+}
+
+export function buildUpdatedMinorContent(existingContent, fields) {
+    // Phase 1 seam S6 backstop: invalid field values never reach the entry —
+    // they are nulled (the merge skips null, keeping the existing line).
+    const { fields: safeFields, rejected } = validateFields(fields);
+    if (rejected.length > 0) {
+        console.warn('[MWT:Knowledge] field contract dropped invalid values:',
+            rejected.map(r => `${r.key} (${r.reason})`).join('; '));
+    }
+    const lines = existingContent.split('\n');
+    const headerIdx = findHeaderLineIdx(lines);
+    return lines.map((line, idx) => {
+        if (safeFields.tone != null && line.startsWith('Tone:')) return `Tone: ${safeFields.tone}`;
+        if (safeFields.perceived_as != null && line.startsWith('Perceived as:')) return `Perceived as: ${safeFields.perceived_as}`;
+        if (safeFields.descriptor != null && idx === headerIdx && headerIdx !== -1) { const parts = line.split('|').map(p => p.trim()); parts[2] = safeFields.descriptor; return parts.join(' | '); }
+        return line;
+    }).join('\n');
+}
+
+export function buildUpdatedMajorContent(existingContent, fields, newKnowledge) {
+    // Phase 1 seam S6 backstop — see buildUpdatedMinorContent.
+    const { fields: safeFields, rejected } = validateFields(fields);
+    if (rejected.length > 0) {
+        console.warn('[MWT:Knowledge] field contract dropped invalid values:',
+            rejected.map(r => `${r.key} (${r.reason})`).join('; '));
+    }
+    let lines = existingContent.split('\n');
+    const headerIdx = findHeaderLineIdx(lines);
+    lines = lines.map((line, idx) => {
+        if (safeFields?.tone != null && line.startsWith('Tone:')) return `Tone: ${safeFields.tone}`;
+        if (safeFields?.perceived_as != null && line.startsWith('Perceived as:')) return `Perceived as: ${safeFields.perceived_as}`;
+        if (safeFields?.descriptor != null && idx === headerIdx && headerIdx !== -1) { const parts = line.split('|').map(p => p.trim()); parts[2] = safeFields.descriptor; return parts.join(' | '); }
+        return line;
+    });
+    return appendLedgerLines(lines, newKnowledge).join('\n');
+}
+
+export function synthesizeMinorFromUpdate(name, fields) {
+    return [`${name} | unknown | ${fields?.descriptor || 'unknown'}`, `Tone: ${fields?.tone || 'unknown'}`,
+        `Perceived as: ${fields?.perceived_as || 'unknown'}`, `First seen: unknown`].join('\n');
+}
+
+export function synthesizeMajorFromUpdate(name, fields, newKnowledge) {
+    const lines = [`${name} | unknown | ${fields?.descriptor || 'unknown'}`, `Tone: ${fields?.tone || 'unknown'}`,
+        `Perceived as: ${fields?.perceived_as || 'unknown'}`, `First seen: unknown`, '', 'Knowledge Ledger:'];
+    if (newKnowledge?.length > 0) newKnowledge.forEach(k => lines.push(formatLedgerLine(k)));
+    else lines.push('- (no entries yet)');
+    return lines.join('\n');
+}
+
+/**
+ * Convert a scan record into the `fields` shape the update mergers consume.
+ *
+ * Handles both record shapes the scan produces: `update_*` records nest their
+ * values under `.fields`, `new_*` records carry them flat. Covers tone,
+ * perceived_as, descriptor AND every dossier field — the reclassification path
+ * used to copy only the first three, silently discarding role, appearance,
+ * secrets, agenda and the rest whenever a new_major turned out to describe an
+ * already-tracked NPC. `species` and `first_seen` are intentionally absent:
+ * they are creation-only and no merger updates them.
+ *
+ * @param {object} data — a scan record (new_* or update_*)
+ * @param {string} type — 'minor' | 'major'
+ * @returns {object} fields, with null for anything the record did not supply
+ */
+export function fieldsFromScanRecord(data, type) {
+    const src = (data && typeof data.fields === 'object' && data.fields !== null) ? data.fields : (data || {});
+    const pick = (k) => (src[k] === undefined ? null : src[k]);
+    const fields = {
+        tone: pick('tone'),
+        perceived_as: pick('perceived_as'),
+        descriptor: pick('descriptor'),
+    };
+    if (type === 'major') {
+        for (const f of DOSSIER_FIELDS) fields[f.key] = pick(f.key);
+    }
+    return fields;
+}
+
+/**
+ * Find this NPC's existing entry in the Knowledge book by label (read-only).
+ *
+ * @param {string} name — canonical NPC name
+ * @returns {Promise<{uid:number, label:string, content:string, exact:boolean, duplicates:number}|null>}
+ */
+export async function findKnowledgeEntryByName(name) {
+    if (!state.wiScript) return null;
+    try {
+        const wi = await state.wiScript.loadWorldInfo(getLorebookName());
+        const match = findEntryUidByNpcIdentity(wi?.entries || {}, name);
+        if (!match) return null;
+        return { ...match, content: wi.entries[match.uid]?.content ?? '' };
+    } catch { return null; }
+}
+
+export async function enrichStagingItem(item) {
+    if (!item) return;
+
+    // CREATE → UPDATE promotion (duplicate prevention, the visible half).
+    //
+    // A create proposal whose NPC ALREADY has an entry in the book would add a
+    // second one. That happens whenever the registry lost the pointer but the
+    // entry survived: an orphan (uid-less) record, a registry that was empty
+    // when the scan ran, or a stale uid the identity guard detached.
+    //
+    // writeToLorebook has a last-resort adopt-before-create backstop, but
+    // resolving it HERE is what makes it safe and legible: the item becomes a
+    // real update, so the user sees a diff against the actual entry and the
+    // merge preserves the existing dossier instead of overwriting it with a
+    // synthesized stub.
+    if (item.action === 'create' && item.uid == null && item.name) {
+        const found = await findKnowledgeEntryByName(item.name);
+        if (found) {
+            console.warn(
+                `[MWT:Knowledge] Staged create for "${item.name}" matches existing entry uid ${found.uid} ` +
+                `(labelled "${found.label}") — converting to an update so the entry is merged, not duplicated.`
+            );
+            item.uid = found.uid;
+            item.action = 'update';
+            item.adoptedUid = found.uid;
+            // Phase 1 (writer-inventory gap 3): the promotion synthesizes
+            // fields the same way buildStagingItems does, so it applies the
+            // same Growth ownership filter — this used to be the one path
+            // where scan fields reached a merge without it.
+            item.fields = item.fields || applyFieldOwnership(item.name, fieldsFromScanRecord(item.data, item.type));
+            item.newKnowledge = item.newKnowledge
+                || item.data?.initial_knowledge || item.data?.new_knowledge || [];
+            item.existingContent = null;
+            // Falls through to the normal update merge below.
+        }
+    }
+
+    if (item.action !== 'update' || item.existingContent !== null || item.uid == null) return;
+    // The item's name is the canonical registry key (buildStagingItems
+    // canonicalizes every category), so the label check inside
+    // loadEntryContent verifies uid ↔ NPC identity before this content is
+    // displayed or merged. A mismatch blocks the fetch (the placeholder text
+    // stays) instead of merging another character's dossier.
+    const existing = await loadEntryContent(item.uid, item.name);
+    if (existing !== null) {
+        item.existingContent = existing;
+        // Phase 1 seam S2: the shared field contract runs at the merge
+        // dispatch — every path into a merger (scan staging, create→update
+        // promotion, future callers) is validated here, so an invalid model
+        // value can never reach a formatter. Ownership is re-applied for the
+        // same reason. Invalid values are dropped whole with surfaced
+        // reasons; valid unrelated updates are retained.
+        const owned = applyFieldOwnership(item.name, item.fields || {});
+        const { fields: safeFields, rejected } = validateFields(owned);
+        const { items: safeKnowledge, rejected: knowledgeRejected } = validateKnowledgeList(item.newKnowledge || []);
+        if (rejected.length + knowledgeRejected.length > 0) {
+            item.contractRejections = [
+                ...(item.contractRejections || []),
+                ...rejected.map(r => ({ field: r.key, reason: r.reason })),
+                ...knowledgeRejected.map(r => ({ field: `new_knowledge[${r.index}]`, reason: r.reason })),
+            ];
+            console.warn(`[MWT:Knowledge] field contract dropped values for "${item.name}":`,
+                item.contractRejections.map(r => `${r.field} (${r.reason})`).join('; '));
+        }
+        item.fields = safeFields;
+        item.newKnowledge = safeKnowledge;
+        if (item.type === 'minor') {
+            item.mergedContent = buildUpdatedMinorContent(existing, item.fields || {});
+        } else if (item.type === 'major') {
+            // Use the dossier merger if the existing entry is a dossier OR the
+            // scan produced dossier fields (item.dossierMode / result.dossierMode).
+            const useDossier = isDossierEntry(existing) || item.dossierMode === true || item.fromDossierScan === true;
+            item.mergedContent = useDossier
+                ? buildUpdatedDossierContent(existing, item.fields || {}, item.newKnowledge || [])
+                : buildUpdatedMajorContent(existing, item.fields || {}, item.newKnowledge || []);
+        } else {
+            item.mergedContent = existing;
+        }
+        item.proposedContent = item.mergedContent || item.proposedContent;
+    }
+}
+
+export function buildPromotedContent(currentContent) {
+    const lines = currentContent.split('\n');
+    if (lines.some(l => l.trim().toLowerCase().startsWith('knowledge ledger:'))) return currentContent;
+    const insertIdx = lines.findIndex(l => l.trim().toLowerCase().startsWith('first seen:'));
+    if (insertIdx !== -1 && insertIdx + 1 < lines.length && lines[insertIdx + 1].trim() === '') lines.splice(insertIdx + 2, 0, '', 'Knowledge Ledger:', '- (no entries yet)');
+    else lines.push('', 'Knowledge Ledger:', '- (no entries yet)');
+    return lines.join('\n');
+}
+
+export function buildDemotedContent(currentContent) {
+    const lines = currentContent.split('\n');
+    const filtered = [];
+    let skipSection = false;
+    for (const line of lines) {
+        if (line.trim().toLowerCase().startsWith('knowledge ledger:')) { skipSection = true; continue; }
+        if (skipSection && line.startsWith('- ')) continue;
+        if (line.trim() !== '' && !line.startsWith('- ')) skipSection = false;
+        filtered.push(line);
+    }
+    while (filtered.length > 0 && filtered[filtered.length - 1].trim() === '') filtered.pop();
+    return filtered.join('\n');
+}
+
+// ─── Dossier formatters (Dossier Mode) ───────────────────────────────────────
+// Rich-field entry formatters used when Knowledge Tracker Dossier Mode is ON.
+
+/** Ordered list of dossier fields for consistent formatting. */
+export const DOSSIER_FIELDS = [
+    { key: 'role',         label: 'Role' },
+    { key: 'where_to_find', label: 'Where to Find' },
+    { key: 'appearance',   label: 'Appearance' },
+    { key: 'voice',        label: 'Voice' },
+    { key: 'background',   label: 'Background' },
+    { key: 'personality',  label: 'Personality' },
+    { key: 'read_on_pc',   label: 'Read on PC' },
+    { key: 'agenda',       label: 'Current Agenda' },
+    { key: 'secrets',      label: 'Secrets' },
+    { key: 'canon_lock',   label: 'Canon Lock' },
+    { key: 'image_tags',   label: 'Image Tags' },
+];
+
+/** Marker prepended to dossier-format entries so we can detect the format. */
+export const DOSSIER_MARKER = '[Dossier]';
+
+/**
+ * Coerce a dossier field value to a readable string. Some models return
+ * structured values (e.g. secrets as {tier1: "...", tier2: "..."} or canon_lock
+ * as an array of facts) instead of plain strings. Without this, template
+ * interpolation produces "[object Object]".
+ */
+export function stringifyDossierValue(val) {
+    if (val == null) return '';
+    if (typeof val === 'string') return val;
+    if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+    if (Array.isArray(val)) {
+        // Arrays of strings → join with semicolons; arrays of objects →
+        // stringify each element recursively and join.
+        return val.map(v => stringifyDossierValue(v)).filter(Boolean).join('; ');
+    }
+    if (typeof val === 'object') {
+        // Objects with tier keys → "Tier 1: ... | Tier 2: ... | Tier 3: ..."
+        // General objects → "key: value; key: value"
+        const entries = Object.entries(val)
+            .filter(([, v]) => v != null && v !== '')
+            .map(([k, v]) => `${k}: ${stringifyDossierValue(v)}`);
+        return entries.join(' | ');
+    }
+    return String(val);
+}
+
+export function formatDossierEntry(data) {
+    data = validateCreationHeader(data).data;
+    const lines = [
+        `${DOSSIER_MARKER} ${data.name || 'Unknown'} | ${data.species || 'Unknown'} | ${data.descriptor || ''}`,
+        `Tone: ${data.tone || 'unknown'}`,
+        `Perceived as: ${data.perceived_as || 'unknown'}`,
+        `First seen: ${data.first_seen || 'unknown'}`,
+    ];
+    for (const f of DOSSIER_FIELDS) {
+        const val = stringifyDossierValue(data[f.key]);
+        if (val) lines.push(`${f.label}: ${val}`);
+    }
+    lines.push('', 'Knowledge Ledger:');
+    const knowledge = data.initial_knowledge || data.new_knowledge || [];
+    if (knowledge.length > 0) knowledge.forEach(k => lines.push(formatLedgerLine(k)));
+    else lines.push('- (no entries yet)');
+    return lines.join('\n');
+}
+
+/** Is this lorebook content in dossier format? */
+export function isDossierEntry(content) {
+    return typeof content === 'string' && content.startsWith(DOSSIER_MARKER);
+}
+
+/**
+ * Count how many dossier fields are present (non-empty) in an entry.
+ * Used by the UI to show whether an entry needs enrichment.
+ */
+export function countDossierFields(content) {
+    if (!content) return 0;
+    let count = 0;
+    for (const f of DOSSIER_FIELDS) {
+        const re = new RegExp(`^${f.label}:\\s*(.+)$`, 'im');
+        const m = content.match(re);
+        if (m && m[1].trim() && m[1].trim().toLowerCase() !== 'unknown') count++;
+    }
+    return count;
+}
+
+/**
+ * Extract each dossier field's current raw value from an entry, keyed by field
+ * key. Missing/absent fields read as null. Used by the per-field refresh UI
+ * (the 🎯 Fields picker) and to build the <refresh_fields> request block, so
+ * the model sees the exact text it is re-deriving.
+ *
+ * @param {string} content
+ * @returns {Record<string, string|null>} field key → trimmed value or null
+ */
+export function extractDossierFieldValues(content) {
+    const values = {};
+    if (typeof content !== 'string') {
+        for (const f of DOSSIER_FIELDS) values[f.key] = null;
+        return values;
+    }
+    for (const f of DOSSIER_FIELDS) {
+        const re = new RegExp(`^${f.label}:\\s*(.*)$`, 'im');
+        const m = content.match(re);
+        const raw = m ? m[1].trim() : '';
+        values[f.key] = raw || null;
+    }
+    return values;
+}
+
+/**
+ * Apply a partial dossier update (from DOSSIER_UPDATE_PROMPT result) to existing
+ * content. Only non-null fields are replaced; unknown fields are ignored.
+ */
+export function buildUpdatedDossierContent(existingContent, fields, newKnowledge) {
+    // Phase 1 seam S6 backstop: one more validation pass at the universal
+    // dossier choke point, so no future caller can merge an invalid model
+    // value even if it bypasses seams S1–S5. Rejection keeps the existing
+    // line (the merge below skips null) — values are never sliced.
+    const { fields: safeFields, rejected } = validateFields(fields);
+    if (rejected.length > 0) {
+        console.warn('[MWT:Knowledge] field contract dropped invalid values:',
+            rejected.map(r => `${r.key} (${r.reason})`).join('; '));
+    }
+    let lines = existingContent.split('\n');
+    const headerIdx = findHeaderLineIdx(lines);
+
+    lines = lines.map((line, idx) => {
+        if (safeFields?.tone != null && line.startsWith('Tone:')) return `Tone: ${safeFields.tone}`;
+        if (safeFields?.perceived_as != null && line.startsWith('Perceived as:')) return `Perceived as: ${safeFields.perceived_as}`;
+        if (safeFields?.descriptor != null && idx === headerIdx && headerIdx !== -1) {
+            const parts = line.split('|').map(p => p.trim());
+            // Preserve the dossier marker if present
+            const markerMatch = parts[0].match(/^\[Dossier\]\s*(.*)$/);
+            parts[0] = markerMatch ? `${DOSSIER_MARKER} ${markerMatch[1]}` : parts[0];
+            parts[2] = safeFields.descriptor;
+            return parts.join(' | ');
+        }
+        // Dossier fields — match by label prefix
+        for (const f of DOSSIER_FIELDS) {
+            if (safeFields?.[f.key] != null && line.startsWith(`${f.label}:`)) {
+                return `${f.label}: ${stringifyDossierValue(safeFields[f.key])}`;
+            }
+        }
+        return line;
+    });
+
+    // Ensure the header carries the [Dossier] marker so future updates keep
+    // using the dossier format — an entry first created in the compact format
+    // and later updated under Dossier Mode would otherwise lose its identity.
+    if (headerIdx !== -1 && !lines[headerIdx].startsWith(DOSSIER_MARKER)) {
+        lines[headerIdx] = `${DOSSIER_MARKER} ${lines[headerIdx]}`;
+    }
+
+    // Append any new dossier fields that don't yet exist in the entry
+    // (insert them before the Knowledge Ledger section). Increment the splice
+    // index after each insert so the fields land in canonical DOSSIER_FIELDS
+    // order rather than reverse.
+    const ledgerIdx = lines.findIndex(l => l.trim().toLowerCase().startsWith('knowledge ledger:'));
+    let insertIdx = ledgerIdx !== -1 ? ledgerIdx : lines.length;
+    for (const f of DOSSIER_FIELDS) {
+        const rawVal = safeFields?.[f.key];
+        if (rawVal == null) continue;
+        const val = stringifyDossierValue(rawVal);
+        if (!val) continue;
+        const prefix = `${f.label}:`;
+        const exists = lines.some(l => l.startsWith(prefix));
+        if (!exists) { lines.splice(insertIdx, 0, `${f.label}: ${val}`); insertIdx++; }
+    }
+
+    return appendLedgerLines(lines, newKnowledge).join('\n');
+}
+
+// ─── Scan entry projection ───────────────────────────────────────────────────
+//
+// What a tracked NPC's existing entry looks like INSIDE a scan prompt. It is a
+// bounded projection, not a copy — the same rule the relationship block
+// follows (see "Compact relationship projection" in relationships.js).
+//
+// It replaces a flat `existing.slice(0, 800)`. That cut was the second half of
+// the missing-ledger report: a real dossier passes 800 characters somewhere
+// around Appearance, so the model never saw `Knowledge Ledger:` at all — it
+// cannot add to a section it does not know exists, and the only other ledger
+// text in the scan prompt is a prohibition. Worse, the fields past the cut
+// (Read on PC, Current Agenda, …) read as MISSING, and the prompt's
+// "CRITICAL — FILL MISSING FIELDS" rule then had the scan rewrite them on
+// every single run. That is exactly the churn testers reported.
+//
+// So: keep every field LABEL (the model needs to see what is already filled),
+// clip long values, and always carry the ledger's recent tail.
+
+/** Per-value character cap inside a scan projection. */
+const SCAN_FIELD_CAP = 120;
+/** How many of the most recent ledger lines a scan projection carries. */
+const SCAN_LEDGER_TAIL = 5;
+/** Backstop against a pathological entry: body lines kept before the ledger. */
+const SCAN_BODY_LINE_CAP = 24;
+
+/**
+ * Project an entry for the "Already Tracked NPCs" section of a scan prompt.
+ *
+ * @param {string} content — the raw lorebook entry
+ * @param {object} [opts] — caps, overridable for tests
+ * @returns {string} the projection ('' when there is nothing to show)
+ */
+export function buildScanEntryProjection(content, {
+    fieldCap = SCAN_FIELD_CAP,
+    ledgerTail = SCAN_LEDGER_TAIL,
+    bodyLineCap = SCAN_BODY_LINE_CAP,
+} = {}) {
+    if (!content || typeof content !== 'string') return '';
+    // The relationships block is a projection of the relationship graph, which
+    // has its own extractor. It is pure prompt cost here.
+    const lines = stripRelationshipBlock(content).split('\n');
+    const headerIdx = lines.findIndex(l => LEDGER_HEADER_RE.test(l.trim()));
+    const body = (headerIdx === -1 ? lines : lines.slice(0, headerIdx)).slice(0, bodyLineCap);
+    // The ellipsis is load-bearing: the prompt tells the model a clipped value
+    // is present-but-abbreviated, NOT missing.
+    const clip = (s) => (s.length > fieldCap ? `${s.slice(0, fieldCap).trimEnd()}…` : s);
+
+    const out = [];
+    for (const line of body) {
+        const t = line.trim();
+        if (t === '') { if (out.length && out[out.length - 1] !== '') out.push(''); continue; }
+        const m = t.match(/^([^:]{1,40}):\s*(.*)$/);
+        out.push(m ? `${m[1]}: ${clip(m[2])}` : clip(t));
+    }
+    while (out.length && out[out.length - 1] === '') out.pop();
+
+    if (headerIdx !== -1) {
+        const items = ledgerItemIndices(lines, headerIdx).map(i => lines[i].trim());
+        out.push('', 'Knowledge Ledger:');
+        const dropped = Math.max(0, items.length - ledgerTail);
+        if (dropped > 0) out.push(`- …(${dropped} older ledger line${dropped === 1 ? '' : 's'} not shown)`);
+        for (const item of items.slice(-ledgerTail)) out.push(clip(item));
+    }
+    return out.join('\n');
+}
+
+/**
+ * Extract identity fields (Tone, Perceived as, Voice, Personality) from a
+ * dossier entry, returning them separately from the remainder of the content.
+ *
+ * Used by the Interiority thoughts call (v2 §17) to build a `<character_core>`
+ * block for non-profiled NPCs — lifting personality/voice/tone out of the
+ * dossier without duplicating format parsing. One owner of the dossier format
+ * (this module), riding the already-sanctioned interiority→knowledge import.
+ *
+ * The fields and remainder PARTITION the entry: extracted fields do NOT appear
+ * in `remainder`, so `<character_core>` and `<knowledge_entry>` carry different
+ * content rather than overlapping.
+ *
+ * @param {string} content — lorebook entry content (dossier or compact format)
+ * @returns {{fields: Object<string,string>, remainder: string}}
+ *   `fields` is a label→value map (e.g. `{ Tone: '...', Voice: '...' }`);
+ *   `remainder` is the entry text with identity-field lines removed.
+ */
+export function extractIdentityFields(content) {
+    if (!content || typeof content !== 'string') return { fields: {}, remainder: '' };
+    const identityLabels = ['Tone', 'Perceived as', 'Voice', 'Personality'];
+    const lines = content.split('\n');
+    const fields = {};
+    const remainderLines = [];
+
+    for (const line of lines) {
+        let matched = false;
+        for (const label of identityLabels) {
+            if (line.startsWith(`${label}:`)) {
+                const val = line.slice(label.length + 1).trim();
+                if (val && val.toLowerCase() !== 'unknown') fields[label] = val;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) remainderLines.push(line);
+    }
+
+    // Collapse multiple blank lines left by extraction
+    const remainder = remainderLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { fields, remainder };
+}
+
+export function synthesizeDossierFromUpdate(name, fields, newKnowledge) {
+    const data = {
+        name,
+        species: 'Unknown',
+        tone: fields?.tone || 'unknown',
+        perceived_as: fields?.perceived_as || 'unknown',
+        descriptor: fields?.descriptor || 'unknown',
+        first_seen: 'unknown',
+        initial_knowledge: newKnowledge || [],
+    };
+    for (const f of DOSSIER_FIELDS) {
+        if (fields?.[f.key] != null) data[f.key] = fields[f.key];
+    }
+    return formatDossierEntry(data);
+}
+
+// ─── Validation ──────────────────────────────────────────────────────────────
+
+export function validateStateOutput(originalEntry, output) {
+    if (!output || !output.trim()) return { ok: false, reason: 'empty output' };
+    const leakPatterns = [
+        { re: /<recent_messages>/i, label: '<recent_messages> tag' }, { re: /<current_entry>/i, label: '<current_entry> tag' },
+        { re: /<entity>/i, label: '<entity> tag' }, { re: /^#+\s*Recent\s+Messages/im, label: '"### Recent Messages" heading' },
+        { re: /^#+\s*Current\s+Entry/im, label: '"### Current Entry" heading' },
+    ];
+    for (const { re, label } of leakPatterns) { if (re.test(output)) return { ok: false, reason: `output contains ${label}` }; }
+    const lineHeaderRe = /^([^\s:#][^:]*?):/gm;
+    const origHeaders = new Set([...originalEntry.matchAll(lineHeaderRe)].map(m => m[1].trim().toLowerCase()));
+    const speakerLineRe = /^([A-Z][\w .'-]{0,30}):\s+\S.{40,}$/gm;
+    const isUnknownPrefix = (m) => !origHeaders.has(m[1].trim().toLowerCase());
+    const outputLines = output.split('\n');
+    let maxRun = 0, currentRun = 0;
+    for (const line of outputLines) {
+        speakerLineRe.lastIndex = 0;
+        const m = speakerLineRe.exec(line);
+        if (m && isUnknownPrefix(m)) { currentRun++; if (currentRun > maxRun) maxRun = currentRun; } else currentRun = 0;
+    }
+    if (maxRun >= 3) return { ok: false, reason: 'output appears to contain a chat transcript' };
+    const fieldRe = /^([A-Z][A-Z0-9_]+):/gm;
+    const origFields = new Set([...originalEntry.matchAll(fieldRe)].map(m => m[1]));
+    const newFields = new Set([...output.matchAll(fieldRe)].map(m => m[1]));
+    if (origFields.size > 0) {
+        const added = [...newFields].filter(f => !origFields.has(f));
+        const dropped = [...origFields].filter(f => !newFields.has(f));
+        if (added.length > 0) return { ok: false, reason: `added unauthorized fields: ${added.join(', ')}` };
+        if (dropped.length > 0) return { ok: false, reason: `dropped required fields: ${dropped.join(', ')}` };
+    }
+    if (output.length > originalEntry.length * 4 + 2000) return { ok: false, reason: 'output too long' };
+    return { ok: true };
+}
+
+// ─── Scan ────────────────────────────────────────────────────────────────────
+
+/**
+ * Scan recent messages for new/updated NPCs.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.trigger=null] — cause of the call; threaded down so
+ *   the coordinator classifies cadence-driven auto scans as background work
+ *   (trigger-less manual paths stay foreground by design)
+ */
+export async function runScan({ trigger = null } = {}) {
+    if (!hasValidSettings()) throw new Error('No API connection configured.');
+    const settings = getSettings();
+    const dossierMode = settings.dossierMode === true;
+    const registry = getRegistry();
+    const knownNames = Object.keys(registry).filter(name => registry[name].uid !== null && registry[name].uid !== undefined);
+    const recentMessages = getRecentMessages();
+    const worldState = getWorldStateFactual();
+    const chronicle = getLatestChronicleEntry();
+    if (!recentMessages) throw new Error('No recent messages to scan.');
+
+    // Build the "Already Tracked NPCs" section. In Dossier Mode, include the
+    // existing entry content (truncated) so the model can see which dossier
+    // fields are missing and fill them in rather than returning all-null.
+    let knownSection;
+    if (knownNames.length > 0) {
+        const lines = [];
+        for (const name of knownNames) {
+            const info = registry[name];
+            lines.push(`- ${name} [${info.type}]`);
+            // In dossier mode, include existing content for major NPCs so the
+            // scan can detect and fill missing dossier fields.
+            if (dossierMode && info.type === 'major' && info.uid != null) {
+                try {
+                    const existing = await loadEntryContent(info.uid, name);
+                    // A bounded projection, not a prefix: every field label
+                    // survives and the ledger's recent tail is always carried.
+                    // See buildScanEntryProjection for why the old
+                    // slice(0, 800) made the scan blind to the ledger.
+                    const projected = buildScanEntryProjection(existing);
+                    if (projected) lines.push(`<existing_entry>\n${projected}\n</existing_entry>`);
+                } catch { /* ignore load errors */ }
+            }
+        }
+        knownSection = `<already_tracked_npcs>\n${lines.join('\n')}\n</already_tracked_npcs>`;
+    } else {
+        knownSection = '<already_tracked_npcs>\nNone yet.\n</already_tracked_npcs>';
+    }
+
+    // trackMainCharAsNpc: when ON, exclude only the human user ({{user}}) so the
+    // AI-played cast ({{char}} and any group members) becomes a valid NPC target
+    // — letting non-scenario cards flow into the registry (growth + relationships
+    // then apply to them). When OFF, legacy behaviour excludes the whole main cast.
+    const trackMain = settings.trackMainCharAsNpc === true;
+    const playerNames = trackMain
+        ? getUserNames({ lower: false })
+        : getPlayerNames({ lower: false, includeFirstChat: true });
+    const playerSection = playerNames.size > 0 ? `<player_names_exclude>\n${[...playerNames].map(n => `- ${n}`).join('\n')}\n</player_names_exclude>` : '';
+    const userContent = [knownSection, '', playerSection, '', worldState ? `<world_state>\n${worldState}\n</world_state>` : '', '', chronicle ? `<chronicle>\n${chronicle}\n</chronicle>` : '', '', '<recent_messages>', recentMessages, '</recent_messages>', '', '='.repeat(60), 'Scan for NPCs. Output only JSON.'].filter(s => s !== null && s !== '').join('\n');
+    // The cast rule is composed into the SYSTEM prompt rather than added as a
+    // user-turn note — the rule it replaces is categorical, and a contradicting
+    // note in the user turn loses to it. See buildScanSystemPrompt.
+    const systemPrompt = buildScanSystemPrompt({ dossier: dossierMode, trackMainCharAsNpc: trackMain });
+
+    // Attempt the scan up to two times. If the first response fails to parse
+    // (typically because it was truncated by max_tokens), retry once — the
+    // model often succeeds on a second pass, and parseJsonLenient will salvage
+    // many truncated responses anyway.
+    let lastErr = null;
+    let lastPreview = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const raw = await ktFetchFromApi(systemPrompt, userContent, { trigger });
+        const cleaned = normaliseOutput(raw);
+        try {
+            const result = parseJsonLenient(cleaned);
+            const playerSet = new Set([...playerNames].map(n => n.toLowerCase()));
+            const notPlayer = (entry) => entry && entry.name && !playerSet.has(String(entry.name).toLowerCase());
+            return {
+                dossierMode,
+                new_minor: Array.isArray(result.new_minor) ? result.new_minor.filter(notPlayer) : [],
+                new_major: Array.isArray(result.new_major) ? result.new_major.filter(notPlayer) : [],
+                update_minor: Array.isArray(result.update_minor) ? result.update_minor.filter(notPlayer) : [],
+                update_major: Array.isArray(result.update_major) ? result.update_major.filter(notPlayer) : [],
+            };
+        } catch (err) {
+            lastErr = err;
+            lastPreview = cleaned.slice(0, 120);
+            console.warn(`[MWT:Knowledge] Scan JSON parse failed (attempt ${attempt}): ${err.message}. Preview: "${lastPreview}"`);
+            if (attempt < 2) continue;
+        }
+    }
+    throw new Error(`Model did not return valid JSON after 2 attempts. Last error: ${lastErr?.message || 'unknown'}. Preview: "${lastPreview}"`);
+}
+
+// ─── State update ────────────────────────────────────────────────────────────
+
+export async function runStateUpdate(name, uid, { trigger = null } = {}) {
+    if (!hasValidSettings()) throw new Error('No API connection configured.');
+    const loaded = await loadStateTrackerEntry(uid);
+    if (!loaded) throw new Error(`Could not load state entry for "${name}".`);
+    if (!loaded.comment.startsWith(TRACKER_SENTINEL)) throw new Error(`UID ${uid} missing sentinel.`);
+    const recentMessages = getRecentMessages();
+    if (!recentMessages) throw new Error('No recent messages.');
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const userContent = attempt === 1
+            ? [`<entity>${name}</entity>`, '', '<current_entry>', loaded.content, '</current_entry>', '', '<recent_messages>', recentMessages, '</recent_messages>', '', 'Output the updated entry.'].join('\n')
+            : [`<entity>${name}</entity>`, '', '<current_entry>', loaded.content, '</current_entry>', '', '<recent_messages>', recentMessages, '</recent_messages>', '', `<previous_attempt_rejected>Reason: ${lastError}</previous_attempt_rejected>`, '', 'Try again. Output ONLY the updated entry.'].join('\n');
+        const raw = await ktFetchFromApi(STATE_UPDATE_PROMPT, userContent, { trigger });
+        const cleaned = normaliseOutput(raw);
+        const validation = validateStateOutput(loaded.content, cleaned);
+        if (validation.ok) return { currentContent: loaded.content, merged: cleaned, unchanged: cleaned.trim() === loaded.content.trim(), attempts: attempt };
+        lastError = validation.reason;
+    }
+    throw new Error(`Output validation failed: ${lastError}`);
+}
+
+export async function runNpcUpdate(name, uid) {
+    if (!hasValidSettings()) throw new Error('No API connection configured.');
+    // Label-verified load: a uid pointing at another NPC's entry must refuse
+    // to load rather than feed that character's dossier in as update context.
+    const rawContent = await loadEntryContent(uid, name);
+    if (!rawContent) throw new Error(`Could not load entry for "${name}".`);
+    const currentContent = stripRelationshipBlock(rawContent);
+    const recentMessages = getRecentMessages();
+    const worldState = getWorldStateFactual();
+    if (!recentMessages) throw new Error('No recent messages.');
+    const userContent = [`<entity>${name}</entity>`, `<current_entry>\n${currentContent}\n</current_entry>`, '', worldState ? `<world_state>\n${worldState}\n</world_state>` : '', '', '<recent_messages>', recentMessages, '</recent_messages>', '', '='.repeat(60), `Identify new info about ${name}. Output only JSON.`].filter(Boolean).join('\n');
+    // Use the dossier update prompt when the existing entry is a dossier, or
+    // when dossier mode is enabled in settings (so new fields get captured).
+    const settings = getSettings();
+    const useDossier = isDossierEntry(currentContent) || settings.dossierMode === true;
+    const systemPrompt = useDossier ? DOSSIER_UPDATE_PROMPT : NPC_UPDATE_PROMPT;
+
+    // Retry loop — mirrors runStateUpdate's 2-attempt pattern. A single
+    // truncated response (max_tokens cut off) would throw from
+    // parseJsonLenient with no recovery; the retry gives the model a second
+    // chance to produce valid JSON.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        let raw, cleaned, result;
+        try {
+            const fetchContent = attempt === 1
+                ? userContent
+                : userContent + `\n\n[REMINDER: Your previous response was truncated or invalid JSON. Output ONLY valid JSON, no prose.]`;
+            raw = await ktFetchFromApi(systemPrompt, fetchContent);
+            cleaned = normaliseOutput(raw);
+            result = parseJsonLenient(cleaned);
+        } catch (err) {
+            // Coordinator cancellation (TODO §1): an aborted/retired call must
+            // be rethrown immediately, never retried. A retry would submit a
+            // FRESH job at the current epoch, which the chat-scope retirement
+            // can no longer cancel — a second request spent on the old chat's
+            // prompt after the user already switched. isCancellation() covers
+            // both the coordinator's marked JobCancelledError and the native
+            // AbortError a mid-wire abort produces.
+            if (isCancellation(err)) throw err;
+            lastError = err;
+            console.warn(`[MWT:Knowledge] runNpcUpdate JSON parse failed (attempt ${attempt}): ${err.message}`);
+            if (attempt < 2) continue;
+            throw new Error(`Model did not return valid JSON after 2 attempts. Last error: ${lastError?.message || 'unknown'}`);
+        }
+
+        // Slice 2 guardrail: if this NPC has an evidence file (growth profile
+        // exists), the personality field is OWNED by the growth profile system,
+        // not DOSSIER_UPDATE_PROMPT. Null it out here so the two systems never
+        // touch the same field — the hard structural partition from
+        // NPC_GROWTH_BLUEPRINT.md §"The split-brain resolution". This prevents
+        // DOSSIER_UPDATE_PROMPT from re-deriving personality from its own prior
+        // prose (the telephone loop) for profiled NPCs.
+        //
+        // Guard against `result.fields` being a truthy non-object (e.g. a
+        // string) before assigning to it — a truthiness check alone would
+        // throw a TypeError on a primitive.
+        if (useDossier && result.fields && typeof result.fields === 'object' && !Array.isArray(result.fields) && hasEvidenceFile(name)) {
+            result.fields.personality = null;
+        }
+
+        // Phase 1 seam S3: the shared field contract — invalid values are
+        // dropped whole (the existing entry keeps its old line), valid
+        // unrelated updates are retained, and every rejection is surfaced
+        // with a field-specific reason on the returned result.
+        const { fields: safeFields, rejected: fieldRejections } = validateFields(result.fields || {});
+        const { items: safeKnowledge, rejected: knowledgeRejections } = validateKnowledgeList(result.new_knowledge || []);
+        const contractRejections = [
+            ...fieldRejections.map(r => ({ field: r.key, reason: r.reason })),
+            ...knowledgeRejections.map(r => ({ field: `new_knowledge[${r.index}]`, reason: r.reason })),
+        ];
+        if (contractRejections.length > 0) {
+            console.warn(`[MWT:Knowledge] field contract dropped values for "${name}":`,
+                contractRejections.map(r => `${r.field} (${r.reason})`).join('; '));
+        }
+
+        const merged = useDossier
+            ? buildUpdatedDossierContent(currentContent, safeFields, safeKnowledge)
+            : buildUpdatedMajorContent(currentContent, safeFields, safeKnowledge);
+        return {
+            currentContent, merged, fields: safeFields, newKnowledge: safeKnowledge, dossierMode: useDossier,
+            ...(contractRejections.length > 0 ? { contractRejections } : {}),
+        };
+    }
+}
+
+// ─── Dossier enrichment ──────────────────────────────────────────────────────
+
+/**
+ * Enrich a single NPC's entry to a complete dossier. Loads the existing entry,
+ * sends it with full chat history to DOSSIER_ENRICH_PROMPT, and produces a
+ * staging item with the fully-filled dossier content.
+ *
+ * Unlike runNpcUpdate (which only captures *changes*), this function asks the
+ * model to fill in ALL missing dossier fields, making it the primary way to
+ * upgrade a compact-format entry to a full dossier or to complete a partial one.
+ *
+ * @param {string} name - NPC name
+ * @param {number} uid - Lorebook UID
+ * @returns {Promise<{currentContent: string, merged: string, fields: object, newKnowledge: array, dossierMode: boolean}>}
+ */
+export async function runNpcEnrich(name, uid) {
+    if (!hasValidSettings()) throw new Error('No API connection configured.');
+    const rawContent = await loadEntryContent(uid, name);
+    if (!rawContent) throw new Error(`Could not load entry for "${name}".`);
+    const currentContent = stripRelationshipBlock(rawContent);
+    const recentMessages = getRecentMessages(50);
+    const worldState = getWorldStateFactual();
+    const chronicle = getLatestChronicleEntry();
+    if (!recentMessages) throw new Error('No recent messages.');
+
+    const userContent = [
+        `<entity>${name}</entity>`,
+        `<current_entry>\n${currentContent}\n</current_entry>`,
+        '',
+        worldState ? `<world_state>\n${worldState}\n</world_state>` : '',
+        chronicle ? `<chronicle>\n${chronicle}\n</chronicle>` : '',
+        '',
+        '<recent_messages>',
+        recentMessages,
+        '</recent_messages>',
+        '',
+        '='.repeat(60),
+        `Write a COMPLETE dossier for ${name}. Fill every field. Output only JSON.`,
+    ].filter(Boolean).join('\n');
+
+    // Retry loop — mirrors runNpcUpdate and runStateUpdate's 2-attempt pattern.
+    // A truncated response (max_tokens cut off) would throw from
+    // parseJsonLenient with no recovery; the retry gives the model a second
+    // chance to produce valid JSON.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        let raw, cleaned, result;
+        try {
+            const fetchContent = attempt === 1
+                ? userContent
+                : userContent + `\n\n[REMINDER: Your previous response was truncated or invalid JSON. Output ONLY valid JSON, no prose.]`;
+            raw = await ktFetchFromApi(DOSSIER_ENRICH_PROMPT, fetchContent);
+            cleaned = normaliseOutput(raw);
+            result = parseJsonLenient(cleaned);
+        } catch (err) {
+            // Coordinator cancellation — see runNpcUpdate's catch above: an
+            // aborted call is rethrown, never retried at a fresh epoch.
+            if (isCancellation(err)) throw err;
+            lastError = err;
+            console.warn(`[MWT:Knowledge] runNpcEnrich JSON parse failed (attempt ${attempt}): ${err.message}`);
+            if (attempt < 2) continue;
+            throw new Error(`Model did not return valid JSON after 2 attempts. Last error: ${lastError?.message || 'unknown'}`);
+        }
+
+        // Build the complete dossier content from the enrich result. We use the
+        // dossier merger which will replace existing fields and add missing ones.
+        // new_knowledge is APPENDED to the ledger, never a replacement — the
+        // prompt asks for new facts only (see DOSSIER_ENRICH_PROMPT).
+        //
+        // Phase 1 seam S4: the shared field contract runs beside the ownership
+        // filter — invalid values are dropped whole with surfaced reasons, so
+        // an overlong or malformed model value can never reach the entry.
+        const owned = applyFieldOwnership(name, result.fields || {});
+        const { fields: safeFields, rejected: fieldRejections } = validateFields(owned);
+        const { items: safeKnowledge, rejected: knowledgeRejections } = validateKnowledgeList(result.new_knowledge || []);
+        const contractRejections = [
+            ...fieldRejections.map(r => ({ field: r.key, reason: r.reason })),
+            ...knowledgeRejections.map(r => ({ field: `new_knowledge[${r.index}]`, reason: r.reason })),
+        ];
+        if (contractRejections.length > 0) {
+            console.warn(`[MWT:Knowledge] field contract dropped values for "${name}":`,
+                contractRejections.map(r => `${r.field} (${r.reason})`).join('; '));
+        }
+        const merged = buildUpdatedDossierContent(currentContent, safeFields, safeKnowledge);
+        return {
+            currentContent,
+            merged,
+            fields: safeFields,
+            newKnowledge: safeKnowledge,
+            dossierMode: true,
+            ...(contractRejections.length > 0 ? { contractRejections } : {}),
+        };
+    }
+}
+
+// ─── Dossier per-field refresh (TODO §3) ─────────────────────────────────────
+
+/**
+ * Filter a user/UI-supplied list of dossier field keys down to the ones a
+ * model-driven field refresh may actually touch, enforcing the two ownership
+ * boundaries from the TODO:
+ *
+ *   1. `canon_lock` is user-authored immutable canon — ALWAYS excluded, never
+ *      auto-overwritten by any generation path.
+ *   2. For NPCs with a growth profile, `personality` is owned by the
+ *      evidence/growth system (the `hasEvidenceFile(name)` partition from
+ *      NPC_GROWTH_BLUEPRINT.md §"The split-brain resolution") — excluded so a
+ *      field-scoped refresh cannot reintroduce the telephone loop.
+ *
+ * Unknown keys and duplicates are dropped; the result keeps canonical
+ * DOSSIER_FIELDS order.
+ *
+ * @param {string[]|string} fieldKeys — requested field keys (raw UI input)
+ * @param {string} name — canonical NPC name (drives the growth check)
+ * @returns {{requested: string[], skipped: Array<{key: string, reason: string}>}}
+ */
+export function sanitizeDossierRefreshFields(fieldKeys, name) {
+    const knownKeys = DOSSIER_FIELDS.map(f => f.key);
+    const growthOwnsPersonality = hasEvidenceFile(name);
+    const requested = [];
+    const skipped = [];
+    const seen = new Set();
+    const input = Array.isArray(fieldKeys) ? fieldKeys : [fieldKeys];
+    for (const key of input) {
+        if (typeof key !== 'string' || !key) continue;
+        if (!knownKeys.includes(key)) {
+            skipped.push({ key, reason: 'not a dossier field' });
+            continue;
+        }
+        if (seen.has(key)) continue; // duplicate — first occurrence wins
+        if (key === 'canon_lock') {
+            skipped.push({ key, reason: 'canon_lock is user-authored canon — edit it manually; it is never model-refreshed' });
+            continue;
+        }
+        if (key === 'personality' && growthOwnsPersonality) {
+            skipped.push({ key, reason: 'personality is owned by the Growth profile system for this NPC (see 🌱 Growth)' });
+            continue;
+        }
+        seen.add(key);
+        requested.push(key);
+    }
+    requested.sort((a, b) => knownKeys.indexOf(a) - knownKeys.indexOf(b));
+    return { requested, skipped };
+}
+
+/**
+ * Refresh ONLY specific dossier fields of one NPC (TODO §3 "Per-field / partial
+ * dossier refresh"). The World State delta-mode concept applied to a single
+ * NPC's dossier: the request lists the exact fields (with their current values)
+ * in a <refresh_fields> block, DOSSIER_FIELD_REFRESH_PROMPT re-derives just
+ * those, and the response is scoped to the requested keys before merging —
+ * everything else in the entry is preserved byte-for-byte by
+ * buildUpdatedDossierContent's null-skipping merge.
+ *
+ * Like runNpcUpdate: label-verified load (a uid pointing at another NPC's
+ * entry refuses to run), relationship block stripped, 2-attempt retry on
+ * invalid JSON. The result is NOT written — callers stage it for review.
+ *
+ * @param {string} name - canonical NPC name
+ * @param {number} uid - Knowledge lorebook UID
+ * @param {string[]|string} fieldKeys - dossier field keys to refresh
+ * @returns {Promise<{currentContent:string, merged:string, fields:object, requestedFields:string[], skippedFields:Array<{key:string,reason:string}>, dossierMode:boolean}>}
+ */
+export async function runDossierFieldRefresh(name, uid, fieldKeys) {
+    if (!hasValidSettings()) throw new Error('No API connection configured.');
+    // Label-verified load — same guard as runNpcUpdate: never feed another
+    // NPC's dossier in as refresh context.
+    const rawContent = await loadEntryContent(uid, name);
+    if (!rawContent) throw new Error(`Could not load entry for "${name}".`);
+    const currentContent = stripRelationshipBlock(rawContent);
+    if (!isDossierEntry(currentContent)) {
+        throw new Error(`Entry for "${name}" is not in dossier format — use 📋 Enrich to convert it first.`);
+    }
+    const { requested, skipped } = sanitizeDossierRefreshFields(fieldKeys, name);
+    if (requested.length === 0) {
+        throw new Error('No refreshable dossier fields selected (canon lock is manual-only; personality belongs to 🌱 Growth when a profile exists).');
+    }
+    const recentMessages = getRecentMessages();
+    const worldState = getWorldStateFactual();
+    if (!recentMessages) throw new Error('No recent messages.');
+    // Show the model the exact text it is re-deriving — null marks fields the
+    // entry doesn't carry yet (the refresh may fill them).
+    const currentValues = extractDossierFieldValues(currentContent);
+    const refreshBlock = {};
+    for (const key of requested) refreshBlock[key] = currentValues[key] ?? null;
+    const userContent = [
+        `<entity>${name}</entity>`,
+        `<current_entry>\n${currentContent}\n</current_entry>`,
+        '',
+        worldState ? `<world_state>\n${worldState}\n</world_state>` : '',
+        '',
+        '<recent_messages>',
+        recentMessages,
+        '</recent_messages>',
+        '',
+        '<refresh_fields>',
+        JSON.stringify(refreshBlock, null, 2),
+        '</refresh_fields>',
+        '',
+        '='.repeat(60),
+        `Refresh ONLY the fields listed in <refresh_fields> for ${name}. Output only JSON.`,
+    ].filter(Boolean).join('\n');
+
+    // Retry loop — mirrors runNpcUpdate / runNpcEnrich's 2-attempt pattern. A
+    // truncated response (max_tokens cut off) or a non-object parse gets one
+    // more chance with an explicit reminder appended.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        let raw, cleaned, result;
+        try {
+            const fetchContent = attempt === 1
+                ? userContent
+                : userContent + `\n\n[REMINDER: Your previous response was truncated or invalid JSON. Output ONLY valid JSON with just the requested field keys, no prose.]`;
+            raw = await ktFetchFromApi(DOSSIER_FIELD_REFRESH_PROMPT, fetchContent);
+            cleaned = normaliseOutput(raw);
+            result = parseJsonLenient(cleaned);
+            if (!result || typeof result !== 'object' || Array.isArray(result)) {
+                throw new Error('response was not a JSON object');
+            }
+        } catch (err) {
+            // Coordinator cancellation — see runNpcUpdate's catch above: an
+            // aborted call is rethrown, never retried at a fresh epoch.
+            if (isCancellation(err)) throw err;
+            lastError = err;
+            console.warn(`[MWT:Knowledge] runDossierFieldRefresh JSON parse failed (attempt ${attempt}): ${err.message}`);
+            if (attempt < 2) continue;
+            throw new Error(`Model did not return valid JSON after 2 attempts. Last error: ${lastError?.message || 'unknown'}`);
+        }
+
+        // Scope enforcement (defense in depth): keep ONLY the requested keys —
+        // a model that answers with canon_lock, growth-owned personality, or
+        // any unrequested field has those values discarded here, before the
+        // merge. An empty string counts as "no value" (null) so a lazy blank
+        // answer cannot wipe an existing line.
+        //
+        // Phase 1 seam S5: the shared field contract — an invalid value is
+        // dropped (null keeps the existing line) with a surfaced reason;
+        // valid values for other requested fields are retained.
+        const src = (result.fields && typeof result.fields === 'object' && !Array.isArray(result.fields))
+            ? result.fields
+            : {};
+        const fields = {};
+        const contractRejections = [];
+        for (const key of requested) {
+            const v = src[key];
+            if (v === undefined || v === null || v === '') { fields[key] = null; continue; }
+            const check = validateFieldValue(key, v);
+            if (!check.ok) {
+                fields[key] = null;
+                contractRejections.push({ field: key, reason: check.reason });
+            } else {
+                fields[key] = check.value;
+            }
+        }
+        if (contractRejections.length > 0) {
+            console.warn(`[MWT:Knowledge] field contract dropped values for "${name}":`,
+                contractRejections.map(r => `${r.field} (${r.reason})`).join('; '));
+        }
+        const merged = buildUpdatedDossierContent(currentContent, fields, []);
+        return {
+            currentContent, merged, fields, requestedFields: requested, skippedFields: skipped, dossierMode: true,
+            ...(contractRejections.length > 0 ? { contractRejections } : {}),
+        };
+    }
+}
+
+
+
+/**
+ * Serialise asynchronous tracker work onto a single promise chain.
+ *
+ * Returns a promise that resolves specifically to `fn`'s own result (or
+ * `undefined` if `fn` throws).  We capture this fn-local promise in a local
+ * variable rather than returning `state.trackerQueue` directly: the queue
+ * field is reassigned by every subsequent call, so returning it would make an
+ * `await` of *this* call resolve to the result of a *later* queued item.
+ *
+ * Errors are logged and swallowed so a single failure can't permanently break
+ * the serialisation chain.
+ *
+ * @param {() => (Promise<*>|*)} fn
+ * @returns {Promise<*>} resolves to fn's return value, or undefined on error
+ */
+export function queueTrackerWork(fn) {
+    const result = state.trackerQueue
+        .catch(() => {})              // a prior failure must not block fn
+        .then(() => fn())
+        .catch(err => console.error('[MWT:Knowledge] Queued work failed:', err));
+    state.trackerQueue = result;
+    return result;
+}

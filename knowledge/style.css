@@ -1,0 +1,3316 @@
+/*   Knowledge Tracker Styles (.kt-*)
+   Staging layout, toolbar, sub-tabs, detail panel, NPC list, state tracker,
+   view/history modal, status, diff, settings, relationship editor & graph,
+   notification panel, orphan indicators, NPC growth profile modal, mobile.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ─── Staging layout ─────────────────────────────────────────────────────── */
+
+.kt-npcs-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 300px;
+}
+
+.kt-npcs-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--mwt-border);
+}
+
+/* ─── Main toolbar (Scan / Export / Import) ──────────────────────────────── */
+.kt-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 8px 0 10px;
+    border-bottom: 1px solid var(--mwt-border);
+    margin-bottom: 8px;
+}
+
+/* ─── Sub-tab bar (Staging / Minor / Major / State / Relationships) ────────
+   Selectors grouped with their legacy aliases (.kt-subtabs / .kt-subtab-btn)
+   for backward compatibility with any older markup. */
+.kt-sub-tabs,
+.kt-subtabs {
+    display: flex;
+    gap: 2px;
+    flex: 1;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--mwt-border);
+}
+
+.kt-sub-tab,
+.kt-subtab-btn {
+    background: none;
+    border: 1px solid transparent;
+    color: var(--mwt-text-dim);
+    padding: 4px 12px;
+    border-radius: var(--mwt-radius);
+    cursor: pointer;
+    font-size: 12px;
+    font-family: var(--mwt-font);
+    transition: all var(--mwt-transition);
+    white-space: nowrap;
+}
+
+.kt-sub-tab:hover,
+.kt-subtab-btn:hover {
+    color: var(--mwt-text);
+    background: var(--mwt-bg-light);
+}
+
+.kt-sub-tab.active,
+.kt-subtab-btn--active {
+    color: var(--mwt-accent);
+    background: var(--mwt-bg-lighter);
+    border-color: var(--mwt-accent);
+}
+
+.kt-sub-spacer {
+    flex: 1;
+}
+
+.kt-notif-badge {
+    color: var(--mwt-warning) !important;
+    font-weight: 600;
+    animation: kt-notif-pulse 2s ease-in-out infinite;
+}
+
+@keyframes kt-notif-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+/* Auto-scan countdown text in the Knowledge toolbar */
+.kt-autoscan-countdown {
+    font-size: 12px;
+    color: var(--mwt-accent);
+    font-family: var(--mwt-font-mono);
+    padding: 2px 8px;
+    background: var(--mwt-bg-light);
+    border-radius: 4px;
+    border: 1px solid var(--mwt-border);
+    cursor: help;
+    white-space: nowrap;
+}
+
+/* Staging tab pulse — draws attention when proposals are pending and
+   the user is viewing a different sub-tab. */
+.kt-staging-pulse {
+    color: var(--mwt-warning) !important;
+    font-weight: 600;
+    animation: kt-staging-tab-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes kt-staging-tab-pulse {
+    0%, 100% { background: rgba(255, 152, 0, 0.0); }
+    50% { background: rgba(255, 152, 0, 0.18); }
+}
+
+/* Staging alert banner shown at the top of the staging panel */
+.kt-staging-alert {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    background: rgba(255, 152, 0, 0.12);
+    border: 1px solid var(--mwt-warning);
+    border-radius: var(--mwt-radius);
+    color: var(--mwt-warning);
+    font-size: 13px;
+    animation: kt-staging-alert-fade 0.3s ease-out;
+}
+
+.kt-staging-alert-icon {
+    font-size: 20px;
+    line-height: 1;
+}
+
+.kt-staging-alert-text {
+    flex: 1;
+}
+
+@keyframes kt-staging-alert-fade {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.kt-sub-content {
+    padding: 8px 0;
+}
+
+/* Note: legacy .kt-subtabs / .kt-subtab-btn aliases are grouped together
+   with the modern .kt-sub-tabs / .kt-sub-tab rules above — no separate
+   definitions needed here. */
+
+.kt-staging-layout {
+    display: flex;
+    gap: 12px;
+    min-height: 300px;
+}
+
+.kt-staging-list {
+    width: 200px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    overflow-y: auto;
+    max-height: 60vh;
+}
+
+/* Slice 5 (a11y plan §4.6): a staging proposal is a real <button>, so this
+   rule also resets the user-agent button chrome the old <div> never had —
+   background, font, colour, alignment and width. The focus ring comes from
+   the shared core rule ([class^="kt-"]:focus-visible), so nothing here may
+   suppress the outline. */
+.kt-staging-item {
+    padding: 8px 10px;
+    border-radius: var(--mwt-radius);
+    border: 1px solid var(--mwt-border);
+    background: none;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    /* No width: the list is a column flex container, so the item stretches
+       exactly as the old div did. border-box keeps the padding + 1px border
+       inside the list's 200px track (this sheet has no global box-sizing). */
+    box-sizing: border-box;
+    cursor: pointer;
+    transition: all var(--mwt-transition);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+}
+
+.kt-staging-item:hover {
+    background: var(--mwt-bg-light);
+    border-color: var(--mwt-accent);
+}
+
+.kt-staging-item--active {
+    background: rgba(74, 158, 255, 0.15);
+    border-color: var(--mwt-accent);
+}
+
+.kt-staging-badge {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--mwt-accent);
+    font-weight: 600;
+}
+
+.kt-staging-name {
+    font-size: 13px;
+    color: var(--mwt-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.kt-staging-detail {
+    flex: 1;
+    min-width: 0;
+}
+
+.kt-staging-toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+}
+
+.kt-staging-toolbar span {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+}
+
+/* ─── Detail panel ─────────────────────────────────────────────────────────── */
+
+.kt-detail-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.kt-detail-empty {
+    color: var(--mwt-text-dim);
+    text-align: center;
+    padding: 40px 16px;
+    font-size: 13px;
+}
+
+.kt-detail-name {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--mwt-text);
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--mwt-border);
+}
+
+/* Slice 5 (a11y plan §4.6): the proposal name is a real <h4> heading —
+ * neutralize the UA's h4 margins so the flex-gap layout is unchanged
+ * (same rule as h4.kt-npc-name on the cards). */
+h4.kt-detail-name {
+    margin: 0;
+}
+
+.kt-detail-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.kt-detail-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--mwt-text-dim);
+    font-weight: 500;
+}
+
+.kt-detail-current {
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    padding: 10px 12px;
+    font-family: var(--mwt-font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--mwt-text-dim);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+    margin: 0;
+}
+
+.kt-detail-editor {
+    width: 100%;
+    min-height: 150px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    padding: 10px 12px;
+    font-family: var(--mwt-font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--mwt-text);
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.kt-detail-editor:focus {
+    outline: none;
+    border-color: var(--mwt-accent);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-detail-editor:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+
+.kt-keyword-input {
+    width: 100%;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    padding: 8px 10px;
+    font-family: var(--mwt-font);
+    font-size: 13px;
+    color: var(--mwt-text);
+    box-sizing: border-box;
+}
+
+.kt-keyword-input:focus {
+    outline: none;
+    border-color: var(--mwt-accent);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-keyword-input:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+
+.kt-detail-actions {
+    display: flex;
+    gap: 8px;
+    padding-top: 4px;
+}
+
+.kt-empty {
+    color: var(--mwt-text-dim);
+    text-align: center;
+    padding: 40px 16px;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* ─── NPC list ─────────────────────────────────────────────────────────────── */
+
+.kt-npc-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.kt-npc-card {
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    padding: 10px 14px;
+    transition: border-color var(--mwt-transition);
+}
+
+.kt-npc-card:hover {
+    border-color: var(--mwt-accent);
+}
+
+.kt-npc-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.kt-npc-name {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--mwt-text);
+}
+
+/* Slice 5 (a11y plan §4.6): card names are real <h4> headings — neutralize
+ * the UA's h4 margins so the card header layout is unchanged. */
+h4.kt-npc-name {
+    margin: 0;
+}
+
+.kt-npc-meta {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    font-family: var(--mwt-font-mono);
+}
+
+.kt-npc-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.kt-npc-actions label {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+/* ─── State tracker ────────────────────────────────────────────────────────── */
+
+.kt-state-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* .kt-state-toolbar — see Injected CSS section below for merged definition */
+
+/* .kt-state-register — see State tracker tab section below for merged definition */
+
+.kt-state-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* ─── View / History modal (NPC + State Tracker) ────────────────────────── */
+
+.kt-view-modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-kt-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.kt-history-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: var(--z-kt-modal);
+}
+
+.kt-history-panel {
+    /* Centered via the parent's flex + margin:auto (see #kt-view-modal etc.
+       below) rather than top/left/transform — a transform-centered fixed
+       panel has no scrollable path back into view if it overflows the
+       visible viewport (mobile browser chrome, on-screen keyboard), which
+       traps the user with no way to reach the close button. */
+    position: relative;
+    z-index: var(--z-kt-panel);
+    width: min(720px, 90vw);
+    max-height: 80vh;
+    max-height: 80dvh;
+    margin: auto;
+    flex-shrink: 0;
+    background: var(--mwt-bg);
+    border: 1px solid var(--mwt-border);
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+}
+
+.kt-history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--mwt-border);
+    flex-shrink: 0;
+}
+
+.kt-history-header h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--mwt-text);
+}
+
+.kt-history-close {
+    background: none;
+    border: none;
+    color: var(--mwt-text-dim);
+    font-size: 18px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    transition: color var(--mwt-transition);
+}
+
+.kt-history-close:hover {
+    color: var(--mwt-error);
+}
+
+.kt-history-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+}
+
+.kt-history-body pre {
+    margin: 0;
+    font-family: var(--mwt-font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--mwt-text);
+}
+
+/* ─── KT status ────────────────────────────────────────────────────────────── */
+
+.kt-status {
+    min-height: 20px;
+    font-size: 12px;
+    padding: 2px 0;
+}
+
+.kt-status--info    { color: var(--mwt-info); }
+.kt-status--success { color: var(--mwt-success); }
+.kt-status--error   { color: var(--mwt-error); }
+/* 'warning' is the spelling ktSetStatus() callers use; it had no rule, so
+   every warning-level status silently rendered in the default body colour. */
+.kt-status--warning { color: var(--mwt-warning); }
+
+/* ─── KT diff inside staging detail ───────────────────────────────── */
+
+/* Note: all KT staging/detail/npc/accept/dismiss styles are defined
+   in the variable-based block above (uses --mwt-* variables) with
+   .kt-accept-btn / .kt-dismiss-btn base definitions following .kt-state-dryrun. */
+
+.kt-npc-remove {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+.kt-npc-remove:hover { color: var(--sc-danger); border-color: var(--sc-danger-bg); }
+
+/* ── NPC update button ───────────────────────────────────────────────────── */
+
+.kt-npc-update {
+    background: var(--sc-accent-btn-bg);
+    color: var(--sc-info);
+    border: 1px solid var(--sc-accent-btn-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.kt-npc-update:hover:not(:disabled) { background: var(--sc-accent-btn-border); color: #fff; }
+.kt-npc-update:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ── Shared helpers ─────────────────────────────────────────────────────── */
+ 
+.kt-help {
+    font-size: 12px;
+    color: var(--sc-text-dim);
+    line-height: 1.5;
+    margin: 0;
+}
+ 
+.kt-help code {
+    background: var(--sc-bg-diff);
+    border: 1px solid var(--sc-border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 11px;
+    color: var(--sc-text-mid);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+ 
+.kt-help--success { color: var(--sc-success); }
+.kt-help--error   { color: var(--sc-danger); }
+ 
+.kt-hint {
+    font-size: 11px;
+    color: var(--sc-text-dim);
+    margin-top: 2px;
+}
+ 
+ 
+/* ── Settings tab ───────────────────────────────────────────────────────── */
+ 
+.kt-settings-form {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    max-width: 560px;
+}
+ 
+.kt-settings-form h3 {
+    margin: 0 0 4px 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--sc-text-bright);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+ 
+.kt-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+ 
+.kt-field > span:first-child {
+    font-size: 11px;
+    color: var(--sc-text-mid);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+ 
+.kt-field input {
+    background: var(--sc-bg-input);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-light);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    width: 100%;
+    box-sizing: border-box;
+    transition: border-color 0.15s;
+}
+ 
+.kt-field input:focus {
+    outline: none;
+    border-color: var(--sc-border-focus);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-field input:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+ 
+.kt-settings-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+}
+ 
+.kt-settings-actions button {
+    background: var(--sc-bg-hover);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-strong);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+ 
+.kt-settings-actions button:hover:not(:disabled) {
+    background: var(--sc-bg-hover-strong);
+}
+ 
+.kt-settings-actions button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+ 
+.kt-primary {
+    background: var(--sc-accent-btn-border) !important;
+    color: #fff !important;
+    border-color: var(--sc-accent-btn-border) !important;
+    font-weight: 600;
+}
+ 
+.kt-primary:hover:not(:disabled) {
+    background: var(--sc-accent-btn-hover) !important;
+}
+ 
+ 
+/* ── State tracker tab ──────────────────────────────────────────────────── */
+ 
+.kt-state-register {
+    background: var(--sc-bg-diff);
+    border-bottom: 1px solid var(--sc-border);
+    padding: 14px 16px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+ 
+.kt-state-register h3 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--sc-text-bright);
+}
+ 
+.kt-state-register .kt-help {
+    font-size: 11px;
+}
+ 
+.kt-state-register-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 4px;
+}
+ 
+.kt-state-register-row input {
+    background: var(--sc-bg-input);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-light);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    box-sizing: border-box;
+    min-width: 160px;
+    transition: border-color 0.15s;
+}
+ 
+.kt-state-register-row input:focus {
+    outline: none;
+    border-color: var(--sc-border-focus);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-state-register-row input:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+ 
+.kt-state-register-row input[type="number"] {
+    width: 110px;
+    flex-shrink: 0;
+}
+ 
+.kt-state-register-row input[type="text"] {
+    flex: 1;
+    min-width: 200px;
+}
+ 
+.kt-state-register-row button {
+    background: var(--sc-bg-hover);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-strong);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+    flex-shrink: 0;
+}
+ 
+.kt-state-register-row button:hover {
+    background: var(--sc-bg-hover-strong);
+}
+ 
+/* State tracker action buttons three side-by-side per card */
+ 
+.kt-state-update {
+    background: var(--sc-accent-btn-bg);
+    color: var(--sc-info);
+    border: 1px solid var(--sc-accent-btn-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s;
+    margin-right: 4px;
+}
+.kt-state-update:hover:not(:disabled) { background: var(--sc-accent-btn-border); color: #fff; }
+.kt-state-update:disabled              { opacity: 0.45; cursor: not-allowed; }
+ 
+.kt-state-dryrun {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    margin-right: 4px;
+}
+.kt-state-dryrun:hover                 { color: var(--sc-text); border-color: var(--sc-border-focus); }
+.kt-state-dryrun:disabled              { opacity: 0.45; cursor: not-allowed; }
+
+/* ── Base accept / dismiss buttons (defined once, scoped below by context) ── */
+
+.kt-accept-btn,
+.kt-dismiss-btn {
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 11px;
+    cursor: pointer;
+    border: 1px solid;
+    transition: background 0.15s;
+}
+
+.kt-accept-btn {
+    background: var(--sc-success-bg);
+    color: var(--sc-success);
+    border-color: var(--sc-success-border);
+}
+.kt-accept-btn:hover:not(:disabled) { filter: brightness(1.15); }
+.kt-accept-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.kt-dismiss-btn {
+    background: var(--sc-danger-bg);
+    color: var(--sc-danger);
+    border-color: var(--sc-danger-border);
+}
+.kt-dismiss-btn:hover { filter: brightness(1.15); }
+ 
+.kt-state-remove {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+.kt-state-remove:hover                 { color: var(--sc-danger); border-color: var(--sc-danger-bg); }
+ 
+ 
+/* ── Staging badge for state items ──────────────────────────────────────── */
+/* Cyan tint distinguishes state updates from minor (orange) and major (purple)
+   updates in the staging list. */
+ 
+.kt-staging-badge--state.kt-staging-badge--update { background: #1e3a3a; color: #67e8f9; }
+.kt-staging-badge--state.kt-staging-badge--create { background: var(--sc-accent-btn-bg); color: var(--sc-accent-light); }
+ 
+ 
+/* ── Diff view ──────────────────────────────────────────────────────────── */
+/* Used in the staging detail pane to show before/after for state updates. */
+
+.kt-diff {
+    background: var(--sc-bg-diff);
+    border: 1px solid var(--sc-border-dim);
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    padding: 4px 0;
+}
+
+.kt-diff-row {
+    padding: 1px 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.kt-diff-same { color: var(--sc-text-dim); }
+.kt-diff-old  { background: rgba(248, 113, 113, 0.08); color: var(--sc-danger); }
+.kt-diff-new  { background: rgba(74, 222, 128, 0.08); color: var(--sc-success); }
+
+
+.kt-state-toolbar {
+    display: flex;
+    gap: 8px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--sc-border-dim);
+}
+.kt-state-toolbar button {
+    background: var(--sc-bg-hover);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-strong);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.kt-state-toolbar button:hover {
+    background: var(--sc-bg-hover-strong);
+}
+
+.kt-state-history {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    margin-right: 4px;
+    transition: color 0.15s, border-color 0.15s;
+}
+.kt-state-history:hover {
+    color: var(--sc-accent-light);
+    border-color: var(--sc-accent);
+}
+
+/* .kt-history-panel, .kt-history-header, .kt-history-body, .kt-history-close
+   are defined once in the variable-based block above. */
+#kt-history-modal,
+#kt-view-modal,
+#kt-create-modal {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-kt-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 24px 0;
+    box-sizing: border-box;
+}
+.kt-history-entry {
+    background: var(--sc-bg-diff);
+    border: 1px solid var(--sc-border-dim);
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.kt-history-meta {
+    display: flex;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--sc-text-dim);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.kt-history-content {
+    margin: 0;
+    padding: 8px 10px;
+    background: var(--sc-bg-input);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--sc-text-mid);
+    white-space: pre-wrap;
+    max-height: 200px;
+    overflow-y: auto;
+    line-height: 1.5;
+}
+.kt-history-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+.kt-history-restore {
+    background: var(--sc-accent-btn-bg);
+    color: var(--sc-info);
+    border: 1px solid var(--sc-accent-btn-border);
+    border-radius: 5px;
+    padding: 4px 10px;
+    font-size: 11px;
+    cursor: pointer;
+}
+.kt-history-restore:hover {
+    background: var(--sc-accent-btn-border);
+    color: #fff;
+}
+
+/* ── Injected CSS moved from index.js ───────────────────────────────────── */
+
+/* .kt-staging-toolbar is defined once in the variable-based block above. */
+.kt-batch-btn {
+    background: var(--sc-bg-hover);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-strong);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.kt-batch-btn:hover {
+    background: var(--sc-bg-hover-strong);
+}
+.kt-batch-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.kt-batch-accept {
+    color: var(--sc-success);
+    border-color: var(--sc-success-border);
+}
+.kt-batch-dismiss {
+    color: var(--sc-danger);
+    border-color: var(--sc-danger-bg);
+}
+#kt-staging-count-text {
+    font-size: 12px;
+    color: var(--sc-text-dim);
+    margin-left: auto;
+}
+.kt-npc-toolbar {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--sc-border-dim);
+}
+.kt-search-input {
+    background: var(--sc-bg-input);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-light);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    width: 100%;
+    box-sizing: border-box;
+}
+.kt-search-input:focus {
+    outline: none;
+    border-color: var(--sc-border-focus);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-search-input:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+.kt-npc-promote,
+.kt-npc-demote {
+    background: transparent;
+    color: var(--sc-accent-light);
+    border: 1px solid var(--sc-border-focus);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    margin-right: 4px;
+    transition: all 0.15s;
+}
+.kt-npc-promote:hover {
+    background: var(--sc-accent-btn-bg);
+    border-color: var(--sc-accent);
+}
+.kt-npc-demote:hover {
+    background: #3a2a1e;
+    border-color: #a855f7;
+}
+.kt-npc-view {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    margin-right: 4px;
+    transition: color 0.15s;
+}
+.kt-npc-view:hover {
+    color: var(--sc-text);
+    border-color: var(--sc-border-focus);
+}
+
+/* History / Rename / Merge same compact transparent base */
+.kt-npc-history,
+.kt-npc-rename,
+.kt-npc-merge {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+.kt-npc-history:hover {
+    color: var(--sc-accent-light);
+    border-color: var(--sc-accent);
+}
+.kt-npc-rename:hover {
+    color: var(--sc-warning);
+    border-color: #b45309;
+}
+.kt-npc-merge:hover {
+    color: #67e8f9;
+    border-color: #0e7490;
+}
+.kt-npc-rel:hover {
+    color: var(--sc-success);
+    border-color: var(--sc-success-border);
+}
+.kt-npc-keywords:hover {
+    color: var(--sc-warning);
+    border-color: #92400e;
+}
+
+/* .kt-npc-rel / .kt-npc-keywords transparent base for NPC cards.
+   Inside the relationship modal (or similar panels), a filled style
+   is applied via context-specific selectors further down. */
+.kt-npc-rel,
+.kt-npc-keywords {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+/* Per-card selection checkbox for batch updates (Major NPCs only) */
+.kt-npc-select {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 4px 0 0;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.kt-npc-select input[type="checkbox"] { margin: 0; cursor: pointer; width: 14px; height: 14px; accent-color: var(--sc-accent); }
+
+/* "Select all visible" bar above the Major NPCs list */
+.kt-major-selectbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--sc-border-dim);
+    background: var(--sc-bg-diff);
+    font-size: 11px;
+    color: var(--sc-text-mid);
+}
+.kt-select-all {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+}
+.kt-select-all input[type="checkbox"] {
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--sc-accent);
+}
+
+/* Per-NPC auto-trigger toggle on State Tracker cards */
+.kt-state-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--sc-text-mid);
+    cursor: pointer;
+    padding: 3px 6px;
+    border: 1px solid var(--sc-border);
+    border-radius: 5px;
+}
+.kt-state-toggle input[type="checkbox"] {
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--sc-accent);
+}
+.kt-state-toggle:hover {
+    border-color: var(--sc-border-focus);
+    color: var(--sc-text);
+}
+
+.kt-type-change-note {
+    background: var(--sc-accent-bg);
+    color: var(--sc-accent-light);
+    border: 1px solid var(--sc-accent);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+}
+.kt-staging-badge--promote { background: var(--sc-accent-btn-bg); color: var(--sc-accent-light); }
+.kt-staging-badge--demote  { background: #3a2a1e; color: #a855f7; }
+.kt-staging-badge--state   { background: rgba(120, 120, 255, 0.18); }
+#kt-staging-toolbar  { display: none; }
+#kt-staging-layout   { display: none; }
+#kt-state-import-file { display: none; }
+
+/* View modal overrides */
+.kt-view-panel { max-width: 600px; }
+.kt-view-content { max-height: none; }
+
+/* ── State Tracker Notification Panel ──────────────────────────────────────── */
+
+#kt-notification-panel {
+    display: none;
+    position: fixed;
+    bottom: 120px;
+    right: 20px;
+    width: 420px;
+    min-width: 300px;
+    max-width: 90vw;
+    height: 380px;
+    min-height: 200px;
+    max-height: 80vh;
+    z-index: var(--z-kt-notif);
+    background: var(--sc-bg);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-accent);
+    border-radius: 10px;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(99, 102, 241, 0.3);
+    transition: opacity 0.2s;
+}
+
+/* Header draggable handle */
+.kt-notif-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    background: var(--mwt-bg);
+    border-bottom: 1px solid var(--mwt-bg-lighter);
+    cursor: move;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.kt-notif-header h3 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--sc-accent-light);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.kt-notif-header .kt-notif-count {
+    background: var(--sc-accent);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 600;
+    border-radius: 10px;
+    padding: 1px 7px;
+    min-width: 16px;
+    text-align: center;
+}
+
+.kt-notif-header-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.kt-notif-header-actions button {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: 1px solid var(--sc-border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.kt-notif-header-actions button:hover {
+    color: var(--sc-text);
+    border-color: var(--sc-border-focus);
+}
+
+/* Notification tabs row */
+.kt-notif-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--sc-border-dim);
+    flex-shrink: 0;
+    overflow-x: auto;
+    background: var(--sc-bg-diff);
+}
+
+.kt-notif-tab {
+    background: transparent;
+    color: var(--sc-text-dim);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
+    flex-shrink: 0;
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.kt-notif-tab:hover { color: var(--sc-text); }
+
+.kt-notif-tab--active {
+    color: var(--sc-accent-light);
+    border-bottom-color: var(--sc-accent);
+}
+
+.kt-notif-tab .kt-notif-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--sc-success);
+    flex-shrink: 0;
+}
+
+/* Notification body */
+.kt-notif-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.kt-notif-body .kt-detail-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--sc-text-bright);
+}
+
+.kt-notif-body .kt-detail-label {
+    font-size: 10px;
+    color: var(--sc-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.kt-notif-body .kt-diff {
+    font-size: 11px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.kt-notif-body .kt-detail-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+}
+
+/* The base .kt-accept-btn / .kt-dismiss-btn rules (defined above) already
+   theme these buttons via the --sc-* variables, so no override is needed
+   here — this keeps them consistent in both light and dark mode. */
+
+/* Resize handle */
+.kt-notif-resize {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 16px;
+    height: 16px;
+    cursor: nwse-resize;
+    background: linear-gradient(135deg, transparent 50%, var(--sc-border-focus) 50%, transparent 75%);
+    border-radius: 0 0 10px 0;
+}
+
+/* ── Orphan indicators ─────────────────────────────────────────────────────── */
+
+.kt-npc-card--orphan        { border-color: #3a2a1e; background: rgba(251, 146, 60, 0.04); }
+.kt-orphan-badge            {
+    display: inline-block; margin-left: 8px; padding: 1px 6px;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+    background: #3a2a1e; color: #fb923c; border-radius: 4px;
+    text-transform: uppercase; vertical-align: middle;
+}
+.kt-npc-recover, .kt-recover-inline {
+    background: #3a2a1e; color: #fb923c; border: 1px solid #9a3412;
+    border-radius: 5px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+    margin-right: 4px; transition: background 0.15s;
+}
+.kt-npc-recover:hover, .kt-recover-inline:hover {
+    background: #7c2d12; color: #fff;
+}
+
+
+/* ── Create NPC modal ───────────────────────────────────────────────────── */
+
+.kt-create-panel { max-width: 520px; }
+
+/* ── Toolbar row (Update All, Create NPC, Sort) ──────────────────────────── */
+
+.kt-toolbar-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.kt-sort-select {
+    background: var(--sc-bg-input);
+    color: var(--sc-text);
+    border: 1px solid var(--sc-border-light);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+}
+
+.kt-sort-select:focus {
+    outline: none;
+    border-color: var(--sc-border-focus);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-sort-select:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+
+/* ── Modals / panels that need filled Rel/Keywords buttons ────────────────── */
+
+/* Inside relationship modal, notification panel, etc. */
+.kt-rel-add-row .kt-npc-rel,
+.kt-rel-add-row .kt-npc-keywords,
+.kt-notif-body .kt-npc-rel,
+.kt-notif-body .kt-npc-keywords,
+.kt-view-panel .kt-npc-rel,
+.kt-view-panel .kt-npc-keywords {
+    background: var(--sc-bg-input);
+    color: var(--sc-text-input);
+    border: 1px solid var(--sc-border-light);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.kt-rel-add-row .kt-npc-rel:hover,
+.kt-rel-add-row .kt-npc-keywords:hover,
+.kt-notif-body .kt-npc-rel:hover,
+.kt-notif-body .kt-npc-keywords:hover,
+.kt-view-panel .kt-npc-rel:hover,
+.kt-view-panel .kt-npc-keywords:hover {
+    background: var(--sc-bg-hover);
+    border-color: var(--sc-border-focus);
+}
+
+.kt-state-view {
+    background: var(--sc-bg-input);
+    color: var(--sc-text-input);
+    border: 1px solid var(--sc-border-light);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.kt-state-view:hover {
+    background: var(--sc-bg-hover);
+    border-color: var(--sc-border-focus);
+}
+
+/* ── Relationship editor ─────────────────────────────────────────────────── */
+
+.kt-rel-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 0;
+}
+
+.kt-rel-toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 0 4px;
+}
+
+.kt-rel-add-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--mwt-border);
+    flex-wrap: wrap;
+}
+
+.kt-rel-add-row .mwt-input {
+    font-size: 12px;
+    padding: 5px 8px;
+}
+
+.kt-rel-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 4px;
+}
+
+.kt-rel-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-rel-from {
+    font-weight: 600;
+    color: var(--mwt-accent);
+    min-width: 100px;
+}
+
+.kt-rel-target {
+    font-weight: 600;
+    color: var(--mwt-text);
+    min-width: 100px;
+}
+
+.kt-rel-type {
+    color: var(--mwt-accent);
+    font-size: 11px;
+    padding: 1px 6px;
+    background: rgba(74, 158, 255, 0.15);
+    border-radius: 4px;
+    text-transform: capitalize;
+    white-space: nowrap;
+}
+
+.kt-rel-to {
+    font-weight: 600;
+    color: var(--mwt-text);
+    min-width: 100px;
+}
+
+.kt-rel-notes {
+    color: var(--mwt-text-dim);
+    font-size: 11px;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.kt-rel-reverse {
+    color: var(--sc-info);
+    font-size: 11px;
+    padding: 1px 6px;
+    background: rgba(96, 165, 250, 0.12);
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.kt-rel-remove,
+.kt-stance-clear {
+    background: transparent;
+    color: var(--sc-text-mid);
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    transition: color 0.15s, background 0.15s;
+}
+
+.kt-rel-remove:hover,
+.kt-stance-clear:hover {
+    color: var(--sc-danger);
+    background: rgba(248, 113, 113, 0.1);
+}
+
+/* Provenance toggle. Locked (hand-entered) is the emphasised state — it is the
+   one that changes what auto-extraction is allowed to do, so it should read at
+   a glance; auto-managed sits back at the same weight as the remove button. */
+.kt-rel-lock,
+.kt-stance-lock {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    opacity: 0.45;
+    transition: opacity 0.15s, background 0.15s;
+}
+
+.kt-rel-lock:hover,
+.kt-stance-lock:hover {
+    opacity: 1;
+    background: var(--mwt-hover, rgba(255, 255, 255, 0.06));
+}
+
+.kt-rel-lock.locked,
+.kt-stance-lock.locked {
+    opacity: 1;
+}
+
+/* ── Collapsible sections (Recent Changes / Stances toward {{user}}) ──────── */
+
+.kt-rel-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* One row: caret + title + count badge (+ optional hint). Rendered as a
+   <button> so it is keyboard-focusable like every other control in the tab. */
+.kt-rel-section-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    color: var(--mwt-text);
+    cursor: pointer;
+    font-size: 12px;
+    font-family: var(--mwt-font);
+    padding: 6px 10px;
+    text-align: left;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.kt-rel-section-header:hover {
+    background: var(--mwt-hover, rgba(255, 255, 255, 0.06));
+    border-color: var(--mwt-accent);
+}
+
+.kt-rel-section-caret {
+    color: var(--mwt-text-dim);
+    font-size: 11px;
+    width: 12px;
+    flex: none;
+}
+
+.kt-rel-section-title {
+    font-weight: 600;
+}
+
+.kt-rel-count-badge {
+    font-size: 11px;
+    color: var(--mwt-accent);
+    background: rgba(74, 158, 255, 0.15);
+    border-radius: 10px;
+    padding: 0 8px;
+    flex: none;
+}
+
+.kt-rel-section-hint {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    margin-left: auto;
+}
+
+/* Recent-changes rows: origin icon + description + age, one line. */
+.kt-rel-change-row {
+    gap: 8px;
+}
+
+.kt-rel-change-origin {
+    flex: none;
+    font-size: 12px;
+    cursor: default;
+}
+
+.kt-rel-change-desc {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.kt-rel-change-age {
+    flex: none;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-rel-changes-clear {
+    align-self: flex-end;
+    background: transparent;
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+    color: var(--mwt-text-dim);
+    cursor: pointer;
+    font-size: 11px;
+    font-family: var(--mwt-font);
+    padding: 2px 8px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.kt-rel-changes-clear:hover {
+    color: var(--sc-danger);
+    border-color: var(--sc-danger);
+}
+
+/* ── Relationship graph view ────────────────────────────────────────────── */
+
+.kt-rel-view-toggle {
+    display: inline-flex;
+    margin-left: auto;
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    overflow: hidden;
+}
+
+.kt-rel-view-btn {
+    background: var(--mwt-bg-light);
+    border: none;
+    color: var(--mwt-text-dim);
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: var(--mwt-font);
+    transition: all var(--mwt-transition);
+    white-space: nowrap;
+}
+
+.kt-rel-view-btn:hover {
+    color: var(--mwt-text);
+    background: var(--mwt-bg-lighter);
+}
+
+.kt-rel-view-btn.active {
+    color: #fff;
+    background: var(--mwt-accent);
+}
+
+.kt-rel-graph-wrap {
+    position: relative;
+    width: 100%;
+    min-height: 420px;
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    background:
+        radial-gradient(circle at center, rgba(74, 158, 255, 0.03), transparent 70%),
+        var(--mwt-bg);
+    overflow: hidden;
+}
+
+.kt-rel-graph {
+    width: 100%;
+    height: 420px;
+    display: block;
+    color: var(--mwt-text);
+    touch-action: none;
+}
+
+.kt-rel-graph-node {
+    transition: filter 0.1s;
+}
+
+.kt-rel-graph-node:hover {
+    filter: brightness(1.25);
+}
+
+.kt-rel-graph-node:hover .kt-rel-graph-node-circle {
+    stroke: var(--mwt-accent-hover);
+    stroke-width: 2.5;
+}
+
+.kt-rel-graph-node-circle {
+    fill: var(--mwt-bg-lighter);
+    stroke: var(--mwt-accent);
+    stroke-width: 1.5;
+    transition: stroke 0.15s, stroke-width 0.15s;
+}
+
+.kt-rel-graph-node-label {
+    pointer-events: none;
+    font-family: var(--mwt-font);
+    font-weight: 500;
+    paint-order: stroke;
+    stroke: var(--mwt-bg);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+}
+
+.kt-rel-graph-edge {
+    transition: opacity 0.15s, stroke-width 0.15s;
+}
+
+.kt-rel-graph-edge:hover {
+    opacity: 1 !important;
+    stroke-width: 2.8 !important;
+    cursor: pointer;
+}
+
+.kt-rel-graph-legend {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 6px 8px;
+    background: rgba(26, 26, 46, 0.85);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    font-size: 11px;
+    color: var(--mwt-text);
+    pointer-events: none;
+    max-width: calc(100% - 16px);
+}
+
+.kt-rel-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    text-transform: capitalize;
+}
+
+.kt-rel-legend-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.kt-rel-graph-hint {
+    position: absolute;
+    bottom: 6px;
+    right: 8px;
+    max-width: 75%;
+    text-align: right;
+    line-height: 1.4;
+    font-size: 10px;
+    color: var(--mwt-text-dim);
+    pointer-events: none;
+    background: rgba(26, 26, 46, 0.7);
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+/* ── Slice 5 (a11y plan §4.6): zoom/reset controls, zoom level, summary ──── */
+
+.kt-rel-graph-controls {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px;
+    background: rgba(26, 26, 46, 0.85);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+}
+
+.kt-rel-graph-ctrl {
+    background: var(--mwt-bg-light);
+    border: none;
+    color: var(--mwt-text);
+    width: 26px;
+    height: 24px;
+    line-height: 1;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-family: var(--mwt-font);
+    transition: background 0.15s, color 0.15s;
+}
+
+.kt-rel-graph-ctrl:hover {
+    background: var(--mwt-bg-lighter);
+    color: #fff;
+}
+
+.kt-rel-graph-zoom-level {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    padding: 0 4px;
+    min-width: 62px;
+    text-align: center;
+    white-space: nowrap;
+}
+
+/* The selected-node summary: visible AND a polite live region, so the same
+ * text serves sighted users and screen readers. */
+.kt-rel-graph-summary {
+    position: absolute;
+    bottom: 6px;
+    left: 8px;
+    max-width: calc(100% - 220px);
+    font-size: 11px;
+    color: var(--mwt-text);
+    background: rgba(26, 26, 46, 0.8);
+    border: 1px solid var(--mwt-border);
+    padding: 4px 8px;
+    border-radius: 4px;
+    pointer-events: none;
+}
+
+/* Hide the CHROME when empty, never the box: this element is a live region,
+ * and display:none takes it out of the accessibility tree entirely. Selecting
+ * a node would then flip it from absent to present-with-content in one step —
+ * the same "inserted already populated" case #kt-rel-filter-summary defers
+ * around, which assistive tech is not required to announce. Staying rendered
+ * (empty, zero-footprint) is what makes the text change an announceable
+ * mutation. Do not swap this back to display:none / visibility:hidden. */
+.kt-rel-graph-summary:empty {
+    border-color: transparent;
+    background: transparent;
+    padding: 0;
+}
+
+/* Keyboard focus ring on graph nodes (paired with the :focus rule per a11y
+ * plan §4.3 — never outline:none without a replacement). */
+.kt-rel-graph-node:focus {
+    outline: none;
+}
+
+.kt-rel-graph-node:focus .kt-rel-graph-node-circle,
+.kt-rel-graph-node:focus-visible .kt-rel-graph-node-circle {
+    stroke: #fff;
+    stroke-width: 3;
+}
+
+.kt-rel-graph-node--selected .kt-rel-graph-node-circle,
+.kt-rel-graph-node[aria-current="true"] .kt-rel-graph-node-circle {
+    stroke: var(--mwt-accent);
+    stroke-width: 3;
+    filter: drop-shadow(0 0 4px rgba(122, 162, 255, 0.6));
+}
+
+/* ── Mobile / Touch Responsive (Knowledge-specific) ────────────────────────── */
+
+@media (max-width: 768px) {
+    /* Staging layout stacks vertically on mobile */
+    .kt-staging-layout {
+        flex-direction: column !important;
+    }
+
+    .kt-staging-list {
+        max-height: 150px !important;
+        min-width: 0 !important;
+        width: 100% !important;
+    }
+
+    .kt-staging-detail {
+        width: 100% !important;
+    }
+
+    /* Toolbar wraps on small screens */
+    .kt-npcs-toolbar,
+    .kt-toolbar {
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .kt-sub-tabs {
+        order: 10;
+        width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .kt-sub-tab {
+        padding: 6px 8px;
+        font-size: 11px;
+        white-space: nowrap;
+    }
+
+    /* NPC cards stack actions */
+    .kt-npc-card-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+    }
+
+    .kt-npc-actions {
+        flex-wrap: wrap;
+    }
+
+    /* Relationship add row wraps */
+    .kt-rel-add-row {
+        flex-wrap: wrap;
+    }
+
+    .kt-rel-add-row select,
+    .kt-rel-add-row input {
+        min-width: 0 !important;
+        flex: 1 1 120px;
+    }
+
+    /* Relationship *list* rows — the add row above was already handled, this
+       one was not.  .kt-rel-from/-to carry min-width:100px, a floor that
+       flex-shrink cannot cross, and -type/-reverse/-notes are all nowrap, so
+       at 375px the row demanded ~381px of a 338px box: it overflowed by 56px
+       and squeezed .kt-rel-notes — the actual payload — to zero width, i.e.
+       invisible.  Drop the alignment floors and give the notes their own
+       wrapped row where they can use normal wrapping instead of an ellipsis
+       that has nothing left to ellipse. */
+    .kt-rel-row {
+        flex-wrap: wrap;
+    }
+
+    .kt-rel-from,
+    .kt-rel-to {
+        min-width: 0;
+    }
+
+    .kt-rel-notes {
+        flex-basis: 100%;
+        white-space: normal;
+        overflow: visible;
+        text-overflow: clip;
+    }
+
+    /* Notification panel responsive */
+    #kt-notification-panel {
+        width: calc(100vw - 20px) !important;
+        left: 10px !important;
+        right: 10px !important;
+        bottom: 10px !important;
+        max-height: 50vh;
+    }
+}
+
+/* ─── NPC Growth Profile modal ───────────────────────────────────────────── */
+
+.kt-growth-modal .mwt-modal-panel {
+    max-width: 720px;
+    max-height: 85vh;
+}
+
+.kt-growth-modal .mwt-modal-body {
+    overflow-y: auto;
+}
+
+.kt-growth-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px 0;
+    color: var(--mwt-text-dim);
+    font-size: 13px;
+}
+
+.kt-growth-spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--mwt-border);
+    border-top-color: var(--mwt-primary, #6366f1);
+    border-radius: 50%;
+    animation: kt-growth-spin 0.8s linear infinite;
+    flex-shrink: 0;
+}
+
+@keyframes kt-growth-spin {
+    to { transform: rotate(360deg); }
+}
+
+.kt-growth-error {
+    padding: 16px;
+    color: var(--mwt-error);
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: var(--mwt-radius);
+    font-size: 13px;
+}
+
+.kt-growth-warning {
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    color: var(--mwt-text);
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    border-radius: var(--mwt-radius);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.kt-growth-warning code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: var(--mwt-font-mono);
+    font-size: 11px;
+}
+
+.kt-growth-section-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--mwt-text-dim);
+    margin-bottom: 8px;
+    letter-spacing: 0.02em;
+}
+
+.kt-growth-hint {
+    font-weight: 400;
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.kt-growth-actions-toolbar {
+    margin-bottom: 20px;
+    padding: 12px;
+    background: rgba(99, 102, 241, 0.06);
+    border: 1px solid rgba(99, 102, 241, 0.2);
+    border-radius: var(--mwt-radius);
+}
+
+.kt-growth-actions-buttons {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.kt-growth-actions-buttons .mwt-btn {
+    font-size: 12px;
+}
+
+.kt-growth-actions-buttons .mwt-btn:disabled {
+    opacity: 0.4;
+}
+
+/* ── Catch-Up progress panel (loops backfill + live capture until current) ── */
+
+.kt-growth-catchup-progress {
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: rgba(74, 158, 255, 0.08);
+    border: 1px solid var(--mwt-accent);
+    border-radius: var(--mwt-radius);
+    animation: kt-growth-catchup-fade 0.3s ease-out;
+}
+
+.kt-growth-catchup-line {
+    font-size: 12px;
+    color: var(--mwt-text);
+    line-height: 1.6;
+    font-family: var(--mwt-font-mono);
+}
+
+@keyframes kt-growth-catchup-fade {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.kt-growth-evidence {
+    margin-bottom: 20px;
+}
+
+.kt-growth-obs-group {
+    margin-bottom: 12px;
+}
+
+.kt-growth-obs-cat {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--mwt-primary, #6366f1);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+}
+
+.kt-growth-obs {
+    padding: 6px 10px;
+    margin-bottom: 4px;
+    background: rgba(99, 102, 241, 0.05);
+    border-left: 2px solid rgba(99, 102, 241, 0.3);
+    border-radius: 0 var(--mwt-radius) var(--mwt-radius) 0;
+}
+
+.kt-growth-obs-claim {
+    font-size: 12px;
+    color: var(--mwt-text);
+    line-height: 1.4;
+}
+
+.kt-growth-obs-quote {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    font-style: italic;
+    margin-top: 2px;
+    line-height: 1.4;
+}
+
+.kt-growth-obs-msgidx {
+    font-style: normal;
+    font-family: var(--mwt-font-mono);
+    opacity: 0.6;
+}
+
+.kt-growth-obs-unverified {
+    font-style: normal;
+    color: rgb(245, 158, 11);
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 3px;
+    padding: 0 4px;
+    font-size: 10px;
+    white-space: nowrap;
+    cursor: help;
+}
+
+.kt-growth-profile-section {
+    margin-bottom: 20px;
+}
+
+.kt-growth-profile-editor {
+    width: 100%;
+    min-height: 200px;
+    padding: 12px;
+    background: var(--mwt-input-bg, transparent);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+    font-size: 13px;
+    line-height: 1.6;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.kt-growth-profile-editor:focus {
+    outline: none;
+    border-color: var(--mwt-primary, #6366f1);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-growth-profile-editor:focus-visible {
+    outline: 2px solid var(--mwt-primary, #6366f1);
+    outline-offset: 2px;
+}
+
+.kt-growth-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.kt-growth-explainer {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    line-height: 1.5;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--mwt-border);
+    border-radius: var(--mwt-radius);
+}
+
+.kt-growth-explainer code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: var(--mwt-font-mono);
+    font-size: 10px;
+}
+
+/* ─── Slice 3: Consolidation + user overrides ──────────────────────────────── */
+
+.kt-growth-evidence-tools {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.kt-growth-evidence-tools .mwt-btn {
+    font-size: 12px;
+}
+
+.kt-growth-obs-tier {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(99, 102, 241, 0.15);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.kt-growth-overrides-section {
+    margin: 16px 0;
+}
+
+.kt-growth-override {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding: 8px;
+    background: rgba(245, 158, 11, 0.06);
+    border: 1px solid rgba(245, 158, 11, 0.2);
+    border-radius: var(--mwt-radius);
+}
+
+.kt-growth-override-text {
+    flex: 1;
+    font-size: 13px;
+    line-height: 1.5;
+    outline: none;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3) —
+   contenteditable is focusable, so it needs the same visible indicator. */
+.kt-growth-override-text:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+
+.kt-growth-override-text:focus {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.kt-growth-override-del {
+    padding: 2px 8px;
+    font-size: 12px;
+}
+
+.kt-growth-overrides-add {
+    margin-bottom: 16px;
+}
+
+/* ─── Slice 2: Evidence Editor + capture notes ─────────────────────────────── */
+
+.kt-growth-existing-note {
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    background: rgba(250, 204, 21, 0.08);
+    border: 1px solid rgba(250, 204, 21, 0.3);
+    border-radius: var(--mwt-radius);
+    font-size: 12px;
+    color: var(--mwt-text);
+}
+
+.kt-growth-capture-note {
+    padding: 6px 12px;
+    margin-bottom: 12px;
+    background: rgba(74, 222, 128, 0.08);
+    border: 1px solid rgba(74, 222, 128, 0.2);
+    border-radius: var(--mwt-radius);
+    font-size: 12px;
+    color: var(--mwt-text);
+}
+
+.kt-growth-obs-header {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.kt-growth-obs-canon {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(250, 204, 21, 0.15);
+    border: 1px solid rgba(250, 204, 21, 0.4);
+    color: rgb(250, 204, 21);
+}
+
+.kt-growth-obs-tier {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(99, 102, 241, 0.15);
+    border: 1px solid rgba(99, 102, 241, 0.4);
+    color: rgb(129, 140, 248);
+}
+
+.kt-growth-obs-claim[contenteditable] {
+    cursor: text;
+    outline: none;
+    border-radius: 3px;
+    padding: 2px 4px;
+    margin: 0 -4px;
+    transition: background 0.15s;
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3) —
+   contenteditable is focusable, so it needs the same visible indicator. */
+.kt-growth-obs-claim[contenteditable]:focus-visible {
+    outline: 2px solid var(--mwt-accent, #6366f1);
+    outline-offset: 2px;
+}
+
+.kt-growth-obs-claim[contenteditable]:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.kt-growth-obs-claim[contenteditable]:focus {
+    background: rgba(99, 102, 241, 0.08);
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3);
+}
+
+.kt-growth-obs-tools {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+}
+
+.kt-growth-obs-tools .mwt-btn {
+    padding: 2px 8px;
+    font-size: 10px;
+    min-height: auto;
+}
+
+.kt-growth-obs-canon-btn {
+    border-color: rgba(250, 204, 21, 0.3);
+}
+
+.kt-growth-obs-del-btn {
+    padding: 2px 6px !important;
+    font-size: 11px;
+    border-color: rgba(239, 68, 68, 0.3);
+}
+
+.kt-growth-obs-del-btn:hover {
+    background: rgba(239, 68, 68, 0.15);
+}
+
+/* ─── Psychoanalyze portrait (dead-end view) ───────────────────────────────── */
+
+.kt-growth-psychoanalyze-section {
+    margin-top: 16px;
+    margin-bottom: 20px;
+    padding: 12px;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+    border-radius: var(--mwt-radius);
+    background: rgba(168, 85, 247, 0.04);
+}
+
+.kt-growth-psychoanalyze-warning {
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    background: rgba(250, 204, 21, 0.08);
+    border: 1px solid rgba(250, 204, 21, 0.3);
+    border-radius: var(--mwt-radius);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--mwt-text);
+}
+
+.kt-growth-psychoanalyze-warning code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: var(--mwt-font-mono);
+    font-size: 10px;
+}
+
+.kt-growth-psychoanalyze-editor {
+    width: 100%;
+    min-height: 300px;
+    padding: 12px;
+    background: var(--mwt-input-bg, transparent);
+    border: 1px solid rgba(168, 85, 247, 0.25);
+    border-radius: var(--mwt-radius);
+    color: var(--mwt-text);
+    font-family: var(--mwt-font);
+    font-size: 13px;
+    line-height: 1.6;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.kt-growth-psychoanalyze-editor:focus {
+    outline: none;
+    border-color: rgba(168, 85, 247, 0.6);
+}
+
+/* Keyboard-focus pair for the outline suppressed above (a11y plan §4.3). */
+.kt-growth-psychoanalyze-editor:focus-visible {
+    outline: 2px solid rgba(168, 85, 247, 0.9);
+    outline-offset: 2px;
+}
+
+/* ─── Dossier per-field refresh modal (TODO §3) ───────────────────────────── */
+
+.kt-dossier-refresh-modal .mwt-modal-panel {
+    max-width: 640px;
+    max-height: 85vh;
+}
+
+.kt-dossier-refresh-modal .mwt-modal-body {
+    overflow-y: auto;
+}
+
+.kt-dfr-hint {
+    margin: 0 0 12px;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    line-height: 1.5;
+}
+
+.kt-dfr-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.kt-dfr-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.kt-dfr-row:hover {
+    border-color: var(--mwt-accent);
+}
+
+.kt-dfr-row--locked {
+    cursor: default;
+    opacity: 0.65;
+}
+
+.kt-dfr-row--locked:hover {
+    border-color: var(--mwt-border);
+}
+
+.kt-dfr-row > input[type='checkbox'] {
+    margin-top: 3px;
+    flex: none;
+}
+
+.kt-dfr-row-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+}
+
+.kt-dfr-row-label {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--mwt-text);
+}
+
+.kt-dfr-row-value {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    overflow-wrap: anywhere;
+}
+
+.kt-dfr-row-note {
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    font-style: italic;
+}
+
+.kt-dfr-chip {
+    flex: none;
+    align-self: center;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--mwt-border);
+    white-space: nowrap;
+}
+
+.kt-dfr-chip--stale {
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.45);
+    background: rgba(251, 191, 36, 0.08);
+}
+
+.kt-dfr-chip--fresh {
+    color: #4ade80;
+    border-color: rgba(74, 222, 128, 0.35);
+    background: rgba(74, 222, 128, 0.06);
+}
+
+.kt-dfr-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* ─── Identity modal (TODO §1 entity identity + alias service) ───────────── */
+
+.kt-identity-modal .mwt-modal-panel {
+    max-width: 560px;
+}
+
+.kt-identity-hint {
+    margin: 0 0 8px;
+    color: var(--mwt-text-dim);
+    font-size: 12px;
+}
+
+.kt-identity-entityid {
+    font-size: 12px;
+    margin-bottom: 12px;
+}
+
+.kt-identity-entityid code {
+    font-family: var(--mwt-monospace, monospace);
+    font-size: 11px;
+    padding: 2px 6px;
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+    background: var(--mwt-bg-dim, transparent);
+    word-break: break-all;
+}
+
+.kt-identity-section {
+    border-top: 1px solid var(--mwt-border);
+    padding: 10px 0 4px;
+    margin-top: 10px;
+}
+
+.kt-identity-section h4 {
+    margin: 0 0 4px;
+    font-size: 13px;
+}
+
+.kt-identity-note {
+    margin: 0 0 8px;
+    color: var(--mwt-text-dim);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+.kt-identity-aliases {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.kt-identity-empty {
+    color: var(--mwt-text-dim);
+    font-size: 12px;
+    font-style: italic;
+}
+
+.kt-alias-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 2px 8px;
+    font-size: 12px;
+    border: 1px solid var(--mwt-border);
+    border-radius: 999px;
+    background: var(--mwt-bg-dim, transparent);
+}
+
+.kt-alias-chip-x {
+    border: none;
+    background: transparent;
+    color: var(--mwt-text-dim);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 4px;
+}
+
+.kt-alias-chip-x:hover {
+    color: var(--mwt-error, #f87171);
+}
+
+.kt-identity-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.kt-identity-row .mwt-input {
+    flex: 1;
+}
+
+
+/* ─── Ledger condensation review modal (concision plan Phase 4) ──────────── */
+
+.kt-condense-modal .mwt-modal-panel {
+    max-width: 860px;
+    max-height: 88vh;
+}
+
+.kt-condense-modal .mwt-modal-body {
+    overflow-y: auto;
+}
+
+.kt-condense-hint {
+    margin: 0 0 12px;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    line-height: 1.5;
+}
+
+.kt-condense-disclosure {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 14px;
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-condense-disclosure dt {
+    font-weight: 600;
+    color: var(--mwt-text-dim);
+    white-space: nowrap;
+}
+
+.kt-condense-disclosure dd {
+    margin: 0;
+    color: var(--mwt-text);
+    overflow-wrap: anywhere;
+}
+
+.kt-condense-refusal {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--mwt-error);
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--mwt-error);
+}
+
+.kt-condense-refusal .kt-condense-suggestion {
+    display: block;
+    margin-top: 4px;
+    color: var(--mwt-text);
+}
+
+.kt-condense-warnings {
+    margin: 0 0 10px;
+    padding: 0 0 0 4px;
+    font-size: 12px;
+    color: var(--mwt-warning);
+    list-style: disc;
+}
+
+.kt-condense-warnings li {
+    margin: 2px 0 2px 16px;
+    overflow-wrap: anywhere;
+}
+
+.kt-condense-draft-offer {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--mwt-warning);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-condense-draft-offer--stale {
+    border-color: var(--mwt-border);
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-draft-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.kt-condense-prev-draft {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    margin: 0 0 8px;
+}
+
+.kt-condense-consent {
+    margin: 4px 0 12px;
+    font-size: 12px;
+}
+
+.kt-condense-consent label {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    cursor: pointer;
+    line-height: 1.5;
+}
+
+.kt-condense-consent input {
+    flex: none;
+    margin-top: 2px;
+}
+
+.kt-condense-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+
+.kt-condense-generating {
+    padding: 18px 0 6px;
+    text-align: center;
+}
+
+.kt-condense-progress {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0 0 6px;
+}
+
+.kt-condense-progress-note {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    margin: 0;
+}
+
+.kt-condense-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-condense-counts {
+    font-size: 13px;
+    color: var(--mwt-text);
+}
+
+.kt-condense-sizes {
+    color: var(--mwt-text-dim);
+    overflow-wrap: anywhere;
+}
+
+.kt-condense-est-note {
+    font-style: italic;
+    margin-left: 6px;
+}
+
+.kt-condense-summary-warnings {
+    color: var(--mwt-warning);
+}
+
+.kt-condense-summary-warnings--error {
+    color: var(--mwt-error);
+}
+
+.kt-condense-model-notes {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    font-style: italic;
+}
+
+.kt-condense-diff {
+    margin: 0 0 12px;
+    font-size: 12px;
+}
+
+.kt-condense-diff summary {
+    cursor: pointer;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-diff-body {
+    margin-top: 6px;
+    max-height: 260px;
+    overflow: auto;
+    font-family: var(--mwt-font-mono, monospace);
+    font-size: 11px;
+}
+
+.kt-condense-diff-error {
+    color: var(--mwt-error);
+}
+
+.kt-condense-records {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.kt-condense-record {
+    padding: 10px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+}
+
+.kt-condense-record-title {
+    margin: 0 0 8px;
+    font-size: 13px;
+}
+
+/* Changed records first; lines kept as written collapse into one group. */
+.kt-condense-section-title {
+    margin: 4px 0 0;
+    font-size: 13px;
+}
+
+.kt-condense-kept {
+    border: 1px dashed var(--mwt-border);
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+
+.kt-condense-kept-summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-kept-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.kt-condense-record--kept {
+    padding: 6px 10px;
+    background: transparent;
+}
+
+.kt-condense-record--kept .kt-condense-record-actions {
+    margin-top: 4px;
+}
+
+.kt-condense-record-size {
+    margin: 6px 0 0;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-record-coverage {
+    color: var(--mwt-text-dim);
+    font-weight: 400;
+    font-size: 12px;
+}
+
+.kt-condense-label {
+    display: block;
+    margin: 0 0 4px;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-text {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 12px;
+    font-family: inherit;
+    resize: vertical;
+}
+
+.kt-condense-record-notes {
+    margin: 6px 0 0;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    font-style: italic;
+}
+
+.kt-condense-record-warnings {
+    margin: 6px 0 0;
+    padding-left: 18px;
+    font-size: 11px;
+    color: var(--mwt-warning);
+}
+
+.kt-condense-record-warnings code {
+    color: inherit;
+}
+
+.kt-condense-sources {
+    margin-top: 8px;
+    font-size: 11px;
+}
+
+.kt-condense-sources summary {
+    cursor: pointer;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-source-list {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.kt-condense-source {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    flex-wrap: wrap;
+    padding: 4px 6px;
+    border: 1px solid var(--mwt-border);
+    border-radius: 4px;
+}
+
+.kt-condense-source--removed {
+    opacity: 0.6;
+    text-decoration: line-through;
+}
+
+.kt-condense-source--removed .kt-condense-source-flag {
+    text-decoration: none;
+}
+
+.kt-condense-source-id {
+    flex: none;
+    font-weight: 600;
+    color: var(--mwt-text-dim);
+    font-size: 10px;
+    text-transform: uppercase;
+}
+
+.kt-condense-source-text {
+    flex: 1 1 240px;
+    font-size: 11px;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.kt-condense-source-flag {
+    flex: none;
+    font-size: 10px;
+    color: var(--mwt-warning);
+}
+
+.kt-condense-record-actions {
+    margin-top: 8px;
+}
+
+.kt-condense-remove-box {
+    margin-top: 6px;
+    padding: 8px;
+    border: 1px dashed var(--mwt-warning);
+    border-radius: 6px;
+}
+
+.kt-condense-remove-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.kt-condense-remove-row .mwt-input {
+    flex: 1 1 200px;
+}
+
+.kt-condense-removals {
+    margin: 12px 0 0;
+    padding: 10px 12px;
+    border: 1px solid var(--mwt-warning);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-condense-removals h4 {
+    margin: 0 0 6px;
+    font-size: 12px;
+}
+
+.kt-condense-removals ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.kt-condense-removals-note {
+    margin: 8px 0 0;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+    font-style: italic;
+}
+
+.kt-condense-suggestions {
+    margin: 12px 0 0;
+    padding: 10px 12px;
+    background: var(--mwt-bg-light);
+    border: 1px solid var(--mwt-border);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-condense-suggestions h4 {
+    margin: 0 0 4px;
+    font-size: 12px;
+}
+
+.kt-condense-suggestions-note {
+    margin: 0 0 8px;
+    font-size: 11px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-suggestions ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.kt-condense-suggestion-reason {
+    display: block;
+    overflow-wrap: anywhere;
+}
+
+.kt-condense-suggestion-sources {
+    margin-top: 4px;
+}
+
+.kt-condense-suggestion-sources summary {
+    cursor: pointer;
+    color: var(--mwt-text-dim);
+    font-size: 11px;
+}
+
+.kt-condense-suggestion .mwt-btn {
+    margin-top: 6px;
+}
+
+.kt-condense-confirm {
+    margin: 12px 0 0;
+    padding: 10px 12px;
+    border: 1px solid var(--mwt-accent);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.kt-condense-confirm h4 {
+    margin: 0 0 6px;
+}
+
+.kt-condense-confirm ul {
+    margin: 0 0 6px;
+    padding-left: 18px;
+}
+
+.kt-condense-confirm li {
+    margin: 2px 0;
+}
+
+.kt-condense-confirm-warn {
+    color: var(--mwt-warning);
+    margin: 0 0 4px;
+}
+
+.kt-condense-footer {
+    border-top: 1px solid var(--mwt-border);
+    padding-top: 10px;
+    margin-top: 14px;
+}
+
+.kt-condense-armed {
+    border-color: var(--mwt-warning) !important;
+    color: var(--mwt-warning) !important;
+}
+
+.kt-condense-explain h4 {
+    margin: 0 0 8px;
+}
+
+.kt-condense-explain-reason {
+    margin: 0 0 8px;
+    font-size: 13px;
+    color: var(--mwt-text);
+    overflow-wrap: anywhere;
+}
+
+.kt-condense-explain-lines {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-explain-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-applied h4 {
+    margin: 0 0 8px;
+    color: var(--mwt-success);
+}
+
+.kt-condense-applied {
+    font-size: 13px;
+}
+
+.kt-condense-applied code {
+    overflow-wrap: anywhere;
+}
+
+.kt-condense-applied-note,
+.kt-condense-restored-note {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-condense-restored-note {
+    color: var(--mwt-success);
+}
+
+.kt-condense-conflict-export {
+    margin-top: 10px;
+}
+
+/* ─── Cleanup recovery manager modal (Phase 4) ───────────────────────────── */
+
+.kt-cleanup-recovery-modal .mwt-modal-panel {
+    max-width: 760px;
+    max-height: 85vh;
+}
+
+.kt-cleanup-recovery-modal .mwt-modal-body {
+    overflow-y: auto;
+}
+
+.kt-crec-usage {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+}
+
+.kt-crec-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-bottom: 10px;
+}
+
+.kt-crec-table th,
+.kt-crec-table td {
+    text-align: left;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--mwt-border);
+    vertical-align: top;
+}
+
+.kt-crec-table th {
+    color: var(--mwt-text-dim);
+    font-weight: 600;
+}
+
+.kt-crec-status {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--mwt-border);
+    color: var(--mwt-text-dim);
+    white-space: nowrap;
+}
+
+.kt-crec-status--applied {
+    border-color: var(--mwt-success);
+    color: var(--mwt-success);
+}
+
+.kt-crec-status--failed,
+.kt-crec-status--outcome-uncertain {
+    border-color: var(--mwt-error);
+    color: var(--mwt-error);
+}
+
+.kt-crec-status--restored {
+    border-color: var(--mwt-info);
+    color: var(--mwt-info);
+}
+
+.kt-crec-actions {
+    white-space: nowrap;
+}
+
+.kt-crec-actions .mwt-btn {
+    margin-right: 4px;
+}
+
+.kt-crec-empty {
+    font-size: 12px;
+    color: var(--mwt-text-dim);
+    margin: 8px 0 12px;
+}
+

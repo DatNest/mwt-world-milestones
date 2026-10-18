@@ -1,0 +1,1527 @@
+/**
+ * knowledge/store.js — Per-lorebook data store, kept inside the lorebook.
+ *
+ * ── Why the store lives in the book ─────────────────────────────────────────
+ * The NPC registry maps an NPC name to a lorebook UID. The registry used to
+ * live in `chat_metadata` while its target lived in the lorebook — two files,
+ * two save paths, two lifetimes. `core/metadata.js` documents at length what
+ * that cost: if the debounced metadata save didn't flush before a reload, the
+ * pointer was lost while the entry it pointed at survived, the next save saw
+ * no existing UID, and a SECOND entry was created. Duplicates accumulated
+ * silently. `persistChatMetaNow()` exists to mitigate exactly that.
+ *
+ * Keeping the registry inside the book removes the failure mode instead of
+ * mitigating it: pointer and target are now the same file, written by the same
+ * `saveWorldInfo` call. It also makes each book self-describing — export or
+ * share a book and its registry travels with it.
+ *
+ * ── The entry is structurally non-injecting ─────────────────────────────────
+ * The store entry uses `key: []` (no keywords) so ST's world-info system can
+ * never keyword-match it, plus `disable: true` as a second line of defence.
+ * This is the same "default OFF by construction, not by toggle" approach the
+ * NPC Profiles lorebook already uses.
+ *
+ * ── The entry is visible on purpose ─────────────────────────────────────────
+ * The store could hide as an extra top-level key in the book's JSON, invisible
+ * to the World Info editor. Rejected twice over: format converters (card-book
+ * round-trips, lorebook imports) rebuild books from `entries` and would
+ * silently strip it — and losing the store IS the duplicate-entry bug. And
+ * hidden data in a user's files is a trust problem, not a favour. A plainly
+ * titled entry the user can open, read, and delete is the deliberate choice.
+ *
+ * ── Why there is a synchronous cache ────────────────────────────────────────
+ * `loadWorldInfo` is async, but `getRegistry()` and friends are synchronous and
+ * called from render paths all over the module. Rather than convert dozens of
+ * call sites to async, the book is hydrated once (on chat change) into an
+ * in-memory cache that the sync accessors read from.
+ *
+ * That trade has one sharp edge: reading before hydration returns an EMPTY
+ * registry, and an empty registry means "no NPC is known", which is precisely
+ * what causes duplicate entries. So reads are permissive (render paths must not
+ * throw) but any path that CREATES an entry must call `assertHydrated()` first,
+ * turning a silent data-corrupting bug into a loud, actionable error.
+ */
+
+import { getChatMeta, record } from '../core/index.js';
+import {
+    mergeQuarantineItems,
+    QUARANTINE_SCHEMA_VERSION,
+    validateQuarantineStoreData,
+} from '../core/quarantine.js';
+// The pure preparation runner (design §4.2) — the same engine backup/import
+// and the write seams use, so hydration can never drift onto separate rules
+// (design §8: "never let backup validation and runtime validation drift").
+import { prepareStore } from '../core/schema.js';
+// The visible paused-state surface (design §5.4, Part 5). A blocked hydration
+// pauses the knowledgeStore so the module banner, Scope & storage, Health, and
+// the one-per-chat/scope notification all read the SAME reason. Imported
+// directly (not via the core barrel) so the registry the tests assert against
+// is the real singleton regardless of the test-only barrel→stub alias.
+import { pauseStore, resumeStore } from '../core/schema_status.js';
+// The scope/epoch guard for the two-book hydration orchestration. core/scope.js
+// is import-free and pure, so the direct import is the same convention as the
+// pause singleton above — the REAL epoch singleton even when the test barrel
+// alias swaps core/index.js for the stub (which re-exports the same module).
+import { assertSameScope, captureScope, getEpoch } from '../core/scope.js';
+
+// The lorebook-store sentinel and version are owned by the module schema
+// (knowledge/schema.js) so the schema registry and the runtime can never
+// drift apart. Both are re-exported below for the existing importers.
+import {
+    STORE_SENTINEL,
+    KNOWLEDGE_STORE_VERSION,
+    knowledgeStoreSchema,
+} from './schema.js';
+
+import {
+    state, REGISTRY_KEY, STATE_REGISTRY_KEY, RELATIONSHIP_KEY,
+    LOREBOOK_NAME, STATE_LOREBOOK_NAME,
+} from './state.js';
+
+/** Marks the entry that holds this book's store. Matched as a PREFIX — see isStoreEntry. */
+export { STORE_SENTINEL };
+
+/**
+ * The full title written on the store entry. The sentinel comes first so the
+ * prefix match keeps working; the rest answers the question a user actually has
+ * when they spot this entry in the World Info editor. Nothing about this store
+ * is meant to be hidden — a plainly-labelled entry the user can open and read
+ * is the point.
+ */
+export const STORE_COMMENT =
+    `${STORE_SENTINEL} — extension bookkeeping (0 tokens, never sent to the AI)`;
+
+/**
+ * Is this world-info entry the store entry?
+ *
+ * Prefix match, not equality: entries written before the descriptive title was
+ * added carry the bare sentinel, and the wording after the sentinel may change
+ * again. Any scan that walks a book's entries (imports, audits) must use this
+ * to recognise and skip the store.
+ *
+ * @param {object} entry — a world-info entry
+ * @returns {boolean}
+ */
+export function isStoreEntry(entry) {
+    return typeof entry?.comment === 'string' && entry.comment.startsWith(STORE_SENTINEL);
+}
+
+/** Bumped only on a breaking change to the stored shape. Owned by ./schema.js. */
+export const STORE_VERSION = KNOWLEDGE_STORE_VERSION;
+
+/** How long to wait before flushing a dirty store back to its book. */
+const FLUSH_DEBOUNCE_MS = 1200;
+
+/**
+ * bookName → { data, hydrated, dirty, timer }
+ * @type {Map<string, {data: object, hydrated: boolean, dirty: boolean, timer: any}>}
+ */
+const _cache = new Map();
+
+// Bumped by every cache retirement (resetStoreCache, and the test seam that
+// simulates one). hydrateCurrentBooks captures it alongside its scope token:
+// after a reset, slots re-created by a later hydration are indistinguishable
+// from live ones, so the generation is what marks an orchestration whose
+// books were retired mid-flight — including resets that never bump the epoch
+// (a settings-driven scope change's reloadStores).
+let _cacheGeneration = 0;
+
+// ─── Serialization lock ─────────────────────────────────────────────────────
+//
+// A restore commit (capture → flush → metadata persist → rollback) and a chat-
+// change cache reset both touch the same dirty slots. JS is single-threaded,
+// but an `await` in the middle of one hands the event loop to the other:
+// resetStoreCache() → flushAll() can flush the restore's half-written store,
+// or _cache.clear() can run between a restore's flush and its rollback, leaving
+// the rollback a no-op and the cancelled restore persisted on disk
+// This promise chain makes those operations strictly
+// sequential. `flushBook` stays a non-locking leaf so a held lock does not
+// re-enter; callers that need atomicity across several flushes (flushAll,
+// resetStoreCache, the restore commit) acquire the lock around their whole
+// critical section.
+let _storeChain = Promise.resolve();
+
+// While a restore transaction owns the store, background
+// writeField() calls are deferred so they cannot join the restore's flush
+// (persisted as if they were part of it) or be erased by its rollback. The
+// restore's own writes go through _writeFieldDirect, which bypasses this buffer.
+// Buffered writes are applied once the lock's critical section ends
+// (withStoreLock's finally), so they flush on their own afterwards.
+let _storeTransaction = false;
+const _deferredWrites = [];
+
+/**
+ * Mark that the current lock holder is a restore transaction. Background
+ * writeField() calls are then buffered until the transaction settles. Called by
+ * the restore path (backup/index.js flushKnowledgeStore).
+ */
+export function beginStoreTransaction() {
+    _storeTransaction = true;
+}
+
+/** Apply writes buffered while a restore transaction owned the store. */
+function applyDeferredWrites() {
+    if (_deferredWrites.length === 0) return;
+    const pending = _deferredWrites.splice(0);
+    for (const { bookName, field, value } of pending) {
+        const s = slot(bookName);
+        s.data[field] = value;
+        s.dirty = true;
+        scheduleFlush(bookName);
+    }
+}
+
+/**
+ * Run `fn` once all prior lock holders have settled. `fn` may be async; its
+ * returned promise is what the caller awaits. Rejections never break the chain
+ * so one failed operation cannot wedge every later one.
+ *
+ * When the critical section ends, any restore transaction is closed and
+ * background writes buffered during it are applied.
+ *
+ * @template T
+ * @param {() => (T | Promise<T>)} fn
+ * @returns {Promise<T>}
+ */
+function _withTransactionFinally(fn) {
+    return async () => {
+        try {
+            return await fn();
+        } finally {
+            _storeTransaction = false;
+            applyDeferredWrites();
+        }
+    };
+}
+
+export function withStoreLock(fn) {
+    const wrapped = _withTransactionFinally(fn);
+    const run = _storeChain.then(wrapped, wrapped);
+    _storeChain = run.then(() => undefined, () => undefined);
+    return run;
+}
+
+function blankStore() {
+    return { version: STORE_VERSION };
+}
+
+function slot(bookName) {
+    let entry = _cache.get(bookName);
+    if (!entry) {
+        entry = { data: blankStore(), hydrated: false, dirty: false, timer: null };
+        _cache.set(bookName, entry);
+    }
+    return entry;
+}
+
+/**
+ * Resolve ST's world-info module.
+ *
+ * state.wiScript is a TRI-STATE:
+ *  - `undefined` — nobody has tried to load world-info.js yet.
+ *  - an object   — lorebook.js's top-level import (or our fallback below)
+ *                  succeeded; this is the live module namespace.
+ *  - `null`      — an import was ATTEMPTED and FAILED.
+ *
+ * lorebook.js loads world-info.js as a side-effect (top-level await) and parks
+ * the result on state.wiScript. But store.js cannot import lorebook.js —
+ * lorebook.js already imports store.js, so the reverse would be a circular
+ * dependency. A future caller that imports store.js (plus registry.js / scope.js,
+ * neither of which pull in lorebook.js) without going through the knowledge
+ * barrel would otherwise find state.wiScript === undefined and silently get null
+ * from every hydration. The fallback below keeps store.js self-sufficient.
+ *
+ * Tests that want to simulate "world-info unavailable" set state.wiScript = null
+ * (tried-and-failed), which this function returns directly without retrying.
+ */
+async function getWiScript() {
+    if (state.wiScript !== undefined) {
+        if (state.wiScript === null) {
+            // Phase 3 diagnostics (design §I.4.5, site 5): a previous import
+            // attempt failed and callers are silently operating without the
+            // world-info module — reads come back empty and writes are blocked.
+            record({
+                level: 'warn',
+                module: 'knowledge',
+                event: 'wi_script_unavailable',
+                detail: { stage: 'previous-attempt-failed' },
+            });
+        }
+        return state.wiScript;
+    }
+    try {
+        state.wiScript = await import('../../../../world-info.js');
+        return state.wiScript;
+    } catch (err) {
+        state.wiScript = null;
+        console.warn('[MWT:Knowledge] store: world-info.js unavailable:', err?.message || err);
+        // Phase 3 diagnostics (site 5, fresh failure) — same event as the
+        // short-circuit above so the ring shows one shape for this condition.
+        record({
+            level: 'warn',
+            module: 'knowledge',
+            event: 'wi_script_unavailable',
+            detail: { stage: 'import-failed', error: String(err?.message || err) },
+        });
+        return null;
+    }
+}
+
+/** Find the store entry inside a loaded world-info object, or null. */
+function findStoreEntry(wi) {
+    const entries = wi?.entries;
+    if (!entries) return null;
+    for (const key of Object.keys(entries)) {
+        if (isStoreEntry(entries[key])) return entries[key];
+    }
+    return null;
+}
+
+/**
+ * Remove registry entries whose NAME is the store sentinel — ghosts left by
+ * "Import from Lorebook" runs that predate isStoreEntry() and mistook the
+ * store entry itself for an NPC.
+ *
+ * @param {object} data — store data, mutated in place
+ * @returns {boolean} whether anything was removed
+ */
+function scrubStoreGhosts(data) {
+    const reg = data?.registry;
+    if (!reg || typeof reg !== 'object') return false;
+    let removed = false;
+    for (const name of Object.keys(reg)) {
+        if (name.startsWith(STORE_SENTINEL)) {
+            delete reg[name];
+            removed = true;
+        }
+    }
+    return removed;
+}
+
+// ─── Hydration ──────────────────────────────────────────────────────────────
+
+/**
+ * Abandon a hydration whose cache slot was retired while its IO was pending.
+ *
+ * A chat switch runs resetStoreCache(), which clears `_cache` — a slot
+ * resolved before an await becomes detached the moment that happens. The
+ * success path already abandons such a hydration quietly inside its lock
+ * (below); the FAILURE paths must do the same before they pause: the pause
+ * registry is scope-keyed, so a failure pause raised against a retired slot
+ * would pause and notify the NEW chat about a book it no longer reads. The
+ * reset is followed by its own hydration, which re-diagnoses the (possibly
+ * fixed) book under the correct scope.
+ *
+ * @param {string} bookName
+ * @returns {object} the current slot's data (or a blank store)
+ */
+function abandonStaleHydration(bookName, reason = 'cache-reset') {
+    record({
+        level: 'debug',
+        module: 'knowledge',
+        event: 'schema_hydration_abandoned',
+        detail: { store: 'knowledgeStore', book: bookName, reason },
+    });
+    return _cache.get(bookName)?.data ?? blankStore();
+}
+
+/**
+ * Load a book's store into the cache through the schema owner (Part 4, design
+ * §6.7).
+ *
+ * The four stages run IN ORDER and all of them must succeed before
+ * `hydrated = true` is set:
+ *
+ *   1. parse        the [MWT:store] entry's JSON (corrupt JSON blocks);
+ *   2. version      a store written by a NEWER MWT is refused untouched
+ *                   (§3.5 category 4) — never coerced, never partially read.
+ *                   A missing/invalid version reads as legacy 0;
+ *   3. migration    the schema's 0 -> 1 step (ghost repair, version stamp);
+ *   4. validation   the full §6.7 record contract; rejected records are
+ *                   preserved in the book's EMBEDDED quarantine (§5.1), never
+ *                   silently dropped.
+ *
+ * A blocked stage (fatal root, failed migration, future version, quarantine
+ * that cannot be stored) leaves the book un-hydrated — reads stay empty and
+ * `assertHydrated()` refuses writes, which is the safe direction: treating
+ * unreadable data as "no NPCs known" is what rebuilds books as duplicates.
+ *
+ * Acceptance (Part 4): a store becomes WRITABLE only after its migration is
+ * durably persisted. The commit, the quarantine merge, and the flush run as
+ * ONE critical section under the store lock (serialized with restore
+ * transactions and cache resets); if the flush fails, the cache rolls back
+ * wholesale to the pre-hydration slot and the untouched on-disk original
+ * stays the recoverable state. The migration is idempotent, so the next
+ * hydration simply re-runs it. A cache reset that lands between this
+ * function's IO and its commit retires the slot; the commit then abandons
+ * quietly rather than reporting a failure the store was never in. The scope is
+ * likewise captured before the first await and re-checked in front of every
+ * failure-side pause: the epoch advances before the reset acquires the lock,
+ * and a failure landing in that window abandons instead of pausing the new
+ * scope.
+ *
+ * When the book has no store entry yet, `seed` is adopted as the starting
+ * data and written through immediately. That is the migration path off
+ * `chat_metadata`: callers pass the legacy per-chat values, and the first
+ * hydration moves them into the book. The seed is VALIDATED BEFORE ADOPTION —
+ * it goes through the same 0 -> 1 migration and §6.7 validation, so records
+ * the validator rejects land in the book's quarantine, never in the live
+ * registry. Seeding only ever happens when the book has no store — an
+ * existing store is never overwritten by a seed.
+ *
+ * @param {string} bookName
+ * @param {object} [seed] — legacy data to adopt if the book has no store yet
+ * @param {boolean} [force] — re-read even if already hydrated
+ * @returns {Promise<object>} the hydrated store data
+ */
+export async function hydrateBook(bookName, seed = {}, force = false) {
+    if (!bookName) return blankStore();
+    const s = slot(bookName);
+    // An outgoing chat's failed write still owns this book. Never rehydrate
+    // over the only copy of those edits; the retry timer remains armed.
+    if (s.dirty && s.hydrated) return s.data;
+    if (s.hydrated && !force) return s.data;
+
+    // The scope is captured BEFORE the first await and re-checked in front of
+    // every failure side-effect below. The slot checks alone catch a chat
+    // switch whose resetStoreCache() already took the lock and retired the
+    // slot; they MISS the window before that — CHAT_CHANGED bumps the epoch
+    // synchronously while the reset is still queued behind this hydration's
+    // IO, and in that window the slot still looks current. Only the captured
+    // scope says a failure belongs to the OLD chat: pausing (or otherwise
+    // reporting) it against the new scope would notify the new chat about a
+    // book it no longer reads. hydrateCurrentBooks() applies the same rule to
+    // the two-book orchestration.
+    const scopeAtStart = captureScope();
+    // 'cache-reset' | 'scope-changed' | null (still live) — the reason rides
+    // the abandonment event so the breadcrumb says WHICH check fired.
+    const staleBecause = () => {
+        if (_cache.get(bookName) !== s) return 'cache-reset';
+        return hydrationScopeStillCurrent(scopeAtStart) ? null : 'scope-changed';
+    };
+
+    const wi$ = await getWiScript();
+    if (!wi$) {
+        // A chat switch may have retired this slot (or advanced the epoch
+        // ahead of the queued reset) while the import above was pending — a
+        // module-level failure must not pause the NEW chat's scope.
+        const why = staleBecause();
+        if (why) return abandonStaleHydration(bookName, why);
+        // No world-info module: stay un-hydrated so write paths refuse to run
+        // rather than creating duplicates against an empty registry. This is
+        // reachable if ST's world-info.js is genuinely absent (both the
+        // top-level import in lorebook.js and our own fallback failed) — log
+        // it so the failure is never silent.
+        console.warn(`[MWT:Knowledge] store: world-info.js not loaded — "${bookName}" stays un-hydrated (writes blocked).`);
+        pauseStore('knowledgeStore', {
+            reasonCode: 'world-info-unavailable',
+            message: `SillyTavern's World Info system is not available, so the Knowledge lorebook "${bookName}" cannot be read. Your data was not changed.`,
+        });
+        // The failure-state breadcrumb: no version could be observed.
+        s.observedVersion = null;
+        return s.data;
+    }
+
+    let wi = null;
+    let loadFailed = false;
+    try {
+        wi = await wi$.loadWorldInfo(bookName);
+    } catch (err) {
+        loadFailed = true;
+        console.warn(`[MWT:Knowledge] store: could not load "${bookName}":`, err?.message || err);
+    }
+
+    // KNOWLEDGE-02: A failed load must NOT fall through to the "no store entry
+    // yet" branch — that would set hydrated=true against an empty registry and
+    // rebuild the whole book as duplicates beside entries still on disk.
+    // Mirror the corrupt-JSON stance below: stay un-hydrated and shout, so
+    // assertHydrated() blocks writes until the load succeeds.
+    if (loadFailed) {
+        // The load awaited above: a chat switch in that window retired this
+        // slot or advanced the epoch ahead of the queued reset — the OLD
+        // book's failure must not pause the new chat either way.
+        const why = staleBecause();
+        if (why) return abandonStaleHydration(bookName, why);
+        console.error(
+            `[MWT:Knowledge] store: load of "${bookName}" failed — refusing to ` +
+            `treat it as empty. Writes are blocked until this is resolved.`
+        );
+        pauseStore('knowledgeStore', {
+            reasonCode: 'book-load-failed',
+            message: `its lorebook "${bookName}" could not be loaded (see the console for the load error). Your data was not changed. Retry in a moment, or check the World Info file.`,
+        });
+        // The load never reached the entry, so no version could be observed.
+        s.observedVersion = null;
+        return s.data;
+    }
+
+    // ── Stage 1: parse ──────────────────────────────────────────────────────
+    const entry = findStoreEntry(wi);
+    let source;
+    let seedAdoption = false;
+    if (entry) {
+        let parsed;
+        try {
+            parsed = JSON.parse(entry.content || '{}');
+        } catch (err) {
+            // A chat switch in the load's await window retired this slot or
+            // advanced the epoch ahead of the queued reset — the stale book's
+            // corruption must not pause the new chat.
+            const why = staleBecause();
+            if (why) return abandonStaleHydration(bookName, why);
+            // A corrupt store is the one case where we must NOT silently fall
+            // back to empty — that would look like "no NPCs known" and rebuild
+            // the whole book as duplicates. Stay un-hydrated and shout.
+            console.error(
+                `[MWT:Knowledge] store: the ${STORE_SENTINEL} entry in "${bookName}" is not valid ` +
+                `JSON (${err?.message}). Refusing to treat it as empty — fix or delete that entry. ` +
+                `Writes are blocked until this is resolved.`
+            );
+            pauseStore('knowledgeStore', {
+                reasonCode: 'store-json-invalid',
+                message: `the tracker entry in its lorebook "${bookName}" is not valid JSON, so MWT cannot safely read it. Your data was not changed. Fix or remove the ${STORE_SENTINEL} entry in SillyTavern's World Info editor, then retry.`,
+            });
+            // Corrupt JSON: the on-disk version could not be determined.
+            s.observedVersion = null;
+            return s.data;
+        }
+        source = parsed;
+        if (source && typeof source === 'object' && !Array.isArray(source) && source._note !== undefined) {
+            // Written on flush purely as a human-readable hint — not data.
+            // Stripped BEFORE preparation so its round-tripped presence never
+            // reads as a change worth persisting on every load.
+            source = { ...source };
+            delete source._note;
+        }
+    } else {
+        // No store entry yet: adopt the legacy chat_metadata values — raw, so
+        // stages 2–4 validate the seed BEFORE it enters the store (§6.7). The
+        // 0 -> 1 migration owns stamping the version and scrubbing ghosts, so
+        // what enters the book is the canonical accepted store, never the
+        // seed as-is.
+        source = seed || {};
+        seedAdoption = true;
+    }
+
+    // ── Stages 2–4: version gate, migration, validation (pure runner) ───────
+    // A missing or invalid embedded version reads as legacy 0 (the migration
+    // stamps it); a NEWER version is refused untouched by the runner.
+    const storedVersion = Number.isInteger(source?.version) && source.version > 0 ? source.version : 0;
+    const prepared = prepareStore(knowledgeStoreSchema, source, { version: storedVersion });
+    if (prepared.status !== 'valid' && prepared.status !== 'migrated') {
+        // Blocked (fatal root, failed migration, future version, quarantine
+        // that cannot be stored) — or deferred, which no knowledgeStore code
+        // emits today but must still fail closed if one ever appears. The
+        // original is untouched; the book stays un-hydrated so writes are
+        // blocked and the reason is visible in the console and diagnostics.
+        // The preparation ran after this function's awaits: if a chat switch
+        // retired the slot or advanced the epoch in that window, the old
+        // book's block must not pause the new chat.
+        const why = staleBecause();
+        if (why) return abandonStaleHydration(bookName, why);
+        const code = prepared.error?.code ?? 'deferred';
+        console.error(
+            `[MWT:Knowledge] store: "${bookName}" could not be prepared for use ` +
+            `(${code}); the original ${STORE_SENTINEL} entry was left unchanged. ` +
+            `Writes are blocked until this is resolved.`
+        );
+        record({
+            level: 'warn',
+            module: 'knowledge',
+            event: code === 'future-version' ? 'schema_blocked_future_version' : 'schema_migration_failed',
+            detail: { store: 'knowledgeStore', book: bookName, code, fromVersion: prepared.fromVersion },
+        });
+        pauseStore('knowledgeStore', {
+            reasonCode: code,
+            version: prepared.fromVersion,
+            message: code === 'future-version'
+                ? `its Knowledge lorebook "${bookName}" was saved by a NEWER version of MWT (v${prepared.fromVersion}; this build supports up to v${knowledgeStoreSchema.currentVersion}). Your data was not changed — upgrade MWT to read it, or open this chat on the newer install.`
+                : `its Knowledge lorebook "${bookName}" could not be safely prepared for use (${code}). Your data was not changed. Export a backup from the newer/working install if you have one, then retry.`,
+        });
+        // Preserve the on-disk version this failure observed (99 for a
+        // future-version block), separately from the blank placeholder data
+        // the slot keeps — peekStore surfaces it so a diagnostics row can
+        // render "99 / 1" instead of the placeholder's "1 / 1".
+        s.observedVersion = Number.isInteger(prepared.fromVersion) ? prepared.fromVersion : null;
+        return s.data;
+    }
+
+    // ── Stage 5: durable commit under the store lock ────────────────────────
+    // Install the accepted store, merge the quarantine additions into the
+    // book's embedded container, and flush BEFORE the book becomes writable —
+    // one critical section, serialized against restore transactions and cache
+    // resets, with a wholesale rollback when the flush fails. Nothing legit
+    // can write into the slot mid-section: creation paths assertHydrated()
+    // first and it is still false here.
+    return withStoreLock(async () => {
+        // The slot was resolved BEFORE this function's awaits (getWiScript,
+        // loadWorldInfo, and the queue behind this lock). A resetStoreCache()
+        // that took the lock in between cleared `_cache`, so `s` is now
+        // detached from it: committing here would write into an object no
+        // accessor reads, and flushBook() — which resolves the slot from
+        // `_cache` — would find nothing, return false, and report a
+        // persistence failure for a store that was never at risk (a red
+        // console error plus a schema_persist_failed event on an ordinary
+        // double chat change). Abandon this hydration quietly instead. The
+        // reset that replaced the slot is followed by its own hydration, and
+        // preparation is pure, so nothing is lost by redoing it there.
+        if (_cache.get(bookName) !== s) {
+            return abandonStaleHydration(bookName);
+        }
+
+        const before = { data: s.data, hydrated: s.hydrated, dirty: s.dirty };
+
+        let next = prepared.data;
+        if (prepared.quarantined.length > 0) {
+            // Per-book quarantine (§5.1): the rejected records ride INSIDE the
+            // store entry, persisted by the same save as the migrated data —
+            // the pair is all-or-nothing (§7.3's single-write rule, applied to
+            // the lorebook's own persistence system).
+            const container = next.quarantine;
+            const existingItems = container && typeof container === 'object' && !Array.isArray(container)
+                && Array.isArray(container.items)
+                ? container.items
+                : [];
+            next = {
+                ...next,
+                [STORE_QUARANTINE_FIELD]: {
+                    version: QUARANTINE_SCHEMA_VERSION,
+                    items: mergeQuarantineItems(existingItems, prepared.quarantined),
+                },
+            };
+        }
+
+        // Compatibility lazy repair (Part 2 leaves the runtime call in place
+        // until the central path owns every repair): a CURRENT-version store
+        // can still carry a ghost, e.g. one written by an older build whose
+        // own scrub flush failed. v0 stores had theirs recorded as a repair
+        // issue by the migration above.
+        const ghostRemoved = !seedAdoption && storedVersion >= knowledgeStoreSchema.currentVersion
+            ? scrubStoreGhosts(next)
+            : false;
+
+        const hasSeedData = seedAdoption && Object.keys(seed || {}).some(k => {
+            const v = seed[k];
+            return v && typeof v === 'object' && Object.keys(v).length > 0;
+        });
+        // A seed persists only when it carried something worth migrating —
+        // creating a book and entry for a blank store is waste. An existing
+        // store persists exactly when preparation changed something, the
+        // quarantine merge did, or the compatibility scrub did, so canonical
+        // repairs are saved once instead of being rediscovered every load.
+        const needsPersist = seedAdoption
+            ? hasSeedData
+            : (prepared.changed || prepared.quarantined.length > 0 || ghostRemoved);
+
+        s.data = next;
+        s.dirty = false;
+        if (needsPersist) {
+            if (seedAdoption) {
+                console.log(`[MWT:Knowledge] store: migrating legacy chat metadata into "${bookName}".`);
+            }
+            let persisted = false;
+            try {
+                // Non-locking leaf by design: the lock is already held here.
+                persisted = await flushBook(bookName);
+            } catch (err) {
+                console.warn(`[MWT:Knowledge] store: hydration flush of "${bookName}" failed:`, err?.message || err);
+            }
+            if (!persisted) {
+                // Roll back wholesale. The disk original is untouched (the
+                // save failed), so the cache must not serve the migrated
+                // value either — writes would build on a store that never
+                // reached disk. Restoring the pre-hydration slot keeps the
+                // book un-writable (Part 4 acceptance), and the idempotent
+                // migration simply re-runs on the next hydration.
+                if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+                s.data = before.data;
+                s.hydrated = before.hydrated;
+                s.dirty = before.dirty;
+                if (before.dirty) scheduleFlush(bookName);
+                // The disk original is untouched, so the version this load
+                // DID observe is what a still-un-hydrated slot reports
+                // (ignored whenever the rollback restored a hydrated slot).
+                s.observedVersion = Number.isInteger(prepared.fromVersion) ? prepared.fromVersion : null;
+                console.error(
+                    `[MWT:Knowledge] store: could not persist the prepared store for ` +
+                    `"${bookName}" — the book stays un-hydrated (writes blocked) and the ` +
+                    `original entry was left unchanged. This will be retried on the next load.`
+                );
+                record({
+                    level: 'warn',
+                    module: 'knowledge',
+                    event: 'schema_persist_failed',
+                    detail: { store: 'knowledgeStore', book: bookName },
+                });
+                // The flush awaited INSIDE the lock: the epoch can advance
+                // while the (lock-queued) reset still waits, so the same
+                // stale-scope rule gates this pause. The rollback above is
+                // slot-local and always runs.
+                if (!staleBecause()) {
+                    pauseStore('knowledgeStore', {
+                        reasonCode: 'persist-failed',
+                        message: 'MWT found invalid saved data but could not safely store a recovery copy. Your original data was not changed. Free some storage or export a backup, then retry.',
+                    });
+                }
+                return s.data;
+            }
+        }
+
+        // All four stages succeeded and the migration (if any) is durable:
+        // only now does the book become writable.
+        s.hydrated = true;
+        // The canonical `data.version` is live again — no stale failure
+        // breadcrumb may survive a successful load.
+        s.observedVersion = null;
+        // NOTE: no resumeStore() here. The knowledgeStore id spans TWO books
+        // (Knowledge Tracker + State Tracker); one book hydrating must not
+        // clear a pause the OTHER book's block raised. hydrateCurrentBooks()
+        // — the path that owns both — resumes the store only when BOTH are
+        // healthy.
+        // Report a migration only when one was actually WRITTEN. An empty
+        // seed for a book with no store entry also reads as version 0 and
+        // comes back status 'migrated', but nothing is persisted and no book
+        // is created — announcing it would log a migration that never
+        // happened for both books on every chat change of a fresh install or
+        // any scoped book, which is exactly the noise the diagnostics ring
+        // must not carry. Outside the seed path a migration always sets
+        // `changed`, so this never hides a real one.
+        if (prepared.status === 'migrated' && needsPersist) {
+            console.log(`[MWT:Knowledge] store: migrated "${bookName}" to schema version ${prepared.toVersion}.`);
+            record({
+                level: 'info',
+                module: 'knowledge',
+                event: 'schema_migrated',
+                detail: {
+                    store: 'knowledgeStore',
+                    book: bookName,
+                    fromVersion: prepared.fromVersion,
+                    toVersion: prepared.toVersion,
+                },
+            });
+        }
+        if (prepared.quarantined.length > 0) {
+            // Counts only (§5.2): never log quarantined record content.
+            console.warn(
+                `[MWT:Knowledge] store: quarantined ${prepared.quarantined.length} record(s) from ` +
+                `"${bookName}" — preserved in the book's store entry for recovery.`
+            );
+            record({
+                level: 'warn',
+                module: 'knowledge',
+                event: 'schema_quarantined',
+                detail: { store: 'knowledgeStore', book: bookName, count: prepared.quarantined.length },
+            });
+        }
+        if (ghostRemoved) {
+            console.log(`[MWT:Knowledge] store: removed a "${STORE_SENTINEL}" ghost NPC from "${bookName}".`);
+        }
+        return s.data;
+    });
+}
+
+/** Has this book's store been loaded into the cache? */
+export function isHydrated(bookName) {
+    return !!_cache.get(bookName)?.hydrated;
+}
+
+/**
+ * Throw unless the book's store is loaded.
+ *
+ * Call this before any operation that could CREATE a lorebook entry. Reading an
+ * un-hydrated (empty) registry reports every NPC as unknown, which is what
+ * produces duplicate entries — so this converts a silent corruption into an
+ * error the user can act on.
+ *
+ * @param {string} bookName
+ * @param {string} [context] — what the caller was trying to do
+ */
+export function assertHydrated(bookName, context = 'write') {
+    if (isHydrated(bookName)) return;
+    throw new Error(
+        `Knowledge store for "${bookName}" is not loaded yet — refusing to ${context}. ` +
+        `Proceeding would treat every NPC as new and create duplicate lorebook entries. ` +
+        `Reopen the chat, or check the console for an earlier store-load error.`
+    );
+}
+
+/**
+ * Read-only peek at a book's cached store slot (Diagnostics Phase 8).
+ *
+ * The Scope & storage tab reports hydration + store version per book, and the
+ * existing accessors cannot answer that without side effects: `readField()`
+ * INSTALLS its fallback into the store data, and `hydrateBook()` performs IO.
+ * This is the one read-only view — it touches nothing, flushes nothing, and
+ * never creates a cache slot for a book that has not been touched.
+ *
+ * @param {string} bookName
+ * @returns {{ hydrated: boolean, dirty: boolean, version: number|null,
+ *            fields: string[], observedVersion: number|null }|null} — null
+ *            when the book has no cache slot; observedVersion is the on-disk
+ *            version a FAILED load saw (null when it could not be read)
+ */
+export function peekStore(bookName) {
+    const s = _cache.get(bookName);
+    if (!s) return null;
+    return {
+        hydrated: s.hydrated === true,
+        dirty: s.dirty === true,
+        version: typeof s.data?.version === 'number' ? s.data.version : null,
+        fields: Object.keys(s.data ?? {}),
+        // The on-disk version OBSERVED at a failed load, kept separately from
+        // the live data (design §5.3's "observed, not canonical" rule): a
+        // failed slot's `data` is the blank placeholder — hydrateBook never
+        // adopts the blocked source — so `version` reports the CURRENT
+        // version, not the book's. Surfaces displaying a stored version for an
+        // un-hydrated slot must read this instead; null when the version could
+        // not be observed (corrupt JSON, failed load, no world-info module).
+        observedVersion: Number.isInteger(s.observedVersion) ? s.observedVersion : null,
+    };
+}
+
+/**
+ * Read-only DEEP COPY of a book's cached store data (schema plan Part 5).
+ *
+ * The Integrity tab validates the live knowledgeStore through its registered
+ * schema, and the validation contract is no-mutation — but handing a caller
+ * the LIVE cache object would still let a faulty validator or a caller holding
+ * the reference too long mutate what accessors read. This returns a JSON copy
+ * (the captureStoreState clone pattern), so no consumer can touch the cache
+ * through it. Like peekStore(): null when the book has no cache slot, and no
+ * slot is ever created.
+ *
+ * @param {string} bookName
+ * @returns {object|null}
+ */
+export function peekStoreData(bookName) {
+    const s = _cache.get(bookName);
+    if (!s) return null;
+    try {
+        return JSON.parse(JSON.stringify(s.data ?? {}));
+    } catch {
+        // Non-JSON data cannot be validated or exported — report that honestly
+        // rather than handing back an alias of the live object.
+        return { __unserializable: true };
+    }
+}
+
+/**
+ * Names of every book whose store slot is currently hydrated (Part 5). The
+ * recovery export/clear reads the books this SESSION actually loaded — no book
+ * name has to be re-derived here (resolveBookNames() is a writer: it saves a
+ * binding, and recovery collection must stay read-only).
+ *
+ * @returns {string[]}
+ */
+export function getHydratedBooks() {
+    const names = [];
+    for (const [bookName, s] of _cache) {
+        if (s?.hydrated === true) names.push(bookName);
+    }
+    return names;
+}
+
+/**
+ * Clear one book's embedded quarantine container and durably flush it
+ * (recovery clear, design §5.3 — an explicit, confirmed, user-initiated
+ * operation; nothing here runs from a load or a render path).
+ *
+ * Refuses (like every embedded-container write) when the book is not hydrated
+ * or its container was written by a newer MWT — a refused container must be
+ * left unchanged, not emptied.
+ *
+ * The clear empties the LIVE cache before the flush proves the deletion
+ * persisted, so the whole operation runs as ONE critical section under the
+ * store lock (serialized with restore transactions and cache resets) with a
+ * rollback when the flush fails: the recovery export reads the cache — a
+ * failed clear must not report the records gone — and a later dirty-slot
+ * flush must not persist a deletion that never reached the book.
+ * `flushBook` stays a non-locking leaf, so it is safe to call with the lock
+ * held (the hydration commit's pattern).
+ *
+ * @param {string} bookName
+ * @returns {Promise<{ ok: boolean, reason?: string, cleared: boolean }>}
+ */
+export async function clearStoreQuarantine(bookName) {
+    return withStoreLock(async () => {
+        // Under the lock (also for the refusal read): a reset or restore that
+        // ran between a caller's check and this critical section must never
+        // be cleared over.
+        const check = refusedQuarantineContainer(bookName);
+        if (!check.ok) return { ok: false, reason: check.reason, cleared: false };
+        if (check.validated.data.items.length === 0) return { ok: true, cleared: false };
+        const s = _cache.get(bookName);
+        if (!s || !s.hydrated) return { ok: false, reason: 'store-not-hydrated', cleared: false };
+        // Activate the deferred-write transaction for the whole critical
+        // section (the restore pattern). withStoreLock serializes lock users,
+        // but an ordinary writeField() is synchronous and can land while
+        // flushBook() below awaits its IO; restoring savedDirty (usually
+        // false) in the rollback would then leave that background value in
+        // memory marked clean — silently lost on the next reload. Buffered
+        // here, it is applied (dirty, scheduled) once this section settles,
+        // whichever way the flush went. This function's own writes go through
+        // _writeFieldDirect, which bypasses the buffer — the restore seam.
+        beginStoreTransaction();
+        // Field-scoped snapshot: only this function's own mutation is rolled
+        // back, so a background write to another field that interleaved with
+        // the flush's IO survives untouched.
+        const savedContainer = s.data[STORE_QUARANTINE_FIELD];
+        const savedDirty = s.dirty;
+        _writeFieldDirect(bookName, STORE_QUARANTINE_FIELD, {
+            version: QUARANTINE_SCHEMA_VERSION,
+            items: [],
+        });
+        let persisted = false;
+        try {
+            persisted = await flushBook(bookName);
+        } catch { persisted = false; }
+        if (!persisted) {
+            // Roll the slot back to its pre-clear state (the hydration
+            // rollback pattern): the disk original never changed, so the live
+            // view must keep showing — and exporting — the records.
+            if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+            s.data[STORE_QUARANTINE_FIELD] = savedContainer;
+            s.dirty = savedDirty;
+            if (s.dirty) scheduleFlush(bookName);
+            console.error(
+                `[MWT:Knowledge] store: clearing the embedded quarantine in ` +
+                `"${bookName}" failed — the in-memory store was rolled back and ` +
+                `the book's records are untouched. Nothing was cleared; retry the clear.`
+            );
+            return { ok: false, reason: 'flush-failed', cleared: false };
+        }
+        return { ok: true, cleared: true };
+    });
+}
+
+// ─── Field access ───────────────────────────────────────────────────────────
+
+/**
+ * Read a field from a book's store, installing `fallback` when it is absent.
+ *
+ * Installing (rather than just returning) the fallback preserves the semantics
+ * of the `chat_metadata` version this replaced: `getRegistry()` returned a
+ * stable object that callers could mutate in place before calling save. Handing
+ * back a fresh `{}` each time would silently drop those mutations.
+ *
+ * Installing does NOT mark the store dirty — an empty registry is not a change
+ * worth writing, and if the book is not hydrated yet the value is replaced
+ * wholesale by `hydrateBook` anyway.
+ *
+ * Safe to call before hydration; render paths rely on that.
+ */
+export function readField(bookName, field, fallback = {}) {
+    if (!bookName) return fallback;
+    const s = slot(bookName);
+    const value = s.data[field];
+    if (value === undefined || value === null) {
+        s.data[field] = fallback;
+        return fallback;
+    }
+    return value;
+}
+
+/**
+ * Write a field into a book's store and schedule a flush.
+ * The in-memory value updates synchronously so sync callers see it immediately.
+ *
+ * While a restore transaction owns the store (beginStoreTransaction), this is
+ * deferred: the write is buffered and applied once the transaction settles, so
+ * it cannot join the restore's flush or be erased by its rollback
+ * The restore's own writes use _writeFieldDirect.
+ */
+export function writeField(bookName, field, value) {
+    if (!bookName) return;
+    if (_storeTransaction) {
+        _deferredWrites.push({ bookName, field, value });
+        return;
+    }
+    const s = slot(bookName);
+    s.data[field] = value;
+    s.dirty = true;
+    scheduleFlush(bookName);
+}
+
+/**
+ * Write a field bypassing the transaction buffer. Used by the restore path so
+ * its own writes apply to the live cache immediately while background writes are
+ * deferred. @internal
+ */
+export function _writeFieldDirect(bookName, field, value) {
+    const s = slot(bookName);
+    s.data[field] = value;
+    s.dirty = true;
+    scheduleFlush(bookName);
+}
+
+// ─── Embedded store quarantine (design §5.1) ────────────────────────────────
+//
+// A global/scoped lorebook is SHARED across chats, so its recovery records
+// must live inside the book's own store entry — a chat-local
+// `mwt_schema_quarantine` container cannot correctly own them. The container
+// uses the exact same shape and validator as the chat-local one; the store
+// schema (knowledge/schema.js) accepts it as the `quarantine` field.
+
+/** The store-data field holding a book's embedded quarantine container. */
+export const STORE_QUARANTINE_FIELD = 'quarantine';
+
+function refusedQuarantineContainer(bookName) {
+    const s = _cache.get(bookName);
+    if (!s || !s.hydrated) return { ok: false, reason: 'store-not-hydrated' };
+    const container = s.data?.[STORE_QUARANTINE_FIELD];
+    // An ABSENT container is the normal pre-quarantine state, not corruption —
+    // it validates as an empty container and the first merge creates it.
+    if (container === undefined || container === null) {
+        return {
+            ok: true,
+            validated: { data: { version: QUARANTINE_SCHEMA_VERSION, items: [] }, issues: [], stats: { added: 0, updated: 0, conflicts: 0 } },
+        };
+    }
+    const validated = validateQuarantineStoreData(container);
+    if (validated.issues.some(issue => issue.code === 'future-version')) {
+        // Unknown-future-version guardrail (§3.5 cat 4): never downgrade a
+        // container this build cannot understand.
+        return { ok: false, reason: 'quarantine-version-future' };
+    }
+    // Any other NON-REPAIR finding means part of the persisted container could
+    // not be preserved in its canonical form — a malformed root or items list,
+    // or items the checker rejected as unrecoverable (design §5.2). Merging
+    // into the canonical form would overwrite the container and silently
+    // delete those records, so the container is refused whole: a failed merge
+    // leaves the book untouched. Repair findings (a recomputed fingerprint)
+    // preserve the raw record and never refuse.
+    const lossy = validated.issues.find(issue => issue.severity === 'quarantine' || issue.severity === 'fatal');
+    if (lossy) {
+        return { ok: false, reason: 'quarantine-container-invalid' };
+    }
+    return { ok: true, validated };
+}
+
+/**
+ * Inspect a book's embedded quarantine container for a caller that must not
+ * silently omit recovery data (e.g. a backup export): `ok: false` means the
+ * container is refused — not loaded, written by a newer MWT, or malformed in a
+ * way this build cannot preserve — so the container must be surfaced, not read
+ * as "no items".
+ *
+ * @param {string} bookName
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function getStoreQuarantineContainerStatus(bookName) {
+    const check = refusedQuarantineContainer(bookName);
+    return check.ok ? { ok: true } : { ok: false, reason: check.reason };
+}
+
+/**
+ * Read a book's embedded quarantine items (canonical, deduplicated). A book
+ * with no cache slot, an un-hydrated slot, no container, or a container this
+ * build must refuse all read as "no items" — this is a READ; the container
+ * itself is never rewritten here.
+ *
+ * @param {string} bookName
+ * @returns {object[]}
+ */
+export function getStoreQuarantineItems(bookName) {
+    const check = refusedQuarantineContainer(bookName);
+    return check.ok ? check.validated.data.items : [];
+}
+
+/**
+ * Can quarantine items be merged into this book's embedded container right
+ * now? Refusal reasons: the book's store is not loaded (writing an un-hydrated
+ * slot would be erased by the next hydration) or its container was written by
+ * a newer MWT (must be left unchanged).
+ *
+ * @param {string} bookName
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function canMergeStoreQuarantine(bookName) {
+    const check = refusedQuarantineContainer(bookName);
+    return check.ok ? { ok: true } : { ok: false, reason: check.reason };
+}
+
+/**
+ * Merge quarantine items into a book's embedded container and schedule the
+ * flush (during a restore transaction the write goes through the direct seam
+ * so it joins the transaction's own flush and is covered by its rollback).
+ * Content fingerprints dedup a record that is already stored.
+ *
+ * @param {string} bookName
+ * @param {object[]} items quarantine items (makeQuarantineItem shape)
+ * @returns {{ ok: boolean, reason?: string, stored: number }} `stored` is the
+ *   item count after the merge; `ok: false` means NOTHING was written — the
+ *   caller must treat preserving the records as failed and block.
+ */
+export function mergeStoreQuarantineItems(bookName, items) {
+    if (!Array.isArray(items) || items.length === 0) return { ok: true, stored: 0 };
+    const check = refusedQuarantineContainer(bookName);
+    if (!check.ok) return { ok: false, reason: check.reason, stored: 0 };
+    const merged = mergeQuarantineItems(check.validated.data.items, items);
+    const container = { version: QUARANTINE_SCHEMA_VERSION, items: merged };
+    if (_storeTransaction) {
+        _writeFieldDirect(bookName, STORE_QUARANTINE_FIELD, container);
+    } else {
+        writeField(bookName, STORE_QUARANTINE_FIELD, container);
+    }
+    return { ok: true, stored: merged.length };
+}
+
+/**
+ * Capture complete cache slots before a multi-book operation. The restore path
+ * uses this to ensure a failed transaction cannot be retried later by flushAll
+ * with data it already reported as not committed.
+ */
+export function captureStoreState(bookNames) {
+    const snapshot = new Map();
+    for (const bookName of bookNames) {
+        const s = _cache.get(bookName);
+        if (!s) continue;
+        snapshot.set(bookName, {
+            data: JSON.parse(JSON.stringify(s.data)),
+            dirty: s.dirty,
+        });
+    }
+    return snapshot;
+}
+
+/**
+ * Restore slots captured by captureStoreState(), including their dirty state.
+ * `flushBooks` marks selected restored slots dirty so callers can durably undo
+ * a preceding successful write without leaking the failed transaction later.
+ */
+export function restoreStoreState(snapshot, { flushBooks = [] } = {}) {
+    const toFlush = new Set(flushBooks);
+    for (const [bookName, saved] of snapshot || []) {
+        const s = _cache.get(bookName);
+        if (!s) continue;
+        if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+        s.data = JSON.parse(JSON.stringify(saved.data));
+        s.dirty = saved.dirty || toFlush.has(bookName);
+        if (s.dirty) scheduleFlush(bookName);
+    }
+}
+
+// ─── Flushing ───────────────────────────────────────────────────────────────
+
+function scheduleFlush(bookName) {
+    const s = slot(bookName);
+    if (s.timer) clearTimeout(s.timer);
+    s.timer = setTimeout(() => {
+        s.timer = null;
+        // Serialize the debounced flush with restore transactions and cache
+        // resets an unguarded flush could interleave with
+        // a restore's flush/rollback and re-persist cancelled data.
+        withStoreLock(() => flushBook(bookName)).catch(err => {
+            console.warn(`[MWT:Knowledge] store: flush of "${bookName}" failed:`, err?.message || err);
+        });
+    }, FLUSH_DEBOUNCE_MS);
+}
+
+/**
+ * Write the cached store into an already-loaded world-info object, in place.
+ *
+ * This is the one function that actually renders the store into a book, and it
+ * is synchronous by design. Every code path that saves a book calls it just
+ * before `saveWorldInfo`, so the store always travels with whatever else is
+ * being written.
+ *
+ * That matters because both this module and `writeToLorebook` do
+ * load-modify-save on the SAME book. Without this, the two could interleave:
+ *
+ *   writeToLorebook loads v1 → store flush loads v1 →
+ *   writeToLorebook saves v1+entry → store flush saves v1+store
+ *
+ * and the last write would silently drop the entry that had just been created.
+ * Folding the store into the caller's own save removes the second writer.
+ *
+ * No-ops when the book has no cached store, so it is always safe to call.
+ *
+ * @param {string} bookName
+ * @param {object} wi — a loaded world-info object (mutated in place)
+ * @returns {boolean} whether a store entry was written
+ */
+export function applyStoreToWorldInfo(bookName, wi) {
+    const s = _cache.get(bookName);
+    if (!s || !wi || !wi.entries) return false;
+
+    // `_note` is written for the benefit of anyone who stumbles across this
+    // entry in the World Info editor, and stripped again on read so it never
+    // accumulates in the cached data.
+    const content = JSON.stringify({
+        _note: 'MWT bookkeeping for this lorebook (NPC registry, relationships, state '
+             + 'tracker registry). Never sent to the AI: it has no keywords and is '
+             + 'disabled, non-constant, and non-vectorized — and MWT re-asserts those '
+             + 'flags on every save. Deleting this entry resets the registry for this '
+             + 'book, which can cause duplicate entries on the next scan.',
+        ...s.data,
+    });
+    let entry = findStoreEntry(wi);
+
+    if (!entry) {
+        const uids = Object.keys(wi.entries).map(Number).filter(n => !Number.isNaN(n));
+        const newUid = uids.length > 0 ? Math.max(...uids) + 1 : 0;
+        entry = {
+            uid: newUid,
+            // No keywords: ST's world-info can never keyword-match this entry,
+            // so it is structurally impossible for it to reach the prompt.
+            key: [],
+            keysecondary: [],
+            comment: STORE_COMMENT,
+            content,
+            // Belt and braces on top of the empty keyword list.
+            enabled: false, disable: true, constant: false, selective: false,
+            order: 100, position: 0, addMemo: true,
+            group: '', groupOverride: false, groupWeight: 100,
+            sticky: null, cooldown: null, delay: null,
+            probability: 100, useProbability: true, depth: 4,
+            selectiveLogic: 0, excludeRecursion: true, preventRecursion: true,
+            delayUntilRecursion: false, scanDepth: null, caseSensitive: null,
+            matchWholeWords: null, useGroupScoring: null, automationId: '',
+            role: null, vectorized: false, displayIndex: newUid,
+        };
+        wi.entries[newUid] = entry;
+    } else {
+        entry.content = content;
+        // Repair an entry that was edited into an injecting state — by a user
+        // poking at it in the World Info editor, or by an import that
+        // normalised the flags.
+        //
+        // An empty keyword list only defeats KEYWORD matching. Two flags bypass
+        // keywords entirely and must be re-asserted every write:
+        //   constant   — injects unconditionally, keywords irrelevant
+        //   vectorized — retrievable by embedding similarity (Vector Storage)
+        entry.key = [];
+        entry.keysecondary = [];
+        entry.constant = false;
+        entry.vectorized = false;
+        entry.disable = true;
+        entry.enabled = false;
+        // Keep the title canonical: upgrades entries written before the
+        // descriptive title existed, and undoes partial edits. The sentinel
+        // prefix is this entry's identity, so it must not drift.
+        entry.comment = STORE_COMMENT;
+    }
+
+    // Cancel the pending debounced flush but do NOT clear `dirty` — that is
+    // the caller's job, AFTER its save resolves (see markStoreClean).
+    //
+    // Cancelling the timer here is still correct and must stay eager: the whole
+    // point of folding the store into the caller's save is to remove the second
+    // writer, so a debounced flush firing alongside it would reintroduce the
+    // interleaving this function exists to prevent. Clearing `dirty` is a
+    // different claim entirely — it asserts the data reached disk, which cannot
+    // be true yet, because this function is synchronous and the save it is
+    // being folded into has not been awaited.
+    if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+    return true;
+}
+
+/**
+ * Mark a book's store as persisted. Call ONLY after the `saveWorldInfo` that
+ * carried it has resolved successfully.
+ *
+ * A book that stays dirty is retried by the next {@link flushAll} (chat change,
+ * reload) and re-armed by the next {@link writeField}, so a transient failure
+ * costs a retry rather than the data.
+ *
+ * @param {string} bookName
+ */
+export function markStoreClean(bookName) {
+    const s = _cache.get(bookName);
+    if (s) s.dirty = false;
+}
+
+/**
+ * Save a world-info book and wait for it to actually reach disk.
+ *
+ * ST's `saveWorldInfo(name, data)` does NOT write when called with two
+ * arguments. It refreshes `worldInfoCache` synchronously, hands the write to a
+ * module-level `saveWorldDebounced`, and returns — so awaiting it proves only
+ * that a timer was armed. Two consequences follow, and both silently lose
+ * writes:
+ *
+ *   1. `saveWorldDebounced` is ONE debounced function shared by every book, and
+ *      ST's `debounce()` closes over a single timer that each call clears. Save
+ *      book A and then book B inside the 1s window and A's write is discarded —
+ *      never retried, never logged. `flushAll()` does exactly that: it awaits
+ *      the Knowledge book and then the State book back to back.
+ *   2. Any immediate save anywhere in ST runs `cancelDebounce(saveWorldDebounced)`
+ *      first, which drops a pending write belonging to any book. So does a page
+ *      reload inside the window.
+ *
+ * Meanwhile `worldInfoCache` already holds the new data, so every read for the
+ * rest of the session looks correct and nothing appears wrong until a reload.
+ * That is what "the profile is in the NPC Profiles lorebook but the registry
+ * forgot its profileUid" looks like from the outside.
+ *
+ * The third argument makes ST await the actual POST. That is precisely what
+ * {@link markStoreClean} and every `{ success: true }` in this module already
+ * claim, so it is the only call form either of them is entitled to. Forks
+ * predating the flag ignore the extra argument harmlessly.
+ *
+ * @param {object} wi$ — ST's world-info module
+ * @param {string} bookName
+ * @param {object} wi — the world-info object to write
+ * @returns {Promise<void>}
+ */
+export async function saveBookNow(wi$, bookName, wi) {
+    await wi$.saveWorldInfo(bookName, wi, true);
+    refreshWorldInfoEditor(wi$, bookName);
+}
+
+/**
+ * Re-render ST's World Info editor when — and only when — it is showing this
+ * book. The editor holds its own copy of the book and saves that WHOLE copy on
+ * its next edit, so without a refresh every MWT write since the editor loaded
+ * (entries, the [MWT:store] entry, cleanup recovery) would be reverted by the
+ * user's next keystroke there. ST's reloadEditor re-reads through
+ * `worldInfoCache`, which every MWT save has already updated.
+ *
+ * The explicit selection check is load-bearing: ST's reloadEditor compares
+ * `Number(select.value)`, and the "--- Pick to Edit ---" placeholder's value
+ * is '' → 0, so with NOTHING selected it would open `world_names[0]` if that
+ * happened to be this book. Forks without reloadEditor/world_names skip.
+ *
+ * @param {object} wi$ — ST's world-info module
+ * @param {string} bookName
+ */
+export function refreshWorldInfoEditor(wi$, bookName) {
+    if (typeof wi$?.reloadEditor !== 'function' || !Array.isArray(wi$.world_names)) return;
+    const selected = globalThis.document?.getElementById?.('world_editor_select')?.value;
+    if (typeof selected !== 'string' || selected === '') return;
+    if (Number(selected) !== wi$.world_names.indexOf(bookName)) return;
+    try {
+        wi$.reloadEditor(bookName);
+    } catch (err) {
+        // Display refresh only — the save itself already succeeded.
+        console.warn('[MWT:Knowledge] World Info editor refresh failed:', err?.message || err);
+    }
+}
+
+/**
+ * Write a book's store back into its lorebook entry, creating the book if it
+ * does not exist yet.
+ *
+ * @param {string} bookName
+ * @returns {Promise<boolean>} whether the write succeeded
+ */
+export async function flushBook(bookName) {
+    const s = _cache.get(bookName);
+    if (!s) return false;
+    if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+
+    const wi$ = await getWiScript();
+    if (!wi$) return false;
+
+    let wi = null;
+    try {
+        wi = await wi$.loadWorldInfo(bookName);
+    } catch { /* handled below */ }
+
+    if (!wi || !wi.entries) {
+        if (typeof wi$.createNewWorldInfo === 'function') {
+            // The Aikobots v4 fork returns a boolean here rather than the world
+            // object, so always re-load instead of trusting the return value.
+            try { await wi$.createNewWorldInfo(bookName); } catch { /* fall through */ }
+        }
+        try { wi = await wi$.loadWorldInfo(bookName); } catch { /* fall through */ }
+        if (!wi || !wi.entries) wi = { entries: {} };
+    }
+
+    applyStoreToWorldInfo(bookName, wi);
+
+    try {
+        await saveBookNow(wi$, bookName, wi);
+        markStoreClean(bookName);
+        return true;
+    } catch (err) {
+        // `dirty` deliberately stays set: resetStoreCache retains failed slots
+        // for a later retry, and any writeField() re-arms the debounce. Marking it clean
+        // here would strand the write in memory with only this warning.
+        console.warn(`[MWT:Knowledge] store: save of "${bookName}" failed (will retry):`, err?.message || err);
+        return false;
+    }
+}
+
+/** Flush every dirty book. Await this before anything that could lose state. */
+export function flushAll() {
+    // Serialize with restore transactions and cache resets.
+    return withStoreLock(async () => {
+        const names = [..._cache.keys()].filter(name => _cache.get(name)?.dirty);
+        for (const name of names) await flushBook(name);
+    });
+}
+
+/**
+ * Drop all cached stores.
+ *
+ * Called on chat change: the next chat may resolve to different books. Flushes
+ * pending writes first; failed dirty slots survive for a later retry. A failed
+ * slot must not be replaced by a fresh hydration of the same book.
+ */
+export function resetStoreCache() {
+    // Serialize with restore transactions: a reset that
+    // interleaves a restore's flush/rollback can re-persist cancelled data or
+    // clear the cache mid-rollback.
+    return withStoreLock(async () => {
+        const failed = [];
+        for (const [name, s] of _cache) {
+            if (!s.dirty) continue;
+            try {
+                if (!await flushBook(name)) failed.push(name);
+            } catch (err) {
+                console.warn(`[MWT:Knowledge] store: could not flush "${name}" during cache reset:`, err);
+                failed.push(name);
+            }
+        }
+        for (const [name, s] of _cache) {
+            if (failed.includes(name)) {
+                scheduleFlush(name);
+            } else {
+                if (s.timer) clearTimeout(s.timer);
+                _cache.delete(name);
+            }
+        }
+        _cacheGeneration += 1;
+        return failed.length === 0;
+    });
+}
+
+// ─── Orchestration ──────────────────────────────────────────────────────────
+
+/**
+ * Epoch-first scope re-check for the two-book orchestration.
+ *
+ * `assertSameScope()`'s identity comparison fail-closes when the chat cannot
+ * be identified (scope.js mints a fresh unknown nonce per call), which is the
+ * norm in unit tests and on hosts without a usable chat id. The same rule
+ * backup/index.js's assertRestoreScope applies to merges applies here: the
+ * epoch is the whole check for an unknown capture, and the identity only
+ * sharpens a known one (it catches chat drift that never fired CHAT_CHANGED).
+ *
+ * @param {object} token — captureScope()'s value
+ * @returns {boolean} false when the capture is stale (fail-closed on no token)
+ */
+function hydrationScopeStillCurrent(token) {
+    if (getEpoch() !== token?.epoch) return false;
+    if (token?.identity?.isUnknown !== false) return true;
+    return assertSameScope(token).ok;
+}
+
+/**
+ * Quietly drop an orchestration whose scope was retired mid-flight. Mirrors
+ * abandonStaleHydration(): the reset that invalidated this capture is followed
+ * by its own reloadStores(), which re-runs the (pure) preparation under the
+ * correct scope — so this is a debug breadcrumb, never an error.
+ *
+ * @param {string} knowledgeBook
+ * @param {string} stateBook
+ * @returns {{ knowledge: string, state: string }}
+ */
+function abandonStaleHydrationOrchestration(knowledgeBook, stateBook) {
+    record({
+        level: 'debug',
+        module: 'knowledge',
+        event: 'schema_hydration_abandoned',
+        detail: { store: 'knowledgeStore', reason: 'scope-changed', books: [knowledgeBook, stateBook] },
+    });
+    return { knowledge: knowledgeBook, state: stateBook };
+}
+
+/**
+ * Hydrate the stores for the books the current scope resolves to.
+ *
+ * Call this on chat change, and await it before any scan. Legacy per-chat
+ * values from `chat_metadata` are passed as the seed, so a user upgrading from
+ * a pre-store version has their existing registry adopted by the book on first
+ * load. Once the book has a store, the seed is ignored.
+ *
+ * The registry and relationships live in the Knowledge book; the state registry
+ * lives in the State Tracker book. Each book therefore carries the data that
+ * describes its own entries and stays portable on its own.
+ *
+ * The scope is captured at ORCHESTRATION START (before the first await) and
+ * re-checked between both book hydrations and in front of resumeStore(): a
+ * chat switch retires this invocation's slots mid-flight (resetStoreCache),
+ * and hydrateBook can only detect that against the slot IT captured. The
+ * SECOND hydrateBook would otherwise run against the post-reset cache — fresh
+ * slots that look perfectly live — and cache or persist the PREVIOUS chat's
+ * seed into the new chat's session. Every event that invalidates the capture
+ * (chat switch, scope reload) is followed by its own reloadStores(), so the
+ * abort is always safe: nothing stays un-hydrated and no work is lost.
+ *
+ * @returns {Promise<{ knowledge: string, state: string }>} the books hydrated
+ */
+export async function hydrateCurrentBooks() {
+    const scopeAtStart = captureScope();
+    const generationAtStart = _cacheGeneration;
+    const staleScope = () =>
+        !hydrationScopeStillCurrent(scopeAtStart) || _cacheGeneration !== generationAtStart;
+
+    // Imported lazily: scope.js reads module settings, which are not available
+    // in every context this file may be pulled into (e.g. unit tests).
+    const { getLorebookName, getStateLorebookName } = await import('./scope.js');
+
+    const knowledgeBook = getLorebookName();
+    const stateBook = getStateLorebookName();
+    const meta = getChatMeta() || {};
+
+    // Legacy chat_metadata describes entries in the GLOBAL books, so only the
+    // global books may adopt it.
+    //
+    // Seeding a SCOPED book from it would copy a registry whose uids point into
+    // a different book. `writeToLorebook` trusts a registry uid: if an entry
+    // exists at that uid here it takes the update branch — so the first write
+    // after switching scope would overwrite whatever happens to occupy that
+    // uid in the new book. On a freshly created book that is the [MWT:store]
+    // entry itself, which would be rewritten as an NPC entry complete with
+    // keywords. A scoped book must start empty and build its own registry.
+    const knowledgeSeed = knowledgeBook === LOREBOOK_NAME
+        ? { registry: meta[REGISTRY_KEY] || {}, relationships: meta[RELATIONSHIP_KEY] || {} }
+        : {};
+    const stateSeed = stateBook === STATE_LOREBOOK_NAME
+        ? { stateRegistry: meta[STATE_REGISTRY_KEY] || {} }
+        : {};
+
+    await hydrateBook(knowledgeBook, knowledgeSeed);
+    if (staleScope()) return abandonStaleHydrationOrchestration(knowledgeBook, stateBook);
+
+    await hydrateBook(stateBook, stateSeed);
+    // Doubles as the gate in front of resumeStore(): a stale invocation must
+    // not resume the store on the new chat's behalf — or clear a pause its own
+    // load raised. The follow-up reload's hydration owns that transition.
+    if (staleScope()) return abandonStaleHydrationOrchestration(knowledgeBook, stateBook);
+
+    // A successful load clears any pause an earlier failed attempt of this
+    // session left on the store (design §5.4 — "a Retry or a later load
+    // cleared the block"): the banner comes down and `schema_store_resumed` is
+    // recorded. The knowledgeStore id spans BOTH books, so the store resumes
+    // only when both are healthy — one book hydrating must not clear a pause
+    // the other book's block raised. No-op (and no event) when nothing was
+    // paused.
+    if (isHydrated(knowledgeBook) && isHydrated(stateBook)) {
+        resumeStore('knowledgeStore', { via: 'load' });
+    }
+
+    return { knowledge: knowledgeBook, state: stateBook };
+}
+
+/** Test seam: synchronously seed the cache without touching a lorebook. */
+export function _setCacheForTests(bookName, data) {
+    const s = slot(bookName);
+    s.data = { ...blankStore(), ...data };
+    s.hydrated = true;
+    s.dirty = false;
+    // A seeded slot is healthy by construction — never keep a previous
+    // failed attempt's observed-version breadcrumb on it.
+    s.observedVersion = null;
+}
+
+/** Test seam: clear the cache without flushing. */
+export function _clearCacheForTests() {
+    for (const s of _cache.values()) {
+        if (s.timer) clearTimeout(s.timer);
+    }
+    _cache.clear();
+    _cacheGeneration += 1;
+}

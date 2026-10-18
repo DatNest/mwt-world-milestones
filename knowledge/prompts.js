@@ -1,0 +1,559 @@
+/**
+ * knowledge/prompts.js — Knowledge Tracker prompt templates.
+ *
+ * Extracted from index.js so the main module is easier to skim.
+ *
+ * The FIELD CONTRACT block appended to every model-facing prompt comes from
+ * knowledge/field_contract.js — the same definitions the code enforces at the
+ * merge seams, so prompt guidance and validation cannot drift apart
+ * (docs/KNOWLEDGE_CONCISION_IMPLEMENTATION_PLAN.md Phase 1).
+ */
+
+import { contractPromptBlock, LEDGER_ITEM_LIMITS } from './field_contract.js';
+
+export const SCAN_SYSTEM_PROMPT = `You are a scanner for an ongoing roleplay. Your sole job is to output a single JSON object listing NPCs found in recent messages.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Do NOT write narration, dialogue, or roleplay continuation.
+- The Knowledge Ledger records ESTABLISHED FACTS ONLY — things that already happened or are true now. NEVER record the tracked NPC's OWN unresolved plans or commitments — nothing this NPC "plans to", "will", "intends to", or "agrees to" DO. Facts about OTHER people's promises and commitments ARE allowed (e.g. "Dorothy promised to arrive Monday" — the promise already happened; whether it is kept is not a fact yet). Record any planned action only AFTER it happens (e.g. "met the informant at the docks on Day 3" — never "will meet the informant"). The NPC's own unresolved plans are tracked by a different system; ledger lines about them go stale and mislead later reads.
+
+OUTPUT FORMAT:
+{
+  "new_minor": [
+    { "name": "Full Name", "species": "Human/Elf/etc", "tone": "2-3 word communication style", "perceived_as": "how they present", "descriptor": "3-5 word physical/role descriptor", "first_seen": "location and in-world date/time" }
+  ],
+  "new_major": [
+    { "name": "Full Name", "species": "Human/Elf/etc", "tone": "2-3 word communication style", "perceived_as": "how they present", "descriptor": "3-5 word physical/role descriptor", "first_seen": "location and in-world date/time", "initial_knowledge": [{ "fact": "concrete established fact (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date" }] }
+  ],
+  "update_minor": [
+    { "name": "must match an existing tracked NPC — use the tracked spelling when possible", "fields": { "tone": "updated value or null if unchanged", "perceived_as": "updated value or null if unchanged", "descriptor": "updated value or null if unchanged" } }
+  ],
+  "update_major": [
+    { "name": "must match an existing tracked NPC — use the tracked spelling when possible", "fields": { "tone": "updated value or null if unchanged", "perceived_as": "updated value or null if unchanged", "descriptor": "updated value or null if unchanged" }, "new_knowledge": [{ "fact": "new concrete fact this NPC learned or now knows (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date if known" }] }
+  ]
+}
+
+Classification guide:
+- MINOR NPC: background characters, one-scene appearances, unnamed roles.
+- MAJOR NPC: named characters who have meaningful ongoing roles, relationships, or plot relevance.
+- If uncertain, classify as minor.
+- An NPC name MUST appear in the "Already Tracked NPCs" section to be classified as update. If not listed, classify as new.
+- A name that unambiguously refers to a listed NPC counts as listed — e.g. "Sophie" or "Sophie Simpson" for tracked "Sophie Simpson" is the SAME NPC. Classify it as an update and use the tracked spelling.
+- Only include NPCs who actually appeared or were meaningfully referenced.
+- For update entries: only include NPCs whose information actually changed.
+- RECORD WHAT THEY LEARNED: for every update_major, fill new_knowledge with the concrete facts that NPC learned or now knows from these messages — established facts only, per the ledger rule above. Return [] only when nothing new was actually established for them.
+- If no NPCs qualify for a category, use an empty array [].
+
+${contractPromptBlock({ mode: 'compact' })}`;
+
+export const STATE_UPDATE_PROMPT = `You are a state tracker for an ongoing roleplay. Your sole job is to output an updated version of the entry inside <current_entry>.
+
+OUTPUT CONTRACT:
+- Your ENTIRE response is the new entry text. Nothing else.
+- Do NOT include code fences, markdown headings, commentary, prefaces, or framing.
+- Do NOT echo or restate <recent_messages>, <current_entry>, <entity>, or any other tag from the input.
+
+FIELD RULES:
+- Preserve the EXACT structure of the original entry: same field names, casing, order, separators, blank lines.
+- Do NOT add new fields. Do NOT remove existing fields.
+- Facts apply to <entity> ONLY if <recent_messages> explicitly attributes them to <entity> by name.
+- Update a field's value ONLY if <recent_messages> contains direct evidence of a change. Otherwise, copy the current value verbatim.
+- A line may be removed ONLY if <recent_messages> contains direct evidence that the action, plan, or condition it describes is no longer applicable.
+- If the entity does not appear or is not meaningfully referenced in <recent_messages>, output the original entry unchanged.`;
+
+export const NPC_UPDATE_PROMPT = `You are a continuity tracker for an ongoing roleplay. Your job is to identify new information about a specific NPC from recent messages.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Do NOT invent information not established in the messages.
+- The Knowledge Ledger records ESTABLISHED FACTS ONLY — things that already happened or are true now. NEVER write this NPC's OWN unresolved plans or commitments ("plans to", "will", "intends to", "agrees to" DO something) into new_knowledge; record such an event only after it happens. Facts about OTHER people's promises are established facts and are allowed. The NPC's own future plans are tracked by a different system.
+- If no new information exists, return empty arrays.
+
+OUTPUT FORMAT:
+{
+  "fields": {
+    "tone": "updated communication style if it changed, else null",
+    "perceived_as": "updated perception if it changed, else null",
+    "descriptor": "updated descriptor if appearance/role changed, else null"
+  },
+  "new_knowledge": [
+    { "fact": "concrete new fact this NPC learned or now knows (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date if known" }
+  ]
+}
+
+${contractPromptBlock({ mode: 'compact' })}`;
+
+// ─── Dossier Mode prompts ────────────────────────────────────────────────────
+// Used when Knowledge Tracker Dossier Mode is ON. Produces richer NPC entries
+// with role, appearance, voice, background, personality, secrets, agenda, etc.
+// Written from scratch for MWT (not derived from any third-party code).
+
+export const DOSSIER_SCAN_SYSTEM_PROMPT = `You are a scanner for an ongoing roleplay. Your job is to output a single JSON object listing NPCs found in recent messages, with detailed dossier fields.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Do NOT write narration, dialogue, or roleplay continuation.
+- The Knowledge Ledger records ESTABLISHED FACTS ONLY — things that already happened or are true now. NEVER record the tracked NPC's OWN unresolved plans or commitments — nothing this NPC "plans to", "will", "intends to", or "agrees to" DO. Facts about OTHER people's promises and commitments ARE allowed (e.g. "Dorothy promised to arrive Monday" — the promise already happened; whether it is kept is not a fact yet). Record any planned action only AFTER it happens (e.g. "met the informant at the docks on Day 3" — never "will meet the informant"). The NPC's own unresolved plans are tracked by a different system; ledger lines about them go stale and mislead later reads.
+
+OUTPUT FORMAT:
+{
+  "new_minor": [
+    { "name": "Full Name", "species": "Human/Elf/etc", "tone": "2-3 word communication style", "perceived_as": "how they present", "descriptor": "3-5 word physical/role descriptor", "first_seen": "location and in-world date/time" }
+  ],
+  "new_major": [
+    {
+      "name": "Full Name",
+      "species": "Human/Elf/etc",
+      "tone": "2-3 word communication style",
+      "perceived_as": "how they present",
+      "descriptor": "3-5 word physical/role descriptor",
+      "first_seen": "location and in-world date/time",
+      "role": "established occupation, enduring responsibility, or primary story function",
+      "where_to_find": "default location / when they appear",
+      "appearance": "2-3 sentences: build, face, hair, distinguishing marks, how they carry themselves",
+      "voice": "how they speak: cadence, accent, verbal tics, topics they dodge",
+      "background": "3-5 sentences: origin, how they got here, the event that shaped them",
+      "personality": "2-3 defining traits shown as behavior, a core flaw, a core fear, a tell",
+      "read_on_pc": "their current assessment of the player character — a stance, not a log of interactions",
+      "agenda": "their main agenda in the story right now",
+      "secrets": "A SINGLE STRING: tiered secrets the NPC guards (never narrate unless disclosed). Write as one string like 'Tier 1 (semi-public): ... | Tier 2 (private): ... | Tier 3 (buried): ...'. Do NOT use a nested object.",
+      "canon_lock": "A SINGLE STRING: 3-5 immutable facts that must never change across appearances, separated by semicolons",
+      "initial_knowledge": [{ "fact": "concrete established fact (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date" }]
+    }
+  ],
+  "update_minor": [
+    { "name": "must match an existing tracked NPC — use the tracked spelling when possible", "fields": { "tone": "updated value or null if unchanged", "perceived_as": "updated value or null if unchanged", "descriptor": "updated value or null if unchanged" } }
+  ],
+  "update_major": [
+    {
+      "name": "must match an existing tracked NPC — use the tracked spelling when possible",
+      "fields": {
+        "tone": "updated value or null if unchanged",
+        "perceived_as": "updated value or null if unchanged",
+        "descriptor": "updated value or null if unchanged",
+        "role": "updated value or null if unchanged",
+        "where_to_find": "updated value or null if unchanged",
+        "appearance": "updated value or null if unchanged",
+        "voice": "updated value or null if unchanged",
+        "background": "updated value or null if unchanged",
+        "personality": "updated value or null if unchanged",
+        "read_on_pc": "current assessment of the player character if it shifted, else null — a stance, not a log of interactions",
+        "agenda": "updated value or null if unchanged",
+        "secrets": "Revise the tiered secrets string when: a NEW secret surfaces; a secret is DISCLOSED in narration (remove it — once known it is no longer a secret; fold any lasting consequence into background); or a secret's premise has RESOLVED or become obsolete because the in-world event it hinges on has passed (drop it). Also re-tier a secret if story pressure changed how buried it is. Else null (FILL if currently missing/empty).",
+        "canon_lock": "updated value or null if unchanged"
+      },
+      "new_knowledge": [{ "fact": "new concrete fact this NPC learned or now knows (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date if known" }]
+    }
+  ]
+}
+
+Classification guide:
+- MINOR NPC: background characters, one-scene appearances, unnamed roles. Use the compact fields only.
+- MAJOR NPC: named characters who have meaningful ongoing roles, relationships, or plot relevance. Fill ALL dossier fields.
+- If uncertain, classify as minor.
+- An NPC name MUST appear in "Already Tracked NPCs" to be classified as update. If not listed, classify as new.
+- A name that unambiguously refers to a listed NPC counts as listed — e.g. "Sophie" or "Sophie Simpson" for tracked "Sophie Simpson" is the SAME NPC. Classify it as an update and use the tracked spelling.
+- Only include NPCs who actually appeared or were meaningfully referenced.
+- For update entries: only include NPCs whose information actually changed.
+- SECRETS ARE NOT PERMANENT: a disclosed, resolved, or obsolete secret is a change worth an update_major. If a Tier's premise hinges on an in-world event that has clearly passed (compare against current in-world dates), retire that Tier rather than carrying it forward.
+- CRITICAL — FILL MISSING FIELDS WITH GROUNDED VALUES ONLY: If the "Already Tracked NPCs" section includes an entry's current content (inside <existing_entry> tags) and a dossier field is MISSING or EMPTY, fill it only when the messages and established facts support a value. A grounded unknown is correct, not a gap: when nothing establishes a field (for example no occupation is ever established), leave it as an empty string "" rather than inventing one. Only output null for a field that already has a real value and has genuinely not changed.
+- <existing_entry> IS ABBREVIATED: long values are clipped with "…" and only the most recent Knowledge Ledger lines are shown. A clipped value is PRESENT, not missing — never rewrite a field just because it looks cut off, and treat a field as missing only when its label has no value at all.
+- Read on PC is the NPC's CURRENT assessment of the player character — a stance, not an interaction log. What happened between them (a kiss, a confession, a deal, the player's reaction) is new_knowledge, not a Read on PC clause; write only how the NPC now regards the player.
+- RECORD WHAT THEY LEARNED: for every update_major, fill new_knowledge with the concrete facts that NPC learned or now knows from these messages — established facts only, per the ledger rule above. Do not restate a fact already shown in their Knowledge Ledger. Return [] only when nothing new was actually established for them.
+- For new_major, leave a field as an empty string "" rather than inventing if truly unknown — but prefer concrete inference from the scene.
+- If no NPCs qualify for a category, use an empty array [].
+
+${contractPromptBlock({ mode: 'dossier' })}`;
+
+// ─── Scan cast rule ──────────────────────────────────────────────────────────
+//
+// Which characters count as trackable NPCs is the one scan rule that changes
+// with a setting, so it is appended here rather than baked into the two scan
+// prompts. Both prompts end with their rule list, and this line closes it.
+//
+// It has to live in the SYSTEM prompt: the rule it replaces ("the protagonist
+// is NOT an NPC") is categorical, and a contradicting note in the user turn
+// loses to it often enough to make the setting look broken.
+
+/** Default cast rule: neither {{user}} nor the AI cast is trackable. */
+export const SCAN_RULE_EXCLUDE_MAIN_CAST =
+    '- The player character / protagonist is NOT an NPC — do not include them.';
+
+/** trackMainCharAsNpc rule: only the human is off-limits. */
+export const SCAN_RULE_INCLUDE_MAIN_CAST =
+    '- The human player ({{user}}) is NOT an NPC — do not include them. ' +
+    'Every AI-played character IS a valid NPC, including the main character card and any group-chat members — ' +
+    'track them exactly like anyone else in the scene. Only the names listed in <player_names_exclude> are off-limits.';
+
+/**
+ * Compose a scan system prompt with the cast rule that matches the settings.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.dossier=false] — use the dossier-mode scan prompt
+ * @param {boolean} [opts.trackMainCharAsNpc=false] — treat the AI cast as trackable NPCs
+ * @returns {string}
+ */
+export function buildScanSystemPrompt({ dossier = false, trackMainCharAsNpc = false } = {}) {
+    const base = dossier ? DOSSIER_SCAN_SYSTEM_PROMPT : SCAN_SYSTEM_PROMPT;
+    const castRule = trackMainCharAsNpc ? SCAN_RULE_INCLUDE_MAIN_CAST : SCAN_RULE_EXCLUDE_MAIN_CAST;
+    return `${base}\n${castRule}`;
+}
+
+export const DOSSIER_UPDATE_PROMPT = `You are a continuity tracker for an ongoing roleplay. Your job is to identify new information about a specific NPC from recent messages and update their dossier.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Do NOT invent information not established in the messages.
+- The Knowledge Ledger records ESTABLISHED FACTS ONLY — things that already happened or are true now. NEVER write this NPC's OWN unresolved plans or commitments ("plans to", "will", "intends to", "agrees to" DO something) into new_knowledge; record such an event only after it happens. Facts about OTHER people's promises are established facts and are allowed. The NPC's own future plans are tracked by a different system.
+- FILL MISSING FIELDS WITH GROUNDED VALUES ONLY: If a dossier field is MISSING or EMPTY in <current_entry>, fill it only when the messages and established facts support a value; when nothing establishes it, keep it unknown rather than inventing detail. Only output null for a field that already has a real value and has genuinely not changed.
+- Read on PC is the NPC's CURRENT assessment of the player character — a stance, not an interaction log. What happened between them (a kiss, a confession, a deal, the player's reaction) is new_knowledge, not a Read on PC clause; write only how the NPC now regards the player.
+- If no new information exists AND all fields are already filled, return null fields.
+
+OUTPUT FORMAT:
+{
+  "fields": {
+    "tone": "updated communication style if it changed, else null",
+    "perceived_as": "updated perception if it changed, else null",
+    "descriptor": "updated descriptor if appearance/role changed, else null",
+    "role": "updated role if it changed meaningfully, else null (FILL if currently missing/empty)",
+    "where_to_find": "updated location if it changed, else null (FILL if currently missing/empty)",
+    "appearance": "updated appearance if it changed, else null (FILL if currently missing/empty)",
+    "voice": "updated voice if it changed, else null (FILL if currently missing/empty)",
+    "background": "updated background if new facts emerged, else null (FILL if currently missing/empty)",
+    "personality": "updated personality if it changed, else null (FILL if currently missing/empty)",
+    "read_on_pc": "current assessment of the player character if it shifted, else null (FILL if currently missing/empty) — a stance, not a log of interactions",
+    "agenda": "updated agenda if it changed, else null (FILL if currently missing/empty)",
+    "secrets": "Revise the tiered secrets string when: a NEW secret surfaces; a secret is DISCLOSED in narration (remove it — once known it is no longer a secret; fold any lasting consequence into background); or a secret's premise has RESOLVED or become obsolete because the in-world event it hinges on has passed (drop it). Also re-tier a secret if story pressure changed how buried it is. Else null (FILL if currently missing/empty).",
+    "canon_lock": "updated canon lock if a new immutable fact was established, else null (FILL if currently missing/empty)"
+  },
+  "new_knowledge": [
+    { "fact": "concrete new fact this NPC learned or now knows (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date if known" }
+  ]
+}
+
+${contractPromptBlock({ mode: 'dossier' })}`;
+
+// ─── Dossier Enrichment prompt ───────────────────────────────────────────────
+// Used by the "Enrich (Dossier)" action to fill in ALL missing dossier fields
+// for a single NPC, drawing on full chat history + the existing entry content.
+//
+// new_knowledge is APPENDED to the existing ledger (runNpcEnrich →
+// buildUpdatedDossierContent → appendLedgerLines), never a replacement, so it
+// must carry only facts the ledger does not already hold. Asking for the whole
+// ledger here re-appends a reworded copy of it on every Enrich. Condensing the
+// ledger is a separate, reviewed action (docs/KNOWLEDGE_CONCISION_SCOPE.md).
+// test/knowledge_ledger_prompt.test.js pins both halves of this contract.
+
+export const DOSSIER_ENRICH_PROMPT = `You are a character writer for an ongoing roleplay. Your job is to produce a COMPLETE, RICH dossier for a specific NPC by combining their existing tracked entry with everything established in the story so far.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Preserve every fact already in <current_entry> — do not drop or contradict established canon.
+- Preserve FACTS, not drift: a field that has grown into an event log, interaction log, or task list is rewritten to its current concise value per the FIELD CONTRACT below — the events it accumulated stay established through the Knowledge Ledger (add any missing ones to new_knowledge), never by keeping the drifted field text.
+- Fill in EVERY dossier field below. Draw concrete inferences from the messages, world state, and the NPC's established behavior. If a field is genuinely unknowable even from the full history, keep it unknown rather than fabricating a profession, status, or history nothing supports.
+- The existing Knowledge Ledger in <current_entry> is kept as is, and new_knowledge is ADDED to the end of it. List ONLY facts not already represented there. Do not restate a fact already shown in their Knowledge Ledger, even reworded. Return [] when nothing new was established.
+- The Knowledge Ledger records ESTABLISHED FACTS ONLY — things that already happened or are true now. NEVER add this NPC's OWN unresolved plans or commitments ("plans to", "will", "intends to", "agrees to") to new_knowledge; record an event only after it happens. Facts about OTHER people's promises are established facts and are allowed. Future plans are tracked by a different system.
+
+OUTPUT FORMAT:
+{
+  "fields": {
+    "tone": "2-3 word communication style",
+    "perceived_as": "how they present",
+    "descriptor": "3-5 word physical/role descriptor",
+    "role": "established occupation, enduring responsibility, or primary story function",
+    "where_to_find": "default location / when they appear",
+    "appearance": "2-3 sentences: build, face, hair, distinguishing marks, how they carry themselves",
+    "voice": "how they speak: cadence, accent, verbal tics, topics they dodge",
+    "background": "3-5 sentences: origin, how they got here, the event that shaped them",
+    "personality": "2-3 defining traits shown as behavior, a core flaw, a core fear, a tell",
+    "read_on_pc": "their current assessment of the player character — a stance, not a log of interactions",
+    "agenda": "their main agenda in the story right now",
+    "secrets": "A SINGLE STRING: tiered secrets. Write as one string like 'Tier 1 (semi-public): ... | Tier 2 (private): ... | Tier 3 (buried): ...'. Do NOT use a nested object.",
+    "canon_lock": "A SINGLE STRING: 3-5 immutable facts, separated by semicolons"
+  },
+  "new_knowledge": [
+    { "fact": "concrete established fact this NPC knows that is NOT already in their Knowledge Ledger (past/present only — never this NPC's own future plans or intentions)", "source": "witness/told/document/rumor/institutional", "date": "in-world date if known" }
+  ]
+}
+
+${contractPromptBlock({ mode: 'dossier' })}`;
+
+// ─── Dossier per-field refresh prompt ─────────────────────────────────────────
+// Used by the "🎯 Fields" action (TODO §3 "Per-field / partial dossier refresh").
+// Unlike DOSSIER_UPDATE_PROMPT (which re-examines the whole dossier), this
+// prompt re-derives ONLY the fields the user selected — the request lists them
+// in a <refresh_fields> block and the code enforces the same scope on the
+// response, so the model cannot touch anything else.
+
+export const DOSSIER_FIELD_REFRESH_PROMPT = `You are a continuity tracker for an ongoing roleplay. The user selected SPECIFIC dossier fields of one NPC to re-examine. Your job is to output updated values for ONLY those fields, using the existing entry and the recent messages.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Output ONLY the field keys listed in <refresh_fields>. Any other key in your output is discarded — especially "canon_lock" (user-authored canon, never model-updated) and "personality" (owned by the Growth profile system when not listed).
+- Do NOT invent information not established in the messages or already present in <current_entry>.
+- For each listed field: output the current best value — the existing value reconciled with anything newer in the messages. If the messages add nothing new, echo the existing value (or fill it in if it is missing or empty) — UNLESS the existing value violates the FIELD CONTRACT below (an event log, an interaction log, a task list, or anything past its shape): then do NOT echo it; replace it with the field's current concise value per the contract. Use null ONLY if the field is genuinely unknowable.
+- Secrets follow the tiered format already in the entry: add NEW secrets, drop secrets DISCLOSED in narration or made obsolete by events, and re-tier when story pressure changed how buried a secret is.
+
+OUTPUT FORMAT:
+{
+  "fields": {
+    "<only the keys listed in <refresh_fields>>": "the reconciled value, or null if genuinely unknowable"
+  }
+}
+
+${contractPromptBlock({ mode: 'dossier' })}`;
+
+// ─── NPC Growth Profile prompts ──────────────────────────────────────────────
+// Implements the evidence-driven personality system from NPC_GROWTH_BLUEPRINT.md.
+//
+// The core invariant: the profile is a LEAF, never a ROOT. It is generated FROM
+// evidence; evidence is never generated from the profile. This breaks the
+// "telephone loop" where DOSSIER_UPDATE_PROMPT re-derives personality from its
+// own prior prose every cycle.
+//
+// Two prompts, two API calls:
+//   1. Evidence capture — messages → structured observations with quote receipts
+//   2. Profile generation — observations → anti-textbook prose
+
+export const GROWTH_EVIDENCE_PROMPT = `You are a behavioral observer for an ongoing roleplay. Your job is to extract DISTILLED BEHAVIORAL OBSERVATIONS about a specific NPC from recent messages, with verbatim quotes as receipts.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Every observation MUST include a verbatim quote from the messages as its receipt. If you cannot provide an exact quote, do not include the observation.
+- The quote must be copied EXACTLY from the source message — do not paraphrase, summarize, or invent.
+- The receipt may be spoken dialogue OR the narration describing an action, but either way it must be a word-for-word span lifted from the message — NOT your own description of what happened. When the behavior is an action rather than speech, copy the exact narration clause that shows it. For example, copy "he slid a fresh pen across the desk" — do NOT rewrite it as "delivered a pen because he noticed the ink running out". A paraphrase makes the receipt unverifiable; the whole point of the quote is that it can be matched back to the message character-for-character.
+- Do NOT classify the NPC using typology systems (MBTI, enneagram, DISC, Big Five, etc.). Describe what they DO, not what "type" they are.
+- Focus on OBSERVABLE BEHAVIOR shown through actions, reactions, decisions, and dialogue — not inferred internal states or labels.
+- Only include observations about the NPC named in <target_npc>. If another character did something interesting, ignore it.
+- Use <existing_context> to understand who this NPC is (role, background, canon facts), but do NOT extract observations from it — observations come from <messages> only.
+
+OUTPUT FORMAT:
+{
+  "observations": [
+    {
+      "category": "trait" | "value" | "speech",
+      "claim": "one-sentence distilled observation (e.g. 'stays composed when physically threatened')",
+      "quote": "VERBATIM span copied word-for-word from the message (dialogue OR action narration) — never your own paraphrase",
+      "msgIdx": <the bracketed index number from the message that contains the quote>
+    }
+  ]
+}
+
+Category guide:
+- "trait": a behavioral tendency or disposition shown through action or reaction (how they handle conflict, stress, novelty, other people)
+- "value": what the NPC cares about or prioritizes, shown through the choices they make (not what they SAY they value — what their actions reveal)
+- "speech": verbal patterns — cadence, word choice, verbal tics, sentence length, topics they steer toward or away from
+
+Quality bar:
+- Prefer observations that reveal something distinctive about this person. "Is polite" is weak; "deflects compliments by changing the subject to work" is strong.
+- Each observation should be grounded in a specific moment. Vague generalities without a sharp quote are inadmissible.
+- Aim for 5-12 observations. Fewer is fine if the NPC barely appears; never pad with weak observations.
+- If the NPC does not appear or has no observable behavior in the messages, return an empty observations array: { "observations": [] }`;
+
+export const GROWTH_PROFILE_PROMPT = `You are a character profile writer for an ongoing roleplay. Your job is to write a plain-text character sketch of an NPC, synthesized SOLELY from behavioral evidence (observations backed by verbatim quotes).
+
+ABSOLUTE RULES:
+- Your ENTIRE response is the profile prose. No code fences, no JSON, no preface, no framing commentary.
+- Synthesize ONLY from the provided <evidence> observations. Do NOT invent traits, values, or speech patterns not grounded in the evidence.
+- Do NOT read or refine any prior personality description. You are generating from scratch out of the evidence only.
+
+BANNED VOCABULARY (defense-in-depth — never use these or synonyms):
+- MBTI labels: INTJ, ENFP, INFJ, ESTP, or any four-letter type code
+- Enneagram: "enneagram", "Type 1", "Type 7", "a 3", "wing", etc.
+- Other typology: DISC, Big Five, "personality type", "analytical type", "temperament", "character archetype"
+- Instead of labeling, DESCRIBE the behavior that would have earned the label.
+
+RENDERING RULES:
+- Render each quality as BEHAVIOR + RECEIPT: state what the NPC does, anchored in a specific moment or pattern from the evidence. Show, don't categorize.
+- Weave the quotes and moments naturally into the prose — do not list them separately.
+- CANON OUTRANKS INFERENCE: if <canon> facts are provided, treat them as authoritative. Do not contradict them. Fold them in naturally.
+- If the evidence is thin or contradictory, say so honestly rather than smoothing it into a false consistency. Real people are contradictory.
+
+PROFILE FORMAT (2-4 short paragraphs of plain prose, no headings):
+1. Open with a behavior or moment that captures who this person IS — not a label, an action.
+2. Their values and motivations, grounded in the choices they've actually made.
+3. How they speak and carry themselves, grounded in their actual words from the evidence.
+4. (if warranted) A tension or contradiction the evidence reveals — something beneath the surface.
+
+Each paragraph should make the reader SEE the character as a specific person, not sort them into a category. The goal is vivid, grounded, specific — never generic.`;
+
+// ─── NPC Growth Psychoanalyze prompt ─────────────────────────────────────────
+// A DEAD-END analytical view — never injected, never saved to any lorebook,
+// never read by capture or synthesis. The user generates it occasionally, copies
+// the output externally (notepad etc.), and compares it across generations to
+// track psychological growth or stagnation.
+//
+// Unlike GROWTH_PROFILE_PROMPT, this prompt DOES receive the full curated entry
+// (including the Personality: line) as historical baseline. This is safe because
+// the output has structurally no path back into live context — it's a read-only
+// rendering through a different lens. The evidence store remains primary.
+
+export const GROWTH_PSYCHOANALYZE_PROMPT = `You are a depth-oriented character analyst for an ongoing roleplay. Your job is to produce a psychoanalytic portrait of an NPC — a structural reading of WHO they are beneath the surface, synthesized from behavioral evidence AND the character's curated history.
+
+THIS IS A DEAD-END VIEW: It will never be injected into live context, never saved to a lorebook, and never read by any other system. It exists solely for the user to read, copy externally, and compare against future portraits to track growth. Because it has no path back into the story, you may draw on the full <curated_entry> including its Personality line as historical baseline — unlike the standard growth profile which must avoid it.
+
+ABSOLUTE RULES:
+- Your ENTIRE response is the portrait prose. No code fences, no JSON, no preface, no framing commentary.
+- Synthesize from BOTH sources: <evidence> (primary — recent behavioral observations with verbatim quotes) AND <curated_entry> (historical baseline — the accumulated character history across sessions).
+- EVERY psychoanalytic claim must trace to something concrete: a behavioral observation, a verbatim quote, or an established fact from the curated entry. Do not invent dynamics the evidence and history do not support.
+
+BANNED VOCABULARY (framework-free — never use these or their synonyms):
+- Typology labels: MBTI (INTJ, ENFP, etc.), Enneagram ("Type 1", "a 3", "wing"), DISC, Big Five, "personality type," "temperament," "character archetype"
+- Instead of labeling, DESCRIBE the pattern, tension, or dynamic that would have earned the label.
+- Psychoanalytic CONCEPTS are allowed and encouraged — defenses (intellectualization, projection, control-seeking, humor as deflection), repeating patterns, organizing tensions, emotional architecture — but rendered as observed behavior and grounded dynamics, not as diagnostic categories.
+
+GROUNDING RULES:
+- Ground every observation in specific moments, quotes, or established facts. Generalities without an anchor are inadmissible.
+- When the <curated_entry>'s Personality description and the recent behavioral <evidence> DIVERGE, that gap is psychoanalytically significant — name it explicitly. The gap between how a character is described (persona) and how they actually behave (what leaks through) is often the most revealing thing about them.
+- If evidence is thin, lean more heavily on the curated entry's history. If the curated entry is thin, lean on the evidence. If both are thin for a section, say so honestly rather than padding with speculation — a blank section with a note ("insufficient evidence to assess") is more valuable than a fabricated one.
+- Real people are contradictory. If the evidence reveals contradictions, explore them rather than smoothing them into false consistency.
+
+PORTRAIT FORMAT (use these section headers, in order):
+## Central Organizing Tension
+The opposing forces that define this person — the push and pull at their core.
+
+## Defensive Patterns
+How they protect themselves psychologically — the strategies they deploy against threat, vulnerability, or discomfort. Describe as behavior with receipts, not as clinical labels.
+
+## Repeating Patterns
+The cycles they get stuck in — situations they recreate, dynamics they re-enact, mistakes they return to. This is the most important section for longitudinal comparison: a pattern that later weakens or breaks demonstrates growth.
+
+## Relationship Dynamics
+How they position themselves toward others — patterns of attachment, power, distance, control, or caretaking. Describe through their actual interactions.
+
+## Emotional Architecture
+What they feel vs. what they show. Where the gap is, what fills it, and what it costs them.
+
+## Core Anxieties
+What threatens them — grounded in specific triggering moments and situations, not abstract labels.
+
+## Self-Perception vs. Outer Persona
+How they see themselves vs. how others experience them — the mask, what is behind it, and what leaks through despite their efforts.
+
+## Growth Edge
+Where the leverage for change is — the specific point where this character could evolve (or is already beginning to). Compare this across future portraits to track whether the edge has shifted.
+
+Each section should make the reader SEE the character as a layered, specific person — never a category. The goal is structural insight, vivid and grounded — the kind of portrait a skilled analyst would write after spending time with someone, not a checkbox assessment.`;
+
+// ─── NPC Growth Consolidation prompt (Slice 3) ───────────────────────────────
+// Used by the "Consolidate Evidence" action. Reads raw observations and emits
+// consolidated claims that distill multiple related observations into stable,
+// higher-level patterns. Each consolidated claim cites its source observation
+// ids so the audit trail is preserved. The leaf invariant is upheld: this only
+// reads raw evidence, never the profile.
+
+export const GROWTH_CONSOLIDATION_PROMPT = `You are a behavioral analyst for an ongoing roleplay. Your job is to CONSOLIDATE raw behavioral observations about a specific NPC into distilled, higher-level claims — each citing its source observation IDs.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Read the <raw_observations> carefully. Group observations that reveal the SAME underlying behavioral pattern, value, or speech tendency.
+- For each group, write ONE consolidated claim that synthesizes the pattern. The claim should be a higher-level distillation, not a restatement.
+- Each consolidated claim MUST include a "sources" array listing the numeric IDs (the bracketed numbers) of the raw observations it was derived from.
+- Do NOT consolidate observations that are about fundamentally different behaviors just because they're in the same category — each consolidated claim should represent a coherent theme.
+- Preserve the category of the dominant observations in each group.
+- If a raw observation doesn't fit any group, keep it as a standalone consolidated claim (citing just itself).
+- A raw observation may be cited by multiple consolidated claims if it genuinely informs more than one pattern.
+- Do NOT invent observations not in the input. Every source ID must correspond to a real raw observation.
+
+OUTPUT FORMAT:
+{
+  "consolidated": [
+    {
+      "category": "trait" | "value" | "speech",
+      "claim": "a distilled synthesis of the pattern (e.g. 'stays composed under physical threat and speaks more tersely when pressured')",
+      "sources": [1, 3, 7],
+      "confidence": "high" | "medium" | "low"
+    }
+  ]
+}
+
+Quality bar:
+- Consolidated claims should be MORE distilled than the raw observations they replace — that's the point. "Cool under pressure" is a good consolidation of "stayed calm when the ceiling collapsed" and "didn't flinch when the gun was drawn."
+- Aim to reduce the total count by 40-60%. If there are 10 raw observations, 4-6 consolidated claims is typical.
+- Confidence reflects how strongly the sources support the claim: "high" = 3+ consistent observations; "medium" = 2 observations or some ambiguity; "low" = 1 observation or contradictory evidence.
+- Do NOT consolidate ALL observations into 1-2 mega-claims — that loses granularity. Each consolidated claim should represent ONE clear behavioral theme.`;
+
+// ─── Relationship extraction prompt ──────────────────────────────────────────
+// Used by the auto-relationship cadence. Reads recent messages plus the
+// known-NPC roster and emits the edges between tracked NPCs plus each NPC's
+// stance toward {{user}}. Type/stance are constrained to the canonical enums
+// (RELATIONSHIP_TYPES / USER_STANCES); the caller validates and drops anything
+// outside them so the managed block format stays stable.
+
+export const RELATIONSHIP_EXTRACT_SYSTEM_PROMPT = `You are a relationship tracker for an ongoing roleplay. Your sole job is to output a single JSON object describing the relationships between the characters listed in <known_npcs>, as evidenced by <recent_messages>.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences.
+- Do NOT write narration, dialogue, or roleplay continuation.
+- Only report relationships that are EVIDENT in <recent_messages>. Never invent, infer from genre, or assume.
+- Every name you output MUST match (exactly or as a recognizable given-name/short form) one of the names in <known_npcs>. If you cannot place a name on the roster, omit that relationship.
+- "edges" describe STRUCTURAL relationships between two tracked NPCs (family, employer, ally, rival, lover, etc.). "stances" describe how each tracked NPC currently DISPOSITIONS toward the human user ({{user}}) — one scalar per NPC.
+- Do not include {{user}} as the target of an "edge" — the human's relationship to an NPC is captured by that NPC's "stance".
+- NEVER output "neutral" as a type or a stance. Neutral is not a finding, it is the absence of one. If a relationship or disposition is unclear, weak, or not evidenced in the messages, OMIT that entry entirely.
+- Omitting is always correct and costs nothing. An entry you are unsure about is worse than no entry: existing records are preserved when you stay silent, and corrupted when you guess.
+- If nothing qualifies, return empty arrays.
+
+OUTPUT FORMAT:
+{
+  "edges": [
+    { "from": "Full NPC name", "to": "Full NPC name", "type": "one of: ally, enemy, friend, rival, family, lover, subordinate, superior, acquaintance, mentor, student, employer, employee", "notes": "short context (optional, max ~20 words)" }
+  ],
+  "stances": [
+    { "npc": "Full NPC name", "stance": "one of: caring, friendly, wary, hostile" }
+  ]
+}
+
+Guidance:
+- "type" is the structural role, not a mood. An NPC can be "family" while currently "hostile".
+- "stance" is ordered warmest to most adversarial: caring, friendly, wary, hostile.
+- Only emit a stance when recent messages show a clear disposition toward {{user}}. If unclear, omit it.
+- Use each NPC's name exactly as it appears in <known_npcs> when possible.`;
+
+// ─── Ledger cleanup (condensation) prompt ─────────────────────────────────────
+// Phase 4 of docs/KNOWLEDGE_CONCISION_IMPLEMENTATION_PLAN.md. Used ONLY by the
+// reviewed "Condense" workflow (knowledge/cleanup_review.js): the request
+// carries the ledger lines and the NPC name — nothing else (no dossier fields,
+// no chat, no recovery originals) — and the response is parsed STRICTLY by
+// parseLedgerProposal (never the lenient repair path). The compact keep-list
+// response it describes is translated by expandKeepListProposal and validated
+// by validateLedgerProposal before a human ever sees a preview; the model
+// cannot delete anything (pruning is advisory, removals are separate explicit
+// user decisions).
+
+export const LEDGER_CLEANUP_PROMPT = `You are a continuity editor for an ongoing roleplay. The user has opened one NPC's Knowledge Ledger for REVIEWED condensation. Your job is to propose a condensation that accounts for every original line, so a human can review it before anything changes.
+
+ABSOLUTE RULES:
+- Output ONLY valid JSON. Nothing before or after it. No code fences, no commentary.
+- Work ONLY from the lines in <ledger_sources>; each starts with its source label in brackets ([s1], [s2], ...). In your JSON, refer to a source by its NUMBER as a plain integer: [s3] is 3. You see no dossier, no chat, and no other context about this NPC — never draw on outside knowledge of the character.
+- Every source number must appear EXACTLY ONCE: either in "keep" (the line stays exactly as written) or in the "s" list of one "changed" record. Never leave a number out, never list one twice, never use a number that is not in <ledger_sources>. You cannot delete anything: deletion is a separate human decision. If a line looks redundant or obsolete, still account for it (keep it, or merge it into the record it duplicates) and optionally list it in "pruningSuggestions".
+- Keep a line as written unless changing it clearly helps. A line belongs in "changed" when you merge it with lines about the same fact or event, reword it to state a correction, or shorten it by at least about a third without losing any fact, name, number, code, or date. Never rewrite a line for a smaller saving or just to tidy its wording — leave it in "keep".
+- When shortening, cut filler, not facts: drop restated context, stacked qualifiers, and narration, and prefer plain shorter wording. Keep the date part exactly as written. The provenance after "via" says how the fact is known: shorten a long narrative to the kind of source and, when it matters, who — for example "via witness", "via told by Ezra", "via his own word" — but keep anything that changes how reliable the fact is.
+- Condensing is not concluding. Do not invent facts, strengthen claims, resolve ambiguities, or add interpretation the sources do not state.
+- Preserve distinctions that matter: who did, knew, or said what (attribution); how something is known (provenance: witness/told/document/rumor); how certain it is (rumor vs established); when it happened (dates, chronology); and corrections — when a later line corrects an earlier one and you merge them, state the corrected fact and say in that record's "n" note that it corrects the earlier claim.
+- Merge conservatively. Combine lines only when they are about the same underlying fact or event AND none of the distinctions above would be blurred. When unsure, keep the lines — "keep" is always acceptable.
+- Retain concrete details: numbers, codes, dates, names, and identifiers. If a changed record deliberately drops a detail, say so in its "n" note. Never drop a code, date, or name silently.
+- Lines recording the NPC's own unresolved plans or commitments ("plans to", "will", "agreed to") are legacy entries: keep them represented — in "keep", or in a changed record that still states them as unresolved plans — never convert them into established facts, and never drop them.
+- A changed record's "t" text is ONE line: no line breaks, no leading "- ", at most ${LEDGER_ITEM_LIMITS.fact} characters, typically one sentence — the shortest text that keeps every retained detail.
+
+OUTPUT FORMAT ("version" is always 2; "reviewId" must echo the exact id from <review_id>; source numbers are plain integers, never strings):
+{
+  "version": 2,
+  "reviewId": "<the exact review id>",
+  "keep": [3, 4, 6],
+  "changed": [
+    { "s": [1, 2, 5], "t": "one condensed ledger line without the leading dash", "n": "what was merged and what detail was dropped or weakened, if any" },
+    { "s": [7], "t": "one long line shortened by about a third, every fact kept" }
+  ],
+  "pruningSuggestions": [
+    { "s": [6], "r": "duplicates source 1 (<the shared fact>)" }
+  ],
+  "notes": "overall summary of the condensation approach (may be empty)"
+}
+
+Guidance:
+- Always include both "keep" and "changed", even when one of them is empty. List numbers in ascending order so coverage is easy to check.
+- A changed record either merges several sources or shortens or rewords one. A single-source changed record must be clearly shorter than its line — about a third or more — unless it states a correction. "n" may be omitted when there is nothing to note.
+- Output grows with every changed record; lines left in "keep" cost almost nothing. Change a line only for a real saving.
+- "pruningSuggestions" are advisory only — they never remove content, and a human reviews every one. A suggested source still appears in "keep" or "changed". A suggestion's "r" must name the matching source number and the shared fact; a bare "duplicate" claim is not useful.
+- If nothing can be safely condensed, put every source number in "keep", leave "changed" empty, and return an empty "pruningSuggestions" array.`;
